@@ -26,6 +26,7 @@ pub const channel = @import("channel.zig");
 pub const codec = @import("codec/codec.zig");
 pub const frame = @import("codec/frame.zig");
 pub const http = @import("codec/http.zig");
+pub const http2 = @import("codec/http2.zig");
 pub const json = @import("codec/json.zig");
 pub const websocket = @import("codec/websocket.zig");
 pub const event_loop = @import("event_loop.zig");
@@ -123,6 +124,7 @@ test {
     _ = event_loop;
     _ = frame;
     _ = http;
+    _ = http2;
     _ = json;
     _ = lock;
     _ = message;
