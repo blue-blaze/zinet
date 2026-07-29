@@ -1,0 +1,39 @@
+From: (unattributed — take it as a suggestion, not a claim of authorship)
+Subject: [PATCH] std.mem.Allocator: honour free's own precondition for *[len]T
+
+`free` permits a `*[len]T`, in a check whose comment says so, and then hands the
+argument to `absorbSentinel`, which asserts a slice. So the permitted case is a
+compile error, and no caller can free a pointer-to-array.
+
+Absorbing the sentinel matters for the array case too: freeing a `*[N:s]T` as N
+elements returns one element less than `allocSentinel` reserved, which trips the
+allocator's own bookkeeping ("Invalid free" under DebugAllocator).
+
+Rationale and evidence: std-allocator-free.md next to this file.
+---
+ lib/std/mem/Allocator.zig | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/lib/std/mem/Allocator.zig b/lib/std/mem/Allocator.zig
+--- a/lib/std/mem/Allocator.zig
++++ b/lib/std/mem/Allocator.zig
+@@ -449,7 +449,18 @@
+         // slicing with comptime-known start and end results in *[len]T, which may be free'd
+         comptime assert(slice_info.size == .one and @typeInfo(slice_info.child) == .array);
+     }
+-    const bytes: []u8 = @ptrCast(@constCast(mem.absorbSentinel(memory)));
++    // `absorbSentinel` only accepts a slice, so the `*[len]T` that the check
++    // above deliberately permits has to be turned into one here — and its
++    // sentinel, if it has one, has to be absorbed the same way, or the length
++    // handed to `rawFree` is one element short of what was allocated.
++    const bytes: []u8 = if (slice_info.size == .slice)
++        @ptrCast(@constCast(mem.absorbSentinel(memory)))
++    else brk: {
++        const array_info = @typeInfo(slice_info.child).array;
++        const len = array_info.len + if (array_info.sentinel_ptr != null) 1 else 0;
++        const many: [*]const array_info.child = memory;
++        break :brk @ptrCast(@constCast(many[0..len]));
++    };
+     if (bytes.len == 0) return;
+     @memset(bytes, undefined);
+     self.rawFree(bytes, .fromByteUnits(slice_info.attrs.@"align" orelse @alignOf(slice_info.child)), @returnAddress());

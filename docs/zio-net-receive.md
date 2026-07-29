@@ -126,9 +126,11 @@ Applied to a local v0.16.0 checkout, with no other change:
 Environment: Zig 0.16.0, macOS aarch64 (kqueue backend).
 
 The patch is next to this file as
-[`zio-net-receive.patch`](zio-net-receive.patch); it applies cleanly to tag
-v0.16.0. Still present on `main` as of commit `3566a3a`, 100 commits past that
-tag, so this is not a report about something already fixed.
+[`zio-net-receive.patch`](zio-net-receive.patch). It applies cleanly to tag
+v0.16.0 and to the `zig-0.17` branch at commit `407427a`, which is what Zinet
+depends on now; there the `unreachable` sits at `src/io.zig:1871`. Still present on
+`main` as of commit `3566a3a`, and on all fifteen remote branches, so this is not
+a report about something already fixed.
 
 ## Why this operation matters
 

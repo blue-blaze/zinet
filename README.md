@@ -80,7 +80,7 @@ worth being exact about what is missing, because "it does not compile" was true 
 | Backend | Selected on | State in 0.17-dev |
 |---|---|---|
 | `Io/Uring.zig` | Linux | Compiles. `netReceive`, `netBindIp`, `netShutdown` and `netClose` are implemented; `netListenIp`, `netAccept`, `netConnectIp`, `netSend`, `netWrite` are wired to `…Unavailable` stubs that return `error.NetworkDown` |
-| `Io/Dispatch.zig` | macOS | Does not compile: `deinit` frees `main_loop_stack[0..len]`, a `*[len]u8`, and `Allocator.free` rejects it — even though `free`'s own precondition permits exactly that, because the next line hands it to `absorbSentinel`, which asserts a slice. With that one line fixed it compiles and runs, and then only `netClose` of the network operations is implemented |
+| `Io/Dispatch.zig` | macOS | Does not compile: `deinit` frees `main_loop_stack[0..len]`, a `*[len]u8`, and `Allocator.free` rejects it — even though `free`'s own precondition permits exactly that, because the next line hands it to `absorbSentinel`, which asserts a slice. With that one line fixed it compiles and runs ([write-up](docs/std-allocator-free.md)), and then only `netClose` of the network operations is implemented |
 | `Io/Kqueue.zig` | the BSDs | Does not compile: assigns `fileWriteStreaming` and `fileReadStreaming`, neither of which is a field of `Io.VTable` |
 
 So the blocker moved rather than lifted. A framework whose whole job is sockets
