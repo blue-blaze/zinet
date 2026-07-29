@@ -44,7 +44,7 @@ pub const Opcode = enum(u4) {
 
     /// Control opcodes are 0x8 and above; they may not be fragmented.
     pub fn isControl(opcode: Opcode) bool {
-        return @intFromEnum(opcode) & 0x8 != 0;
+        return @backingInt(opcode) & 0x8 != 0;
     }
 
     pub fn isKnown(opcode: Opcode) bool {
@@ -70,7 +70,7 @@ pub const CloseCode = enum(u16) {
     _,
 
     pub fn value(code: CloseCode) u16 {
-        return @intFromEnum(code);
+        return @backingInt(code);
     }
 };
 
@@ -315,7 +315,7 @@ pub const FrameCodec = struct {
         if (compressed and self.deflate == null) return error.ReservedBitsSet;
 
         const fin = first & 0x80 != 0;
-        const opcode: Opcode = @enumFromInt(@as(u4, @truncate(first & 0x0F)));
+        const opcode: Opcode = @fromBackingInt(@intCast(@as(u4, @truncate(first & 0x0F))));
         if (!opcode.isKnown()) return error.UnknownOpcode;
 
         // RFC 7692 §6.1: never on a control frame, and never on a continuation.
@@ -408,7 +408,7 @@ pub const FrameCodec = struct {
                 errdefer gpa.free(payload);
                 self.closed = true;
                 const code: ?CloseCode = if (payload.len >= 2)
-                    @enumFromInt(std.mem.readInt(u16, payload[0..2], .big))
+                    @fromBackingInt(@intCast(std.mem.readInt(u16, payload[0..2], .big)))
                 else
                     null;
                 const reason = if (payload.len > 2) payload[2..] else payload[0..0];
@@ -596,7 +596,7 @@ pub const FrameCodec = struct {
         errdefer out.deinit(gpa);
 
         const rsv1: u8 = if (compressed != null) 0x40 else 0x00;
-        try out.writeByte(gpa, 0x80 | rsv1 | @as(u8, @intFromEnum(frame.opcode)));
+        try out.writeByte(gpa, 0x80 | rsv1 | @as(u8, @backingInt(frame.opcode)));
         try writeLength(&out, gpa, payload_len, mask);
 
         var key: [4]u8 = @splat(0);
@@ -1184,7 +1184,7 @@ fn clientFrame(
     payload: []const u8,
 ) !void {
     const key = [4]u8{ 0x1A, 0x2B, 0x3C, 0x4D };
-    try out.append(gpa, (if (fin) @as(u8, 0x80) else 0) | @intFromEnum(opcode));
+    try out.append(gpa, (if (fin) @as(u8, 0x80) else 0) | @backingInt(opcode));
     if (payload.len < 126) {
         try out.append(gpa, 0x80 | @as(u8, @intCast(payload.len)));
     } else if (payload.len <= std.math.maxInt(u16)) {
@@ -1378,7 +1378,7 @@ test "FrameCodec: a close frame is delivered and echoed" {
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(gpa);
     var code: [2]u8 = undefined;
-    std.mem.writeInt(u16, &code, @intFromEnum(CloseCode.going_away), .big);
+    std.mem.writeInt(u16, &code, @backingInt(CloseCode.going_away), .big);
     try payload.appendSlice(gpa, &code);
     try payload.appendSlice(gpa, "bye");
 
@@ -2313,7 +2313,7 @@ test "FrameCodec: a compressed frame round trips through the codec" {
     var server = try deflateHarness(gpa, .server);
     defer server.deinit();
 
-    const payload = "compress me, compress me, compress me" ** 4;
+    const payload = test_support.repeat("compress me, compress me, compress me", 4);
     try server.fixture.pipeline.write(try Message.initAny(
         gpa,
         OutboundFrame,

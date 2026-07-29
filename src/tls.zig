@@ -957,10 +957,10 @@ test "Connection: a plain TCP peer is not mistaken for a TLS one" {
 test "Connection: verification choices map onto the session's options" {
     // A compile-time check that every `Verification` case is covered, so adding
     // one cannot silently fall through to the insecure branch.
-    inline for (@typeInfo(Verification).@"union".fields) |field| {
+    inline for (@typeInfo(Verification).@"union".field_names) |name| {
         comptime var seen = false;
         inline for (.{ "bundle", "self_signed", "insecure" }) |known| {
-            if (comptime std.mem.eql(u8, field.name, known)) seen = true;
+            if (comptime std.mem.eql(u8, name, known)) seen = true;
         }
         try testing.expect(seen);
     }

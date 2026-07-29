@@ -278,7 +278,7 @@ pub const Status = enum(u16) {
     _,
 
     pub fn code(status: Status) u16 {
-        return @intFromEnum(status);
+        return @backingInt(status);
     }
 
     pub fn phrase(status: Status) []const u8 {
@@ -1574,7 +1574,7 @@ pub const ResponseDecoder = struct {
         const code = std.fmt.parseInt(u16, code_text, 10) catch
             return error.MalformedStatusLine;
         if (code < 100) return error.MalformedStatusLine;
-        response.status = @enumFromInt(code);
+        response.status = @fromBackingInt(@intCast(code));
 
         const reason = if (rest.len > 3) std.mem.trim(u8, rest[3..], " \t") else "";
         if (!isFieldValueValid(reason)) return error.MalformedStatusLine;
@@ -1948,7 +1948,7 @@ test "Status: codes, phrases and body rules" {
     try testing.expect(!Status.no_content.allowsBody());
     try testing.expect(!Status.switching_protocols.allowsBody());
 
-    const custom: Status = @enumFromInt(599);
+    const custom: Status = @fromBackingInt(@intCast(599));
     try testing.expectEqual(@as(u16, 599), custom.code());
     try testing.expectEqualStrings("Unknown", custom.phrase());
 }
@@ -2222,7 +2222,7 @@ test "RequestDecoder: limits on the request line, headers and body" {
     {
         var harness = try DecoderHarness.init(gpa, .{ .max_request_line = 32 });
         defer harness.deinit();
-        try harness.feed("GET /" ++ ("x" ** 64) ++ " HTTP/1.1\r\n");
+        try harness.feed("GET /" ++ test_support.repeat("x", 64).* ++ " HTTP/1.1\r\n");
         try testing.expectEqual(@as(anyerror, error.HeaderTooLong), harness.errors()[0]);
     }
     {

@@ -185,3 +185,16 @@ pub const Fixture = struct {
         fixture.sink_impl.written.clearRetainingCapacity();
     }
 };
+
+/// Repeats `chunk` `count` times, standing in for the `**` operator that Zig 0.17
+/// removed. The value lives in a container-level constant so the returned pointer
+/// is comptime-known rather than into a stack temporary.
+pub fn repeat(comptime chunk: []const u8, comptime count: usize) *const [chunk.len * count]u8 {
+    return &struct {
+        const value = blk: {
+            var buffer: [chunk.len * count]u8 = undefined;
+            for (0..count) |i| @memcpy(buffer[i * chunk.len ..][0..chunk.len], chunk);
+            break :blk buffer;
+        };
+    }.value;
+}

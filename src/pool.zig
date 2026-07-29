@@ -279,7 +279,7 @@ pub const SharedBuffer = struct {
     /// builds where the atomics would be pure overhead.
     var live_count: std.atomic.Value(usize) = .init(0);
 
-    pub const track_leaks = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
+    pub const track_leaks = builtin.mode == .debug or builtin.mode == .safe;
 
     pub const Error = Allocator.Error;
 

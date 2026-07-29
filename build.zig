@@ -80,7 +80,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_fuzz = b.addRunArtifact(fuzz_tests);
-    if (b.args) |args| run_fuzz.addArgs(args);
+    run_fuzz.addPassthruArgs();
     fuzz_step.dependOn(&run_fuzz.step);
 
     // `zig build examples`, `zig build run-<name>`
@@ -90,7 +90,7 @@ pub fn build(b: *std.Build) void {
         examples_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
 
         const run_cmd = b.addRunArtifact(exe);
-        if (b.args) |args| run_cmd.addArgs(args);
+        run_cmd.addPassthruArgs();
         const run_step = b.step(
             b.fmt("run-{s}", .{name}),
             b.fmt("Run the {s} example", .{name}),
@@ -101,11 +101,11 @@ pub fn build(b: *std.Build) void {
     // `zig build bench`, `zig build bench-<name>`
     const bench_step = b.step("bench", "Build all benchmarks");
     for (benches) |name| {
-        const exe = addExecutable(b, name, "bench", target, .ReleaseFast, zinet_module, backend_module);
+        const exe = addExecutable(b, name, "bench", target, .fast, zinet_module, backend_module);
         bench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
 
         const run_cmd = b.addRunArtifact(exe);
-        if (b.args) |args| run_cmd.addArgs(args);
+        run_cmd.addPassthruArgs();
         const run_step = b.step(
             b.fmt("bench-{s}", .{name}),
             b.fmt("Run the {s} benchmark", .{name}),
@@ -114,7 +114,9 @@ pub fn build(b: *std.Build) void {
     }
 
     // `zig build fmt` / `zig build fmt-check`
-    const fmt_paths: []const []const u8 = &.{ "build.zig", "src", "examples", "bench" };
+    const fmt_paths: []const std.Build.LazyPath = &.{
+        b.path("build.zig"), b.path("src"), b.path("examples"), b.path("bench"),
+    };
     const fmt = b.addFmt(.{ .paths = fmt_paths });
     b.step("fmt", "Format all source files").dependOn(&fmt.step);
     const fmt_check = b.addFmt(.{ .paths = fmt_paths, .check = true });

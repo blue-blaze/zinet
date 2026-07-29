@@ -38,6 +38,7 @@
 //! Decompression handles both forms, because the peer is free to use either.
 
 const std = @import("std");
+const test_support = @import("test_support.zig");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const flate = std.compress.flate;
@@ -490,7 +491,7 @@ test "Deflate: each message compresses from an empty window" {
     var deflate: Deflate = .init(.{});
     defer deflate.deinit(gpa);
 
-    const payload = "Hello" ** 20;
+    const payload = test_support.repeat("Hello", 20);
 
     const first = try deflate.compress(gpa, payload);
     defer gpa.free(first);

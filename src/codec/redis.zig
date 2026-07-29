@@ -61,7 +61,7 @@ pub const Marker = enum(u8) {
 
     pub fn parse(byte: u8) ?Marker {
         return switch (byte) {
-            '+', '-', ':', '$', '*', '_', '#', ',', '(', '!', '=', '%', '~', '>' => @enumFromInt(byte),
+            '+', '-', ':', '$', '*', '_', '#', ',', '(', '!', '=', '%', '~', '>' => @fromBackingInt(@intCast(byte)),
             else => null,
         };
     }

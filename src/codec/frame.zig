@@ -417,7 +417,7 @@ pub const LengthFieldWidth = enum(u8) {
     eight = 8,
 
     pub fn byteCount(width: LengthFieldWidth) usize {
-        return @intFromEnum(width);
+        return @backingInt(width);
     }
 
     /// Reads a length field of this width from the front of `bytes`.
@@ -784,7 +784,7 @@ test "LineBasedFrameDecoder: an oversized line fails and the stream recovers" {
     const collector = try fixture.addCollector();
 
     // 20 bytes with no ending exceeds the 16-byte limit, so it fails fast.
-    fixture.pipeline.fireRead(try Message.initBytes(gpa, "x" ** 20));
+    fixture.pipeline.fireRead(try Message.initBytes(gpa, test_support.repeat("x", 20)));
     try testing.expectEqual(@as(usize, 1), collector.errors.items.len);
     try testing.expectEqual(@as(anyerror, error.FrameTooLong), collector.errors.items[0]);
     try testing.expectEqual(@as(usize, 0), collector.messages.items.len);
@@ -1135,7 +1135,7 @@ test "LengthFieldPrepender and decoder are inverses" {
         .length_field_width = .four,
     });
 
-    const payloads = [_][]const u8{ "", "a", "hello world", "x" ** 200 };
+    const payloads = [_][]const u8{ "", "a", "hello world", test_support.repeat("x", 200) };
     for (payloads) |payload| {
         try encoder_fixture.pipeline.write(try Message.initBytes(gpa, payload));
     }
@@ -1203,7 +1203,7 @@ test "LengthFieldBasedFrameDecoder: an oversized frame does not hide the frame b
     var wire: std.ArrayList(u8) = .empty;
     defer wire.deinit(gpa);
     try wire.appendSlice(gpa, "\x00\x20");
-    try wire.appendSlice(gpa, "x" ** 32);
+    try wire.appendSlice(gpa, test_support.repeat("x", 32));
     try wire.appendSlice(gpa, "\x00\x02ok");
 
     fixture.pipeline.fireRead(try Message.initBytes(gpa, wire.items));

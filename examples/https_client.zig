@@ -38,7 +38,7 @@ const Collector = struct {
 
         if (owned.get(http.IncomingResponse)) |response| {
             var outcome: Outcome = .{ .response = .{
-                .status = @intFromEnum(response.status),
+                .status = @backingInt(response.status),
                 .len = 0,
                 .body = undefined,
             } };
