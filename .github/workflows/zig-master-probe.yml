@@ -1,0 +1,99 @@
+# Does the standard library's evented `Io` compile yet?
+#
+# Zinet takes its `Io` as a parameter, and the interesting implementation is an
+# evented one: every task becomes a fiber rather than an OS thread. In 0.16.0 none
+# of the three backends `std.Io.Evented` selects will compile, which is why the
+# fiber configuration currently comes from a third party — see the README.
+#
+# Reading 0.17-dev suggests both causes have been dealt with upstream:
+#
+#   * macOS/`Dispatch`: 0.16 failed inside `Allocator.free`, which asserted its
+#     argument was a slice while `Dispatch` passes `main_loop_stack[0..len]`, a
+#     `*[len]u8`. 0.17's `free` permits exactly that, with a comment saying so.
+#   * Linux/`Uring`: 0.16 failed on two error-set mismatches, where `dirOpenDir`
+#     and `dirRealPathFile` let `error.ReadOnlyFileSystem` escape into sets that do
+#     not contain it. 0.17 absorbs it via `errnoBug(.ROFS)`.
+#
+# Reading is not compiling, and this cannot be checked from a machine that cannot
+# pull a 53 MB nightly. So it is checked here instead. Manual trigger only: it
+# tracks a moving target and says nothing about whether Zinet's own code builds on
+# 0.17-dev, which is a separate migration.
+name: zig master probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  evented:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: master
+
+      - name: Report the version under test
+        run: zig version
+
+      - name: Instantiate std.Io.Evented
+        run: |
+          set -euo pipefail
+          cat > probe.zig <<'ZIG'
+          const std = @import("std");
+
+          // Instantiating is the point: merely naming the type does not force the
+          // backend's function bodies to be analysed, and every 0.16 failure was
+          // inside one of those bodies.
+          pub fn main() !void {
+              var debug: std.heap.DebugAllocator(.{}) = .init;
+              defer _ = debug.deinit();
+              const gpa = debug.allocator();
+
+              var ev: std.Io.Evented = undefined;
+              try ev.init(gpa, .{});
+              defer ev.deinit();
+
+              const io = ev.io();
+
+              // Touch the operations Zinet leans on, so the probe fails if the
+              // backend compiles but cannot do the work: a bounded socket read is
+              // the load-bearing one, since it is what makes idle timeouts and
+              // cross-task work possible without a second task per connection.
+              var server = try std.Io.net.IpAddress.listen(
+                  &.{ .ip4 = .loopback(0) },
+                  io,
+                  .{ .reuse_address = true },
+              );
+              defer server.close(io);
+
+              const address = server.socket.address;
+              var future = try io.concurrent(connectOnce, .{ io, address });
+              defer future.await(io);
+
+              const accepted = try server.accept(io);
+              defer accepted.stream.close(io);
+
+              var buffer: [64]u8 = undefined;
+              const deadline = std.Io.Timestamp.now(io, .awake)
+                  .addDuration(.fromSeconds(5))
+                  .withClock(.awake);
+              const incoming = try accepted.stream.socket.receiveTimeout(
+                  io,
+                  &buffer,
+                  .{ .deadline = deadline },
+              );
+              if (!std.mem.eql(u8, incoming.data, "ping")) return error.Mismatch;
+
+              std.debug.print("evented io ok on {s}\n", .{@typeName(std.Io.Evented)});
+          }
+
+          fn connectOnce(io: std.Io, address: std.Io.net.IpAddress) void {
+              var stream = address.connect(io, .{ .mode = .stream }) catch return;
+              defer stream.close(io);
+              _ = stream.socket.send(io, &address, "ping") catch return;
+          }
+          ZIG
+          zig run probe.zig

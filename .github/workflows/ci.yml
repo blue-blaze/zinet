@@ -1,0 +1,381 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.optimize }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # Debug catches assertion failures and runs the leak checker; the release
+        # modes catch code that only compiles or only behaves with assertions on.
+        optimize: [Debug, ReleaseSafe, ReleaseFast]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Check formatting
+        if: matrix.optimize == 'Debug'
+        run: zig build fmt-check
+
+      # Through the build system rather than `zig test` directly, because the
+      # `backend` import that selects the `std.Io` implementation is wired in
+      # build.zig.
+      - name: Run tests
+        run: zig build test -Doptimize=${{ matrix.optimize }}
+
+      # The fuzz targets replay their corpora and run their seeded stress loops,
+      # so the properties they assert are checked on every commit rather than
+      # only during a dedicated fuzzing session.
+      - name: Run fuzz targets
+        run: zig build fuzz -Doptimize=${{ matrix.optimize }}
+
+      - name: Build examples
+        run: zig build examples -Doptimize=${{ matrix.optimize }}
+
+      - name: Build benchmarks
+        run: zig build bench
+
+  fibers:
+    name: fibers (${{ matrix.os }}, ${{ matrix.optimize }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        optimize: [Debug, ReleaseSafe]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      # `-Dio=zio` swaps the `std.Io` implementation for a fiber runtime, so every
+      # task becomes a fiber rather than an OS thread. This is the configuration
+      # the design was aimed at; the job exists so that "it works on fibers" is a
+      # checked claim rather than a hopeful one.
+      #
+      # It also fetches from the real URL. The pinned hash itself was checked
+      # locally: Zig's package hash addresses the *extracted tree*, not the
+      # tarball bytes, so three archives of tag v0.16.0 built at different
+      # compression levels all hash to the pinned value.
+      - name: Run tests on fibers
+        run: zig build test -Dio=zio -Doptimize=${{ matrix.optimize }}
+
+      - name: Run fuzz targets on fibers
+        run: zig build fuzz -Dio=zio -Doptimize=${{ matrix.optimize }}
+
+      - name: Build examples on fibers
+        run: zig build examples -Dio=zio -Doptimize=${{ matrix.optimize }}
+
+      # Real traffic, because a green unit-test run on a new I/O backend proves
+      # less than one exchange with somebody else's client.
+      - name: HTTP server on fibers answers curl
+        if: matrix.optimize == 'Debug'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./zig-out/bin/http_server 18301 > /tmp/fib.log 2>&1 &
+          server_pid=$!
+          for _ in $(seq 1 50); do
+            if grep -q listening /tmp/fib.log 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+          curl -fsS --max-time 5 -d "hello fibers" http://127.0.0.1:18301/echo | grep -q "hello fibers"
+          kill -INT "$server_pid"
+          wait "$server_pid"
+          echo "fiber-backed server exited cleanly"
+
+  smoke:
+    name: end-to-end smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build examples -Doptimize=ReleaseSafe
+
+      # Exercises the HTTP server for real, with an independent client, and
+      # confirms the process exits cleanly: the example's allocator returns a
+      # non-zero exit code if anything leaked.
+      - name: HTTP server responds and exits cleanly
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./zig-out/bin/http_server 18080 > /tmp/http.log 2>&1 &
+          server_pid=$!
+          for _ in $(seq 1 50); do
+            if curl -fsS --max-time 1 "http://127.0.0.1:18080/" >/dev/null 2>&1; then break; fi
+            sleep 0.2
+          done
+
+          curl -fsS --max-time 5 "http://127.0.0.1:18080/" | grep -q "Hello from Zinet"
+          curl -fsS --max-time 5 "http://127.0.0.1:18080/echo" -d 'ci payload' | grep -q "ci payload"
+          curl -fsS --max-time 5 "http://127.0.0.1:18080/stream" | grep -q "piece 3"
+          test "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+            "http://127.0.0.1:18080/missing")" = "404"
+
+          kill -INT "$server_pid"
+          wait "$server_pid"
+          echo "server exited cleanly"
+          cat /tmp/http.log
+
+      # The client side, checked against a server that is not Zinet's: Python's
+      # http.server ships with the runner, so this needs no dependencies.
+      - name: HTTP client talks to a third-party server
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m http.server 18081 --bind 127.0.0.1 > /tmp/py.log 2>&1 &
+          server_pid=$!
+          for _ in $(seq 1 50); do
+            if curl -fsS --max-time 1 "http://127.0.0.1:18081/" >/dev/null 2>&1; then break; fi
+            sleep 0.2
+          done
+
+          ./zig-out/bin/http_client 127.0.0.1 18081 / 2>&1 | grep -q "HTTP 200"
+
+          kill "$server_pid" || true
+          wait "$server_pid" 2>/dev/null || true
+          echo "client reached a third-party server"
+
+      # RESP over a raw socket, so no client library is needed. A clean exit is
+      # also proof of no leaks, since the example uses DebugAllocator.
+      - name: RESP server answers and exits cleanly
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./zig-out/bin/redis_server 18379 > /tmp/redis.log 2>&1 &
+          server_pid=$!
+          for _ in $(seq 1 50); do
+            if grep -q listening /tmp/redis.log 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+
+          reply=$(printf '*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\nhi\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n' \
+            | nc -w 2 127.0.0.1 18379 | tr -d '\r')
+          echo "$reply" | grep -q "PONG"
+          echo "$reply" | grep -q "OK"
+          echo "$reply" | grep -q "hi"
+
+          kill -INT "$server_pid"
+          wait "$server_pid"
+          echo "server exited cleanly"
+          cat /tmp/redis.log
+
+      # UDP over Python's stdlib socket module, so no dependency is needed.
+      - name: UDP endpoint echoes and exits cleanly
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./zig-out/bin/udp_echo 19090 > /tmp/udp.log 2>&1 &
+          server_pid=$!
+          for _ in $(seq 1 50); do
+            if grep -q listening /tmp/udp.log 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+
+          python3 -c '
+          import socket
+          sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          sock.settimeout(5)
+          target = ("127.0.0.1", 19090)
+          # An empty datagram is a real one, and 1400 bytes crosses no boundary a
+          # stream would have imposed.
+          for payload in [b"hello", b"", b"x" * 1400]:
+              sock.sendto(payload, target)
+              echoed, _ = sock.recvfrom(65535)
+              assert echoed == payload.upper(), (payload, echoed)
+          print("udp round trips ok")
+          '
+
+          kill -INT "$server_pid"
+          wait "$server_pid"
+          echo "server exited cleanly"
+
+      # The third-party `websockets` library, in both directions and with
+      # compression on. This is the check most worth automating: a
+      # permessage-deflate regression is silent against our own encoder, because
+      # both sides would agree on the same mistake.
+      - name: WebSocket both ways against a third-party library
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check websockets
+
+          # Under `set -e` a failed check skips the kills below, which would leave
+          # a listener holding the port. Harmless on a fresh runner, confusing
+          # anywhere the step is run twice.
+          pids=""
+          cleanup() {
+            for pid in $pids; do kill "$pid" 2>/dev/null || true; done
+            # Waited on, so the ports are free by the time the step returns.
+            for pid in $pids; do wait "$pid" 2>/dev/null || true; done
+          }
+          trap cleanup EXIT
+
+          # Zinet server, third-party client.
+          ./zig-out/bin/ws_echo 19101 > /tmp/wse.log 2>&1 &
+          server_pid=$!
+          pids="$pids $server_pid"
+          for _ in $(seq 1 50); do
+            if grep -q listening /tmp/wse.log 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+
+          python3 - 19101 <<'PYEOF'
+          import asyncio, sys
+          import websockets
+          from websockets.extensions import permessage_deflate
+
+          async def main(port):
+              extensions = [permessage_deflate.ClientPerMessageDeflateFactory(
+                  client_no_context_takeover=True, server_no_context_takeover=True)]
+              async with websockets.connect(f"ws://127.0.0.1:{port}/",
+                                            extensions=extensions) as ws:
+                  negotiated = [str(e) for e in ws.protocol.extensions]
+                  assert any("PerMessageDeflate" in e for e in negotiated), negotiated
+                  # Long enough to be compressed, then short enough not to be.
+                  for payload in ["the quick brown fox " * 40, "hi"]:
+                      await ws.send(payload)
+                      echoed = await asyncio.wait_for(ws.recv(), timeout=5)
+                      assert echoed == payload, (len(payload), len(echoed))
+                  # With no context takeover each message must decode alone, so a
+                  # stateful bug shows from the second onwards.
+                  for index in range(5):
+                      message = f"message {index} " * 10
+                      await ws.send(message)
+                      assert await asyncio.wait_for(ws.recv(), timeout=5) == message
+              print("compressed round trips ok")
+
+          asyncio.run(main(int(sys.argv[1])))
+          PYEOF
+
+          kill -INT "$server_pid"
+          wait "$server_pid"
+          echo "zinet server survived a third-party client"
+
+          # Third-party server, Zinet client.
+          python3 - 19102 <<'PYEOF' > /tmp/wss.log 2>&1 &
+          import asyncio, sys
+          import websockets
+          from websockets.extensions import permessage_deflate
+
+          async def handler(ws):
+              async for message in ws:
+                  await ws.send(f"echo: {message}")
+
+          async def main(port):
+              extensions = [permessage_deflate.ServerPerMessageDeflateFactory(
+                  client_no_context_takeover=True, server_no_context_takeover=True)]
+              async with websockets.serve(handler, "127.0.0.1", port,
+                                          extensions=extensions):
+                  print("listening", flush=True)
+                  await asyncio.sleep(20)
+
+          asyncio.run(main(int(sys.argv[1])))
+          PYEOF
+          peer_pid=$!
+          pids="$pids $peer_pid"
+          for _ in $(seq 1 50); do
+            if grep -q listening /tmp/wss.log 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+          grep -q listening /tmp/wss.log || { cat /tmp/wss.log; exit 1; }
+
+          # Written to a file rather than piped: `grep -q` exits on its first
+          # match, and the SIGPIPE that follows can kill the client before it has
+          # sent its close frame — which would make this step fail intermittently
+          # for a reason that has nothing to do with Zinet.
+          ./zig-out/bin/ws_client 127.0.0.1 19102 / > /tmp/wsc.log 2>&1
+          grep -q "echo: hello from zinet" /tmp/wsc.log
+
+          # A traceback here would mean Zinet sent something the library rejected,
+          # including a missing closing handshake.
+          if grep -qE "Traceback|no close frame" /tmp/wss.log; then
+            cat /tmp/wss.log
+            exit 1
+          fi
+          kill "$peer_pid" 2>/dev/null || true
+          wait "$peer_pid" 2>/dev/null || true
+          echo "zinet client satisfied a third-party server"
+
+      # OpenSSL's server, because the useful question is whether Zinet's TLS
+      # client agrees with a TLS implementation that is not Zinet's. Also the
+      # only way to test it at all: std has no `tls.Server`, so there is no
+      # in-process peer to hand a handshake to.
+      - name: TLS client against OpenSSL s_server
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir=$(mktemp -d)
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+            -keyout "$dir/key.pem" -out "$dir/cert.pem" \
+            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" \
+            >/dev/null 2>&1
+
+          start() {
+            openssl s_server -accept "$1" -cert "$dir/cert.pem" \
+              -key "$dir/key.pem" -www > "$dir/s$1.log" 2>&1 &
+            echo $!
+          }
+
+          pid=$(start 18443)
+          sleep 1
+          # 2>&1 because the examples report through stderr.
+          out=$(./zig-out/bin/https_client 127.0.0.1 18443 localhost / insecure 2>&1)
+          echo "$out" | head -2
+          echo "$out" | grep -q "TLS tls_1_3"
+          echo "$out" | grep -q "status 200"
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+
+          # A certificate nobody signed must not pass CA verification, and a name
+          # that does not match must not pass host verification.
+          pid=$(start 18444)
+          sleep 1
+          if ./zig-out/bin/https_client 127.0.0.1 18444 localhost / verify > /dev/null 2>&1; then
+            echo "an untrusted certificate was accepted" >&2
+            exit 1
+          fi
+          if ./zig-out/bin/https_client 127.0.0.1 18444 wrong.example / self-signed > /dev/null 2>&1; then
+            echo "a mismatched host name was accepted" >&2
+            exit 1
+          fi
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          echo "tls checks ok"
+
+      - name: Benchmarks run without leaking
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig build bench
+          ./zig-out/bin/echo_bench 8 1024 2 2
+          ./zig-out/bin/http_bench 8 2 2

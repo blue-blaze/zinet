@@ -1,0 +1,36 @@
+From: (unattributed — take it as a suggestion, not a claim of authorship)
+Subject: [PATCH] io: do not assert on an unfilled msg_name from recvmsg
+
+`recvmsg` fills `msg_name` only for an unconnected socket. On a connected one the
+kernel sets `msg_namelen = 0` and leaves the buffer alone, so the family byte read
+back in `zioIpToStdIo` is whatever was on the stack, and the `else` branch is
+reached. `netReceiveImpl` (src/io.zig:2347) and `extractBatchResult`
+(src/io.zig:844) both convert unconditionally, which is why this is fixed in the
+conversion rather than at either call site.
+
+`std.Io.Threaded` leaves the same storage `undefined` (std/Io/Threaded.zig:12897)
+and is fine because its `addressFromPosix` defines the case away
+(std/Io/Threaded.zig:13977-13984). zio's own accept path already does the same
+thing (src/io.zig:1948-1953).
+
+Rationale and evidence: zio-net-receive.md next to this file.
+---
+ src/io.zig | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/io.zig b/src/io.zig
+index 3296829..5a671c3 100644
+--- a/src/io.zig
++++ b/src/io.zig
+@@ -1827,7 +1827,10 @@ fn zioIpToStdIo(addr: zio_net.IpAddress) Io.net.IpAddress {
+             .flow = addr.in6.flowinfo,
+             .interface = .{ .index = addr.in6.scope_id },
+         } },
+-        else => unreachable,
++        // recvmsg leaves msg_name untouched on a connected socket, so the family
++        // read back here can be whatever was on the stack. Matches
++        // std.Io.Threaded's addressFromPosix, which returns this same placeholder.
++        else => .{ .ip4 = .loopback(0) },
+     };
+ }
+ 

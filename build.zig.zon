@@ -1,0 +1,25 @@
+.{
+    .name = .zinet,
+    .version = "0.1.0",
+    .fingerprint = 0x3ec57b17431a6ac8,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Only used by `-Dio=zio`, which points the tests, examples and
+        // benchmarks at a fiber runtime. Lazy, so `zig build` without that flag
+        // neither downloads nor builds it, and the library keeps depending on
+        // nothing but the standard library.
+        .zio = .{
+            .url = "https://github.com/lalinsky/zio/archive/refs/tags/v0.16.0.tar.gz",
+            .hash = "zio-0.16.0-xHbVVJQxIgAMdBlOCF65siVKJRVww9Z_ayfJanpk7VEK",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "bench",
+        "README.md",
+    },
+}
