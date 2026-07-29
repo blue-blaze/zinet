@@ -27,7 +27,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: 0.16.0
+          version: master
 
       - name: Check formatting
         if: matrix.optimize == 'Debug'
@@ -65,7 +65,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: 0.16.0
+          version: master
 
       # `-Dio=zio` swaps the `std.Io` implementation for a fiber runtime, so every
       # task becomes a fiber rather than an OS thread. This is the configuration
@@ -116,7 +116,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: 0.16.0
+          version: master
 
       - name: Build
         run: zig build examples -Doptimize=ReleaseSafe

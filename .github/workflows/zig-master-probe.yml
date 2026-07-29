@@ -1,23 +1,20 @@
-# Does the standard library's evented `Io` compile yet?
+# Can the standard library's evented `Io` do sockets yet?
 #
 # Zinet takes its `Io` as a parameter, and the interesting implementation is an
-# evented one: every task becomes a fiber rather than an OS thread. In 0.16.0 none
-# of the three backends `std.Io.Evented` selects will compile, which is why the
-# fiber configuration currently comes from a third party — see the README.
+# evented one: every task becomes a fiber rather than an OS thread. That is the
+# configuration the threading model was designed for, so it is worth tracking how
+# close the standard library is to supplying it.
 #
-# Reading 0.17-dev suggests both causes have been dealt with upstream:
+# As of 0.17.0-dev.1476 it is not close, and the reason has moved. In 0.16 the
+# backends did not compile. Now `Uring` compiles, and `Dispatch` compiles once one
+# line in `Allocator.free` is fixed — but on both, `netListenIp`, `netAccept` and
+# `netConnectIp` are wired to stubs that return `error.NetworkDown`. A framework
+# whose whole job is sockets cannot use that.
 #
-#   * macOS/`Dispatch`: 0.16 failed inside `Allocator.free`, which asserted its
-#     argument was a slice while `Dispatch` passes `main_loop_stack[0..len]`, a
-#     `*[len]u8`. 0.17's `free` permits exactly that, with a comment saying so.
-#   * Linux/`Uring`: 0.16 failed on two error-set mismatches, where `dirOpenDir`
-#     and `dirRealPathFile` let `error.ReadOnlyFileSystem` escape into sets that do
-#     not contain it. 0.17 absorbs it via `errnoBug(.ROFS)`.
-#
-# Reading is not compiling, and this cannot be checked from a machine that cannot
-# pull a 53 MB nightly. So it is checked here instead. Manual trigger only: it
-# tracks a moving target and says nothing about whether Zinet's own code builds on
-# 0.17-dev, which is a separate migration.
+# This probe asks the question the honest way: it tries to listen, connect, accept
+# and receive with a deadline, which is the exact set of operations a Zinet
+# connection needs. Failure here is expected and is not a Zinet regression, which
+# is why the trigger is manual — this tracks upstream, not us.
 name: zig master probe
 
 on:
@@ -31,69 +28,68 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@v1
         with:
           version: master
 
       - name: Report the version under test
         run: zig version
 
-      - name: Instantiate std.Io.Evented
+      - name: Listen, connect, accept and receive on std.Io.Evented
         run: |
           set -euo pipefail
           cat > probe.zig <<'ZIG'
           const std = @import("std");
+          const Io = std.Io;
 
-          // Instantiating is the point: merely naming the type does not force the
-          // backend's function bodies to be analysed, and every 0.16 failure was
-          // inside one of those bodies.
+          fn connectOnce(io: Io, address: Io.net.IpAddress) void {
+              var stream = address.connect(io, .{ .mode = .stream }) catch return;
+              defer stream.close(io);
+              _ = stream.socket.send(io, &address, "ping") catch return;
+          }
+
+          // Instantiating is the point: naming the type does not force the
+          // backend's function bodies to be analysed, and doing I/O is the point
+          // beyond that, since a backend can compile with every operation stubbed.
           pub fn main() !void {
               var debug: std.heap.DebugAllocator(.{}) = .init;
               defer _ = debug.deinit();
-              const gpa = debug.allocator();
 
-              var ev: std.Io.Evented = undefined;
-              try ev.init(gpa, .{});
+              var ev: Io.Evented = undefined;
+              try ev.init(debug.allocator(), .{});
               defer ev.deinit();
-
               const io = ev.io();
 
-              // Touch the operations Zinet leans on, so the probe fails if the
-              // backend compiles but cannot do the work: a bounded socket read is
-              // the load-bearing one, since it is what makes idle timeouts and
-              // cross-task work possible without a second task per connection.
-              var server = try std.Io.net.IpAddress.listen(
+              var server = try Io.net.IpAddress.listen(
                   &.{ .ip4 = .loopback(0) },
                   io,
                   .{ .reuse_address = true },
               );
-              defer server.close(io);
-
+              defer server.deinit(io);
               const address = server.socket.address;
+
               var future = try io.concurrent(connectOnce, .{ io, address });
               defer future.await(io);
 
               const accepted = try server.accept(io);
-              defer accepted.stream.close(io);
+              defer accepted.close(io);
 
+              // The load-bearing one: `net_receive` is the only operation in
+              // `std.Io.Operation` that can put a deadline on a socket read, which
+              // is what lets Zinet give every connection one task and still notice
+              // idle peers and cross-task work.
               var buffer: [64]u8 = undefined;
-              const deadline = std.Io.Timestamp.now(io, .awake)
+              const deadline = Io.Timestamp.now(io, .awake)
                   .addDuration(.fromSeconds(5))
                   .withClock(.awake);
-              const incoming = try accepted.stream.socket.receiveTimeout(
+              const incoming = try accepted.socket.receiveTimeout(
                   io,
                   &buffer,
                   .{ .deadline = deadline },
               );
               if (!std.mem.eql(u8, incoming.data, "ping")) return error.Mismatch;
 
-              std.debug.print("evented io ok on {s}\n", .{@typeName(std.Io.Evented)});
-          }
-
-          fn connectOnce(io: std.Io, address: std.Io.net.IpAddress) void {
-              var stream = address.connect(io, .{ .mode = .stream }) catch return;
-              defer stream.close(io);
-              _ = stream.socket.send(io, &address, "ping") catch return;
+              std.debug.print("evented io does sockets: {s}\n", .{@typeName(Io.Evented)});
           }
           ZIG
           zig run probe.zig

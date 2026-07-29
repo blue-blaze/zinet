@@ -2,15 +2,15 @@
     .name = .zinet,
     .version = "0.1.0",
     .fingerprint = 0x3ec57b17431a6ac8,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0-dev.1476+91a29d707",
     .dependencies = .{
         // Only used by `-Dio=zio`, which points the tests, examples and
         // benchmarks at a fiber runtime. Lazy, so `zig build` without that flag
         // neither downloads nor builds it, and the library keeps depending on
         // nothing but the standard library.
         .zio = .{
-            .url = "https://github.com/lalinsky/zio/archive/refs/tags/v0.16.0.tar.gz",
-            .hash = "zio-0.16.0-xHbVVJQxIgAMdBlOCF65siVKJRVww9Z_ayfJanpk7VEK",
+            .url = "git+https://github.com/lalinsky/zio#407427a21f3ac0ecb20847e146535465d7ad3d16",
+            .hash = "zio-0.16.0-xHbVVIvlIwAtXnRvRtdni09wYZVJgHuXN4YKoOKIwHsr",
             .lazy = true,
         },
     },

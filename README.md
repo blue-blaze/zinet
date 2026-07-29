@@ -1,7 +1,7 @@
 # Zinet
 
 An event-driven network application framework for Zig, in the spirit of Java's
-[Netty](https://github.com/netty/netty). Built on Zig 0.16's `std.Io`, with no
+[Netty](https://github.com/netty/netty). Built on Zig 0.17's `std.Io`, with no
 dependencies outside the standard library.
 
 ```zig
@@ -33,7 +33,7 @@ try server.serve();
 
 Working and tested: the core framework, framing codecs, HTTP/1.1 and WebSocket in
 both directions with `permessage-deflate`, Redis RESP2/RESP3, datagram (UDP)
-endpoints, and TLS 1.3 client connections. 271 tests pass on Linux and macOS in
+endpoints, and TLS 1.3 client connections. 272 tests pass on Linux and macOS in
 Debug, ReleaseSafe and ReleaseFast, all under a leak-checking allocator, plus
 eleven fuzz targets. The same suite also runs **on fibers** rather than threads —
 see [Choosing an `Io`](#choosing-an-io). Every protocol is checked against
@@ -69,24 +69,24 @@ trust.
 | `remoteAddress()` on a stream | `getpeername` | `std.Io` 0.16 exposes no such operation. Datagrams have the address anyway, because `recvmsg` reports it per message. |
 | TLS on the server side | `std.crypto.tls.Server` | `std/crypto/tls/` contains `Client.zig` and nothing else. Accepting a connection would mean hand-rolling certificate loading, `CertificateVerify` signing and session tickets. |
 | HTTP/2 over TLS | ALPN in the TLS client | `tls.Client.Options` has no ALPN field, and the `ClientHello` is built from five extensions of which ALPN is not one. RFC 9113 §3.1 identifies `h2` by ALPN, so every conforming server answers HTTP/1.1. See [HTTP2.md](HTTP2.md). |
-| An evented `Io` *in the standard library* | a backend that compiles | the table below. A third-party one works today; see [Choosing an `Io`](#choosing-an-io) |
+| An evented `Io` *in the standard library* | a backend that can listen, accept and connect | the table below. In 0.17-dev those three are stubs on every platform. A third-party one works today; see [Choosing an `Io`](#choosing-an-io) |
 
 The evented case deserves its own detail, because Zinet takes its `Io` as a
 parameter precisely so the application can choose the backend, and an evented one
-is the interesting case: every task becomes a fiber rather than a thread. In
-0.16.0 `std.Io.Evented` is declared but **none of the three backends it selects
-will compile**, each for its own reason:
+is the interesting case: every task becomes a fiber rather than a thread. It is
+worth being exact about what is missing, because "it does not compile" was true in
+0.16 and is no longer the whole story:
 
-| Backend | Selected on | Fails with |
+| Backend | Selected on | State in 0.17-dev |
 |---|---|---|
-| `Io/Dispatch.zig:584` | macOS | `free` is passed `main_loop_stack[0..len]`, which is a `*[len]u8` rather than a slice, so `Allocator.free`'s comptime assertion fails |
-| `Io/Kqueue.zig:637` | the BSDs | references `fileWriteStreaming`, a field no longer in `Io.VTable` |
-| `Io/Uring.zig:2732,3157` | Linux | error-set mismatches against the current `Io.VTable` |
+| `Io/Uring.zig` | Linux | Compiles. `netReceive`, `netBindIp`, `netShutdown` and `netClose` are implemented; `netListenIp`, `netAccept`, `netConnectIp`, `netSend`, `netWrite` are wired to `…Unavailable` stubs that return `error.NetworkDown` |
+| `Io/Dispatch.zig` | macOS | Does not compile: `deinit` frees `main_loop_stack[0..len]`, a `*[len]u8`, and `Allocator.free` rejects it — even though `free`'s own precondition permits exactly that, because the next line hands it to `absorbSentinel`, which asserts a slice. With that one line fixed it compiles and runs, and then only `netClose` of the network operations is implemented |
+| `Io/Kqueue.zig` | the BSDs | Does not compile: assigns `fileWriteStreaming` and `fileReadStreaming`, neither of which is a field of `Io.VTable` |
 
-All three fire on merely instantiating the backend, with no Zinet code involved,
-so there is nothing to work around from this side — but nothing stops a
-*different* implementation of the same interface, which is the point of taking
-`Io` as a parameter. See below.
+So the blocker moved rather than lifted. A framework whose whole job is sockets
+cannot use a backend that cannot listen, accept or connect, and on both platforms
+those are stubs. Nothing stops a *different* implementation of the same interface,
+which is the point of taking `Io` as a parameter. See below.
 
 ### Choosing an `Io`
 
@@ -95,7 +95,7 @@ tests, examples and benchmarks run on:
 
 ```
 zig build test              # std.Io.Threaded: every task is an OS thread
-zig build test -Dio=zio     # fibers, via github.com/lalinsky/zio
+zig build test -Dio=zio     # fibers, via github.com/lalinsky/zio (its zig-0.17 branch)
 ```
 
 The library keeps depending on nothing outside the standard library. The zio
