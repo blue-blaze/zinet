@@ -5,6 +5,7 @@
 //! identifies `h2` by ALPN, and `std.crypto.tls.Client` offers no way to send it.
 //! See [HTTP2.md](../../HTTP2.md).
 
+pub const flow = @import("http2/flow.zig");
 pub const frame = @import("http2/frame.zig");
 pub const hpack = @import("http2/hpack.zig");
 pub const headers = @import("http2/headers.zig");
@@ -17,6 +18,7 @@ pub const Settings = frame.Settings;
 pub const client_preface = frame.client_preface;
 
 test {
+    _ = flow;
     _ = frame;
     _ = hpack;
     _ = headers;
