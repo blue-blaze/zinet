@@ -33,9 +33,9 @@ try server.serve();
 
 Working and tested: the core framework, framing codecs, HTTP/1.1 and WebSocket in
 both directions with `permessage-deflate`, Redis RESP2/RESP3, datagram (UDP)
-endpoints, and TLS 1.3 client connections. 272 tests pass on Linux and macOS in
+endpoints, and TLS 1.3 client connections. 286 tests pass on Linux and macOS in
 Debug, ReleaseSafe and ReleaseFast, all under a leak-checking allocator, plus
-eleven fuzz targets. The same suite also runs **on fibers** rather than threads —
+twelve fuzz targets. The same suite also runs **on fibers** rather than threads —
 see [Choosing an `Io`](#choosing-an-io). Every protocol is checked against
 other people's code, not only its own counterpart: the HTTP server against
 `curl`, the HTTP client against Python's `http.server`, the WebSocket client *and*
@@ -205,6 +205,7 @@ graph TB
 | `MessageToMessageDecoder` | `MessageToMessageDecoder` | For decoders behind a framer |
 | `FixedLengthFrameDecoder` | `FixedLengthFrameDecoder` | |
 | `DelimiterBasedFrameDecoder` | `DelimiterBasedFrameDecoder` | |
+| `JsonObjectDecoder` | `json.JsonObjectDecoder` | Finds value boundaries; parsing is `std.json`'s job |
 | `Base64Encoder` / `Base64Decoder` | `Base64Encoder` / `Base64Decoder` | |
 | `StringDecoder` | — | `Message` already hands out `[]const u8`; `Utf8Validator` does the part that has behaviour |
 | `IdleStateHandler` | `IdleStateHandler` | Driven by `Channel.Tick`, not a scheduler |

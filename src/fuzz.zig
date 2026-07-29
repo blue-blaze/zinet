@@ -35,6 +35,7 @@ const Smith = std.testing.Smith;
 const buffer_mod = @import("buffer.zig");
 const frame = @import("codec/frame.zig");
 const http = @import("codec/http.zig");
+const json = @import("codec/json.zig");
 const pipeline_mod = @import("pipeline.zig");
 const pool_mod = @import("pool.zig");
 const permessage_deflate = @import("codec/permessage_deflate.zig");
@@ -617,6 +618,65 @@ const framing_corpus = [_][]const u8{
     // Exact multiples and a remainder, for the fixed-length decoder.
     "abcdefghij",
     "abcdefghijk",
+};
+
+// -- JSON ------------------------------------------------------------------
+
+fn installJsonDecoder(pipeline: *Pipeline) anyerror!void {
+    _ = try json.JsonObjectDecoder.addTo(pipeline, .{ .max_length = 64 });
+}
+
+fn installJsonStreamingDecoder(pipeline: *Pipeline) anyerror!void {
+    _ = try json.JsonObjectDecoder.addTo(pipeline, .{
+        .max_length = 64,
+        .stream_array_elements = true,
+    });
+}
+
+fn fuzzJsonBody(harness: *Harness, smith: *Smith, gpa: Allocator) anyerror!void {
+    var scratch: [max_input]u8 = undefined;
+    const len = smith.slice(&scratch);
+    const payload = scratch[0..len];
+
+    // Chunk independence is a sharper claim here than for the other framers,
+    // because this decoder carries a scan position across reads rather than
+    // rescanning: an off-by-one in that bookkeeping shows up as a frame that
+    // appears only when the bytes arrive whole, or only when they are split.
+    try expectChunkIndependent(gpa, harness.io(), smith, payload, installJsonDecoder);
+    try expectChunkIndependent(gpa, harness.io(), smith, payload, installJsonStreamingDecoder);
+}
+
+fn fuzzJson(harness: *Harness, smith: *Smith) anyerror!void {
+    return withLeakCheck(harness, smith, fuzzJsonBody);
+}
+
+test "fuzz: JSON value framing" {
+    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
+    defer harness.threaded.deinit();
+    try std.testing.fuzz(&harness, fuzzJson, .{ .corpus = &json_corpus });
+}
+
+const json_corpus = [_][]const u8{
+    "{}",
+    "{\"a\":1}{\"b\":2}",
+    // Whitespace only: consumed rather than accumulated.
+    "   \n\t  ",
+    "[1,2,3]",
+    // Structural bytes inside a string, an escaped quote, and a backslash
+    // immediately before the closing quote.
+    "{\"s\":\"}{][ \\\" \\\\\"}",
+    // A close with nothing open, with a good value behind it.
+    "}{\"a\":1}",
+    // Truncated, at each of the places a value can be cut.
+    "{\"a\":",
+    "{\"s\":\"unterminated",
+    "[{\"a\":1},",
+    // Deep nesting, and more than the configured maximum.
+    "[[[[[[[[[[1]]]]]]]]]]",
+    "{\"k\":\"0123456789012345678901234567890123456789012345678901234567890123456789\"}",
+    // Scalars, which only the streaming mode frames.
+    "[1,-2.5e3,true,false,null,\"x,y\"]",
+    "42",
 };
 
 // -- WebSocket -------------------------------------------------------------
@@ -1479,6 +1539,10 @@ test "stress: HTTP request decoder over random inputs" {
 
 test "stress: framing decoders over random inputs" {
     try runStress(fuzzFraming, 0xB0B);
+}
+
+test "stress: JSON value framing over random inputs" {
+    try runStress(fuzzJson, 0x150F);
 }
 
 test "stress: WebSocket frame decoder over random inputs" {
