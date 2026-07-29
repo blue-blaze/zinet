@@ -9,13 +9,13 @@
 //! `msg_namelen = 0` and leaves the buffer untouched. zio declares that buffer
 //! `undefined`, ignores the returned length, and converts it unconditionally:
 //!
-//!   src/io.zig:2347  .from = zioIpToStdIo(storage.ip),
-//!   src/io.zig:1830  else => unreachable,
+//!   src/io.zig:2406  .from = zioIpToStdIo(storage.ip),
+//!   src/io.zig:1871  else => unreachable,
 //!
 //! So the family byte is whatever was on the stack. std.Io.Threaded performs the
 //! same conversion but defines the case away:
 //!
-//!   std/Io/Threaded.zig:13982  else => .{ .ip4 = .loopback(0) },
+//!   std/Io/Threaded.zig:14181  else => .{ .ip4 = .loopback(0) },
 //!
 //! Expected: `net_receive` succeeds and `from` holds some defined value.
 //! Actual (Debug/ReleaseSafe): "reached unreachable code" in zioIpToStdIo.
@@ -23,6 +23,11 @@
 //!
 //! The write-up, including the one-line fix and the evidence that it works, is in
 //! zio-net-receive.md next to this file.
+//!
+//! Last confirmed to still reproduce against zio commit 407427a — the `zig-0.17`
+//! branch this repository pins — on Zig 0.17.0-dev.1476, macOS aarch64. The panic
+//! arrives at the two lines cited above, which is also what keeps those citations
+//! honest.
 
 const std = @import("std");
 const zio = @import("zio");

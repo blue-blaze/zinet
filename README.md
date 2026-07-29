@@ -66,7 +66,7 @@ trust.
 
 | Wanted | What is missing | Where that is visible |
 |---|---|---|
-| `remoteAddress()` on a stream | `getpeername` | `std.Io` 0.16 exposes no such operation. Datagrams have the address anyway, because `recvmsg` reports it per message. |
+| `remoteAddress()` on a stream | `getpeername` | `std.Io` 0.17 exposes no such operation. Datagrams have the address anyway, because `recvmsg` reports it per message. |
 | TLS on the server side | `std.crypto.tls.Server` | `std/crypto/tls/` contains `Client.zig` and nothing else. Accepting a connection would mean hand-rolling certificate loading, `CertificateVerify` signing and session tickets. |
 | HTTP/2 over TLS | ALPN in the TLS client | `tls.Client.Options` has no ALPN field, and the `ClientHello` is built from five extensions of which ALPN is not one. RFC 9113 §3.1 identifies `h2` by ALPN, so every conforming server answers HTTP/1.1. See [HTTP2.md](HTTP2.md). |
 | An evented `Io` *in the standard library* | a backend that can listen, accept and connect | the table below. In 0.17-dev those three are stubs on every platform. A third-party one works today; see [Choosing an `Io`](#choosing-an-io) |
@@ -120,9 +120,9 @@ Four tests skip on `-Dio=zio`, all for one upstream defect in zio rather than a
 difference of design. `std.Io.Operation` offers exactly one primitive that can put
 a deadline on a socket read — `net_receive` — and zio panics on it for a *stream*
 socket: `recvmsg` leaves `msg_name` untouched on a connected socket, and zio
-converts that untouched buffer unconditionally (`src/io.zig:2347` reaching
-`else => unreachable` at `src/io.zig:1830`) where the standard library defines the
-case away (`std/Io/Threaded.zig:13982`). So ticks, task hopping and TLS are
+converts that untouched buffer unconditionally (`src/io.zig:2406` reaching
+`else => unreachable` at `src/io.zig:1871`) where the standard library defines the
+case away (`std/Io/Threaded.zig:14181`). So ticks, task hopping and TLS are
 affected; everything else is not. A minimal reproducer is in
 [docs/zio-net-receive-repro.zig](docs/zio-net-receive-repro.zig).
 
@@ -138,7 +138,7 @@ the read against a timer with `Io.Select`, and a race needs `concurrent` rather
 than `async`, so every connection using ticks would pay an extra task on the
 threaded backend to dodge a bug on the fiber one. And it would not even work —
 `Io.Select` builds a `Batch`, whose `net_receive` reaches the same broken
-conversion from a second call site (`src/io.zig:844`).
+conversion from a second call site (`src/io.zig:865`).
 
 ### Deliberately absent
 

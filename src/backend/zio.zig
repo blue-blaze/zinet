@@ -16,9 +16,9 @@
 //! One known difference from the threaded backend, which is a zio defect rather
 //! than a design difference: `operateTimeout` with `.net_receive` panics on a
 //! *stream* socket, because `recvmsg` leaves `msg_name` untouched on a connected
-//! socket and zio converts that buffer unconditionally (`src/io.zig:2347` into
-//! `src/io.zig:1830`, `else => unreachable`), where the standard library defines
-//! the case away (`std/Io/Threaded.zig:13982`). That primitive is what
+//! socket and zio converts that buffer unconditionally (`src/io.zig:2406` into
+//! `src/io.zig:1871`, `else => unreachable`), where the standard library defines
+//! the case away (`std/Io/Threaded.zig:14181`). That primitive is what
 //! `Channel.receiveBounded` and `tls.PumpReader` are built on, so anything using
 //! ticks, task hopping or TLS is affected until it is fixed upstream.
 

@@ -1092,9 +1092,9 @@ fn sleepMs(io: Io, milliseconds: i64) void {
 /// `Channel.receiveBounded` is the only way to put a deadline on a socket read —
 /// `std.Io.Operation` offers no other primitive — and zio panics on it for a
 /// *stream* socket: `recvmsg` leaves `msg_name` untouched on a connected socket,
-/// and zio converts that untouched buffer unconditionally (`src/io.zig:2347`
-/// reaching `else => unreachable` at `src/io.zig:1830`) where the standard
-/// library defines the case away (`std/Io/Threaded.zig:13982`).
+/// and zio converts that untouched buffer unconditionally (`src/io.zig:2406`
+/// reaching `else => unreachable` at `src/io.zig:1871`) where the standard
+/// library defines the case away (`std/Io/Threaded.zig:14181`).
 ///
 /// So this is an upstream defect, not a difference of design, and it is stated
 /// here rather than silently skipped so the claim can be checked. Everything not

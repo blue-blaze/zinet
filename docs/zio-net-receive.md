@@ -10,7 +10,7 @@ Any `net_receive` on a **stream** socket panics:
 
 ```
 thread 6298162 panic: reached unreachable code
-zio/src/io.zig:1830:17: in zioIpToStdIo
+zio/src/io.zig:1871:17: in zioIpToStdIo
         .from = zioIpToStdIo(storage.ip),
 ```
 
@@ -26,7 +26,7 @@ socket the kernel sets `msg_namelen = 0` and leaves the buffer untouched.
 
 `netReceiveImpl` declares that buffer `undefined`, passes `&addr_len` so the
 kernel can report how much it wrote, then converts the buffer unconditionally and
-discards `addr_len` (`src/io.zig:2332-2347`):
+discards `addr_len` (`src/io.zig:2391-2406`):
 
 ```zig
 var storage: zio_net.Address = undefined;
@@ -37,14 +37,14 @@ message.* = .{
 ```
 
 So `addr.any.family` is whatever was on the stack, and `zioIpToStdIo` reaches its
-`else => unreachable` (`src/io.zig:1830`).
+`else => unreachable` (`src/io.zig:1871`).
 
 ### Why this is zio-specific rather than inherent
 
 `std.Io.Threaded` does the *same thing* with the storage — `var storage:
-PosixAddress = undefined` at `std/Io/Threaded.zig:12897` — and is fine, because
+PosixAddress = undefined` at `std/Io/Threaded.zig:13092` — and is fine, because
 its conversion defines the case away instead of asserting it cannot happen
-(`std/Io/Threaded.zig:13977-13984`):
+(`std/Io/Threaded.zig:14176-14183`):
 
 ```zig
 pub fn addressFromPosix(posix_address: *const PosixAddress) IpAddress {
@@ -66,15 +66,15 @@ rather than a choice.
 
 | Site | Path |
 |---|---|
-| `src/io.zig:2347` | `netReceiveImpl` — a direct `net_receive` |
-| `src/io.zig:844` | `extractBatchResult` — `net_receive` inside a `Batch`, i.e. what `Io.Select` builds |
+| `src/io.zig:2406` | `netReceiveImpl` — a direct `net_receive` |
+| `src/io.zig:865` | `extractBatchResult` — `net_receive` inside a `Batch`, i.e. what `Io.Select` builds |
 
 The second one matters because it is platform-independent and is on the path an
 application takes when racing a receive against a timer — a natural way to give a
 socket read a deadline. Guarding only `netReceiveImpl` would leave it broken.
 
 Worth noting: zio's own `accept` path already does the defended thing, with a
-comment reasoning about exactly this (`src/io.zig:1948-1953`):
+comment reasoning about exactly this (`src/io.zig:1994-1998`):
 
 ```zig
 .address = switch (peer_addr.any.family) {
@@ -123,7 +123,10 @@ Applied to a local v0.16.0 checkout, with no other change:
 * Reverting the one line restores the panic, so the line is the cause and not a
   coincidence.
 
-Environment: Zig 0.16.0, macOS aarch64 (kqueue backend).
+Environment: Zig `0.17.0-dev.1476+91a29d707`, macOS aarch64 (kqueue backend). The
+reproducer was last built and run against commit `407427a` on that toolchain, and
+the panic arrives at `src/io.zig:1871` by way of `src/io.zig:2406` — the two lines
+cited above.
 
 The patch is next to this file as
 [`zio-net-receive.patch`](zio-net-receive.patch). It applies cleanly to tag
