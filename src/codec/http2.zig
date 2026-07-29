@@ -7,6 +7,8 @@
 
 pub const frame = @import("http2/frame.zig");
 pub const hpack = @import("http2/hpack.zig");
+pub const headers = @import("http2/headers.zig");
+pub const stream = @import("http2/stream.zig");
 pub const huffman = @import("http2/huffman.zig");
 
 pub const ErrorCode = frame.ErrorCode;
@@ -17,5 +19,7 @@ pub const client_preface = frame.client_preface;
 test {
     _ = frame;
     _ = hpack;
+    _ = headers;
+    _ = stream;
     _ = huffman;
 }
