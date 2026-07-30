@@ -31,7 +31,10 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
+const Buffer = @import("../../buffer.zig").Buffer;
+const flow = @import("flow.zig");
 const frame = @import("frame.zig");
+const limits = @import("limits.zig");
 
 pub const Error = error{
     /// §5.4.2, `STREAM_CLOSED`: reset this stream and carry on.
@@ -104,6 +107,32 @@ pub const State = enum {
 pub const Stream = struct {
     id: u31,
     state: State = .idle,
+
+    /// §5.2: the two windows are per stream as well as per connection, and they
+    /// live here rather than in a table of their own because they are created and
+    /// destroyed with the stream. Defaults are §6.5.2's, replaced by whatever was
+    /// negotiated when the registry opens the stream.
+    send_window: flow.Window = .init(frame.default_initial_window_size),
+    recv_window: flow.Window = .init(frame.default_initial_window_size),
+    /// Bytes the application has handed over that no credit has yet covered, and
+    /// the water mark accounting that reports it. See `flow.SendQueue` for why
+    /// HTTP/2 needs this where the rest of the framework blocks instead.
+    sends: flow.SendQueue = .{},
+    pending: Buffer = .empty,
+    /// Set when `END_STREAM` should go out with the last of `pending`.
+    pending_end_stream: bool = false,
+    /// Whether a header block has been *received* on this stream, so that a second
+    /// one is recognised as trailers (§8.1).
+    ///
+    /// Strictly the receive direction. Marking it when this side sends its own
+    /// headers conflates the two, and then a client treats the response it asked
+    /// for as trailers on its own request — which is exactly what happened before
+    /// the two-sided test above existed to catch it.
+    remote_headers_seen: bool = false,
+
+    pub fn deinit(stream: *Stream, gpa: Allocator) void {
+        stream.pending.deinit(gpa);
+    }
 
     /// §6.2. `end_stream` is the flag on the frame, which is what actually drives
     /// the transition — a `HEADERS` with it set opens and half-closes at once.
@@ -220,28 +249,9 @@ pub const Stream = struct {
 /// `SETTINGS_MAX_CONCURRENT_STREAMS`, so a reset stream frees its slot at once and
 /// the concurrency limit — the obvious defence — never engages.
 ///
-/// So the bound has to be on the *rate*, which is a shape nothing else in this
-/// codebase needs: every other limit here is a ceiling on a quantity. Time is
-/// injected rather than read, in keeping with the rest of the framework.
-pub const ResetLimiter = struct {
-    /// Netty's defaults, which are the closest thing to a community consensus.
-    max_per_window: u32 = 200,
-    window_ns: u64 = 30 * std.time.ns_per_s,
-
-    window_start_ns: u64 = 0,
-    count: u32 = 0,
-    started: bool = false,
-
-    pub fn record(limiter: *ResetLimiter, now_ns: u64) Error!void {
-        if (!limiter.started or now_ns -| limiter.window_start_ns >= limiter.window_ns) {
-            limiter.started = true;
-            limiter.window_start_ns = now_ns;
-            limiter.count = 0;
-        }
-        limiter.count += 1;
-        if (limiter.count > limiter.max_per_window) return error.EnhanceYourCalm;
-    }
-};
+/// The mechanism is `limits.RateLimiter`, shared with the control-frame floods,
+/// which have a different cause and the same answer.
+pub const ResetLimiter = limits.RateLimiter;
 
 /// The live streams of one connection, plus the identifier rules of §5.1.1.
 ///
@@ -260,6 +270,9 @@ pub const Registry = struct {
     /// §5.1.2, as the peer announced it. Absent means unlimited, so a ceiling of
     /// our own is applied regardless; see `Options`.
     peer_max_concurrent: ?u32 = null,
+    /// The initial window sizes in force, which `SETTINGS` may change.
+    initial_send_window: u31 = frame.default_initial_window_size,
+    initial_recv_window: u31 = frame.default_initial_window_size,
     options: Options = .{},
 
     pub const Options = struct {
@@ -269,6 +282,7 @@ pub const Registry = struct {
         /// codebase offers.
         max_concurrent_streams: u32 = 128,
         resets: ResetLimiter = .{},
+        sends: flow.SendQueue.Limits = .{},
     };
 
     pub fn init(is_server: bool, options: Options) Registry {
@@ -276,6 +290,8 @@ pub const Registry = struct {
     }
 
     pub fn deinit(registry: *Registry, gpa: Allocator) void {
+        var iterator = registry.streams.valueIterator();
+        while (iterator.next()) |stream| stream.deinit(gpa);
         registry.streams.deinit(gpa);
         registry.* = undefined;
     }
@@ -325,10 +341,7 @@ pub const Registry = struct {
         }
 
         registry.highest_remote = id;
-        const entry = try registry.streams.getOrPut(gpa, id);
-        assert(!entry.found_existing);
-        entry.value_ptr.* = .{ .id = id };
-        return entry.value_ptr;
+        return registry.create(gpa, id);
     }
 
     /// Registers a stream this endpoint is opening.
@@ -340,9 +353,21 @@ pub const Registry = struct {
             if (registry.concurrentCount() >= limit) return error.RefusedStream;
         }
         registry.highest_local = id;
+        return registry.create(gpa, id);
+    }
+
+    fn create(registry: *Registry, gpa: Allocator, id: u31) Allocator.Error!*Stream {
         const entry = try registry.streams.getOrPut(gpa, id);
         assert(!entry.found_existing);
-        entry.value_ptr.* = .{ .id = id };
+        entry.value_ptr.* = .{
+            .id = id,
+            // The windows start at whatever each side announced, not at the
+            // default: a peer that sent SETTINGS before this stream existed has
+            // already changed the initial size for it.
+            .send_window = .init(registry.initial_send_window),
+            .recv_window = .init(registry.initial_recv_window),
+            .sends = .init(registry.options.sends),
+        };
         return entry.value_ptr;
     }
 
@@ -363,10 +388,23 @@ pub const Registry = struct {
         return id <= highest;
     }
 
-    /// Drops a stream that has reached a closed state. Called after the caller has
-    /// finished with it, since the entry owns nothing.
-    pub fn remove(registry: *Registry, id: u31) void {
+    /// Drops a stream that has reached a closed state, releasing whatever it still
+    /// had queued. A stream that is reset with bytes pending is the ordinary case.
+    pub fn remove(registry: *Registry, gpa: Allocator, id: u31) void {
+        if (registry.streams.getPtr(id)) |stream| stream.deinit(gpa);
         _ = registry.streams.remove(id);
+    }
+
+    /// §6.9.2: a new `SETTINGS_INITIAL_WINDOW_SIZE` from the peer shifts every
+    /// existing stream's *send* window by the difference. Applying it to new
+    /// streams alone would leave the two sides disagreeing about every stream
+    /// already open.
+    pub fn adjustSendWindows(registry: *Registry, old: u31, new: u31) flow.Error!void {
+        const delta = @as(i64, new) - @as(i64, old);
+        registry.initial_send_window = new;
+        if (delta == 0) return;
+        var iterator = registry.streams.valueIterator();
+        while (iterator.next()) |stream| try stream.send_window.adjust(delta);
     }
 
     /// Records a reset for the rate limit. Returns `error.EnhanceYourCalm` when the
@@ -602,7 +640,7 @@ test "registry: §5.1.2 refuses rather than resets, and keeps the identifier" {
 
     // Finishing one frees a slot.
     try a.onRstStream(.remote);
-    registry.remove(1);
+    registry.remove(gpa, 1);
     try testing.expectEqual(@as(u32, 1), registry.concurrentCount());
     _ = try registry.openRemote(gpa, 7);
 }
@@ -638,7 +676,7 @@ test "registry: Rapid Reset is bounded by rate, since the slot limit cannot see 
         try s.onHeaders(.remote, false);
         try s.onRstStream(.remote);
         try registry.recordReset(0);
-        registry.remove(id);
+        registry.remove(gpa, id);
         id += 2;
     }
     try testing.expectEqual(@as(u32, 0), registry.concurrentCount());
@@ -651,22 +689,4 @@ test "registry: Rapid Reset is bounded by rate, since the slot limit cannot see 
     // The window moves on, and a peer that resets occasionally is unaffected.
     try registry.recordReset(1_000_000_000);
     try registry.recordReset(1_000_000_001);
-}
-
-test "stream: ResetLimiter refills rather than counting for ever" {
-    var limiter: ResetLimiter = .{ .max_per_window = 2, .window_ns = 100 };
-
-    try limiter.record(1_000);
-    try limiter.record(1_050);
-    try testing.expectError(error.EnhanceYourCalm, limiter.record(1_099));
-    // A new window starts at the first record past its end.
-    try limiter.record(1_100);
-    try limiter.record(1_150);
-    try testing.expectError(error.EnhanceYourCalm, limiter.record(1_199));
-
-    // Time going backwards must not open the gate: saturating subtraction keeps
-    // the comparison meaningful rather than wrapping into a huge elapsed time.
-    var backwards: ResetLimiter = .{ .max_per_window = 1, .window_ns = 100 };
-    try backwards.record(1_000);
-    try testing.expectError(error.EnhanceYourCalm, backwards.record(0));
 }

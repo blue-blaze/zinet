@@ -5,12 +5,14 @@
 //! identifies `h2` by ALPN, and `std.crypto.tls.Client` offers no way to send it.
 //! See [HTTP2.md](../../HTTP2.md).
 
+pub const connection = @import("http2/connection.zig");
 pub const flow = @import("http2/flow.zig");
 pub const frame = @import("http2/frame.zig");
 pub const hpack = @import("http2/hpack.zig");
 pub const headers = @import("http2/headers.zig");
 pub const stream = @import("http2/stream.zig");
 pub const huffman = @import("http2/huffman.zig");
+pub const limits = @import("http2/limits.zig");
 
 pub const ErrorCode = frame.ErrorCode;
 pub const FrameType = frame.FrameType;
@@ -18,10 +20,12 @@ pub const Settings = frame.Settings;
 pub const client_preface = frame.client_preface;
 
 test {
+    _ = connection;
     _ = flow;
     _ = frame;
     _ = hpack;
     _ = headers;
     _ = stream;
     _ = huffman;
+    _ = limits;
 }
