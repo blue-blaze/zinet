@@ -223,6 +223,64 @@ jobs:
       # compression on. This is the check most worth automating: a
       # permessage-deflate regression is silent against our own encoder, because
       # both sides would agree on the same mistake.
+      - name: HTTP/2 answers curl, on one connection, with flow control
+        run: |
+          set -euo pipefail
+          ./zig-out/bin/http2_server 18081 > /tmp/http2.log 2>&1 &
+          server_pid=$!
+          for _ in $(seq 1 50); do
+            if curl -fsS --max-time 1 --http2-prior-knowledge \
+              "http://127.0.0.1:18081/" >/dev/null 2>&1; then break; fi
+            sleep 0.2
+          done
+
+          # The version actually used, not the one asked for: curl reports HTTP/1.1
+          # here if anything about the handshake went wrong.
+          test "$(curl -sS -o /dev/null --max-time 5 --http2-prior-knowledge \
+            -w '%{http_version}' "http://127.0.0.1:18081/")" = "2"
+
+          curl -fsS --max-time 5 --http2-prior-knowledge \
+            "http://127.0.0.1:18081/" | grep -q "hello over HTTP/2"
+          curl -fsS --max-time 5 --http2-prior-knowledge \
+            "http://127.0.0.1:18081/echo" -d 'ci payload' | grep -q "ci payload"
+          curl -fsS --max-time 5 --http2-prior-knowledge \
+            "http://127.0.0.1:18081/slow" | grep -q "piece 4"
+          test "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+            --http2-prior-knowledge "http://127.0.0.1:18081/missing")" = "404"
+
+          # A response with no body at all. This is the shape that hung before
+          # END_STREAM stopped going through the write scheduler.
+          test "$(curl -s -o /dev/null -w '%{size_download}' --max-time 5 \
+            --http2-prior-knowledge "http://127.0.0.1:18081/echo")" = "0"
+
+          # Several requests over one connection, which is the whole point of the
+          # protocol. num_connects is 1 for the first and 0 for the rest.
+          connects=$(curl -sS --max-time 10 --http2-prior-knowledge \
+            -w '%{num_connects}' -o /dev/null "http://127.0.0.1:18081/" \
+            -o /dev/null "http://127.0.0.1:18081/missing" \
+            -o /dev/null "http://127.0.0.1:18081/slow" | tr -d '\n')
+          test "$connects" = "100"
+
+          # Eight streams at once on one connection. Every one must answer, which
+          # the concatenated status codes say more precisely than an exit code.
+          codes=$(curl -sS --max-time 10 --http2-prior-knowledge --parallel \
+            --parallel-immediate -o /dev/null -w '%{http_code}' \
+            "http://127.0.0.1:18081/[1-8]" | tr -d '\n')
+          test "$codes" = "404404404404404404404404"
+
+          # 300 KiB each way, which crosses the 64 KiB initial window many times and
+          # so only completes if WINDOW_UPDATE and the write scheduler both work.
+          python3 -c "import sys; sys.stdout.write('x' * 300000)" > /tmp/h2big.txt
+          curl -fsS --max-time 30 --http2-prior-knowledge \
+            --data-binary @/tmp/h2big.txt -o /tmp/h2back.txt \
+            "http://127.0.0.1:18081/echo"
+          cmp /tmp/h2big.txt /tmp/h2back.txt
+
+          kill -INT "$server_pid"
+          wait "$server_pid"
+          echo "http/2 server exited cleanly"
+          cat /tmp/http2.log
+
       - name: WebSocket both ways against a third-party library
         shell: bash
         run: |
