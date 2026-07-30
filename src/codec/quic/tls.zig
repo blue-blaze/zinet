@@ -375,6 +375,7 @@ pub const Schedule = struct {
 };
 
 const testing = std.testing;
+const vectors = @import("rfc8448.zig");
 
 fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {
     var out: [hex.len / 2]u8 = undefined;
@@ -382,46 +383,25 @@ fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {
     return out;
 }
 
-/// RFC 8448 §3's ClientHello, exactly as published.
-const rfc8448_client_hello = hexBytes(
-    "010000c00303cb34ecb1e78163ba1c38c6dacb196a" ++
-        "6dffa21a8d9912ec18a2ef6283024dece700000613011303" ++
-        "1302010000910000000b0009000006736572766572ff0100" ++
-        "0100000a00140012001d0017001800190100010101020103" ++
-        "010400230000003300260024001d002099381de560e4bd43" ++
-        "d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c" ++
-        "002b0003020304000d0020001e0403050306030203080408" ++
-        "05080604010501060102010402050206020202002d000201" ++
-        "01001c00024001",
-);
-
-/// And its ServerHello.
-const rfc8448_server_hello = hexBytes(
-    "020000560303a6af06a4121860dc5e6e60249cd34c" ++
-        "95930c8ac5cb1434dac155772ed3e2692800130100002e00" ++
-        "330024001d0020c9828876112095fe66762bdbf7c672e156" ++
-        "d6cc253b833df1dd69b1b04e751f0f002b00020304",
-);
-
 test "tls: RFC 8448 message framing over a split stream" {
-    try testing.expectEqual(@as(usize, 196), rfc8448_client_hello.len);
-    try testing.expectEqual(@as(usize, 90), rfc8448_server_hello.len);
+    try testing.expectEqual(@as(usize, 196), vectors.client_hello.len);
+    try testing.expectEqual(@as(usize, 90), vectors.server_hello.len);
 
     // A CRYPTO stream may split a message anywhere, so every prefix must report
     // "not yet" rather than guessing.
-    for (0..rfc8448_client_hello.len) |cut| {
-        try testing.expect(try nextMessage(rfc8448_client_hello[0..cut]) == null);
+    for (0..vectors.client_hello.len) |cut| {
+        try testing.expect(try nextMessage(vectors.client_hello[0..cut]) == null);
     }
 
-    const message = (try nextMessage(&rfc8448_client_hello)).?;
+    const message = (try nextMessage(&vectors.client_hello)).?;
     try testing.expectEqual(MessageType.client_hello, message.type);
     try testing.expectEqual(@as(usize, 192), message.body.len);
-    try testing.expectEqualSlices(u8, &rfc8448_client_hello, message.raw);
+    try testing.expectEqualSlices(u8, &vectors.client_hello, message.raw);
 
     // Two messages back to back, which is how a server's flight arrives.
     var both: [196 + 90]u8 = undefined;
-    @memcpy(both[0..196], &rfc8448_client_hello);
-    @memcpy(both[196..], &rfc8448_server_hello);
+    @memcpy(both[0..196], &vectors.client_hello);
+    @memcpy(both[196..], &vectors.server_hello);
     const first = (try nextMessage(&both)).?;
     try testing.expectEqual(@as(usize, 196), first.raw.len);
     const second = (try nextMessage(both[first.raw.len..])).?;
@@ -439,12 +419,12 @@ test "tls: RFC 8448 §3 transcript hash over ClientHello and ServerHello" {
     // a wrong transcript produces keys that are internally consistent and
     // useless — the peer simply cannot decrypt anything.
     var transcript: Transcript = .init(.aes_128_gcm_sha256);
-    transcript.update(&rfc8448_client_hello);
-    transcript.update(&rfc8448_server_hello);
+    transcript.update(&vectors.client_hello);
+    transcript.update(&vectors.server_hello);
     const hash = transcript.peek();
     try testing.expectEqualSlices(
         u8,
-        &hexBytes("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8"),
+        &vectors.hello_hash,
         hash[0..32],
     );
 }
@@ -455,35 +435,35 @@ test "tls: RFC 8448 §3 key schedule, every published intermediate value" {
     // §7.1's early secret, with no PSK.
     try testing.expectEqualSlices(
         u8,
-        &hexBytes("33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"),
+        &vectors.early_secret,
         schedule.early_secret[0..32],
     );
 
-    schedule.addMessage(&rfc8448_client_hello);
-    schedule.addMessage(&rfc8448_server_hello);
+    schedule.addMessage(&vectors.client_hello);
+    schedule.addMessage(&vectors.server_hello);
 
     // The ECDHE output §3 publishes for its x25519 pair.
-    const shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
+    const shared = vectors.shared_secret;
     const handshake = schedule.setSharedSecret(&shared);
 
     try testing.expectEqualSlices(
         u8,
-        &hexBytes("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"),
+        &vectors.handshake_secret,
         schedule.handshake_secret[0..32],
     );
     try testing.expectEqualSlices(
         u8,
-        &hexBytes("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"),
+        &vectors.client_handshake_secret,
         handshake.client.slice(),
     );
     try testing.expectEqualSlices(
         u8,
-        &hexBytes("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"),
+        &vectors.server_handshake_secret,
         handshake.server.slice(),
     );
     try testing.expectEqualSlices(
         u8,
-        &hexBytes("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"),
+        &vectors.master_secret,
         schedule.master_secret[0..32],
     );
 
@@ -499,28 +479,13 @@ test "tls: RFC 8448 §3 Finished, both directions" {
     // is deliberate: the messages are cut back out with `nextMessage`, so this
     // tests the framing and the key schedule together, and a hand-split
     // transcription cannot introduce a boundary error the RFC does not have.
-    const flight = hexBytes(
-        "080000240022000a00140012001d00170018001901000101010201030104001c00024001000000000b0001b9000001b5" ++
-            "0001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a0603550403130372" ++
-            "7361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a0603550403130372" ++
-            "736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d980836399b36c6988c" ++
-            "0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0cc" ++
-            "b0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a" ++
-            "8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0" ++
-            "300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594" ++
-            "365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1" ++
-            "fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b4" ++
-            "2b4de100000f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc" ++
-            "90db78e2d33a5c141a078653fa6bef780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671" ++
-            "459e46445c9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea20d53dfacd42f74f3140000" ++
-            "209b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718",
-    );
+    const flight = vectors.server_flight;
     try testing.expectEqual(@as(usize, 657), flight.len);
 
     var schedule: Schedule = .init(.aes_128_gcm_sha256);
-    schedule.addMessage(&rfc8448_client_hello);
-    schedule.addMessage(&rfc8448_server_hello);
-    const shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
+    schedule.addMessage(&vectors.client_hello);
+    schedule.addMessage(&vectors.server_hello);
+    const shared = vectors.shared_secret;
     const handshake = schedule.setSharedSecret(&shared);
 
     // Walk the flight. The server's Finished covers everything before it, so the
@@ -550,7 +515,7 @@ test "tls: RFC 8448 §3 Finished, both directions" {
     const server_finished = schedule.finishedVerifyData(handshake.server.slice());
     try testing.expectEqualSlices(
         u8,
-        &hexBytes("9b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718"),
+        &vectors.server_verify_data,
         server_finished.slice(),
     );
     try testing.expectEqualSlices(u8, server_finished_body, server_finished.slice());
@@ -571,17 +536,17 @@ test "tls: RFC 8448 §3 Finished, both directions" {
     const application = schedule.applicationSecrets();
     try testing.expectEqualSlices(
         u8,
-        &hexBytes("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"),
+        &vectors.client_application_secret,
         application.client.slice(),
     );
     try testing.expectEqualSlices(
         u8,
-        &hexBytes("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"),
+        &vectors.server_application_secret,
         application.server.slice(),
     );
     try testing.expectEqualSlices(
         u8,
-        &hexBytes("fe22f881176eda18eb8f44529e6792c50c9a3f89452f68d8ae311b4309d3cf50"),
+        &vectors.exporter_secret,
         schedule.exporterSecret().slice(),
     );
 
@@ -591,7 +556,7 @@ test "tls: RFC 8448 §3 Finished, both directions" {
     const client_finished = schedule.finishedVerifyData(handshake.client.slice());
     try testing.expectEqualSlices(
         u8,
-        &hexBytes("a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61"),
+        &vectors.client_verify_data,
         client_finished.slice(),
     );
 }
@@ -602,7 +567,7 @@ test "tls: the two derive-secret forms are not interchangeable" {
     // produces a schedule that is self-consistent and cannot talk to anything,
     // so this asserts they differ.
     var schedule: Schedule = .init(.aes_128_gcm_sha256);
-    schedule.addMessage(&rfc8448_client_hello);
+    schedule.addMessage(&vectors.client_hello);
 
     const len = schedule.digestLen();
     const over_empty = schedule.deriveSecretOfEmpty(schedule.early_secret[0..len], "derived");
@@ -613,7 +578,7 @@ test "tls: the two derive-secret forms are not interchangeable" {
     // says which of the two is correct there.
     try testing.expectEqualSlices(
         u8,
-        &hexBytes("6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba"),
+        &vectors.derived_for_handshake,
         over_empty.slice(),
     );
 }
@@ -627,9 +592,9 @@ test "tls: SHA-384 suites run the same schedule at a different width" {
     try testing.expectEqual(@as(usize, 48), wide.digestLen());
     try testing.expectEqual(@as(usize, 48), wide.transcript.digestLen());
 
-    wide.addMessage(&rfc8448_client_hello);
-    wide.addMessage(&rfc8448_server_hello);
-    const shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
+    wide.addMessage(&vectors.client_hello);
+    wide.addMessage(&vectors.server_hello);
+    const shared = vectors.shared_secret;
     const handshake = wide.setSharedSecret(&shared);
     try testing.expectEqual(@as(u8, 48), handshake.client.len);
     try testing.expectEqual(@as(u8, 48), handshake.server.len);
@@ -641,8 +606,8 @@ test "tls: SHA-384 suites run the same schedule at a different width" {
     // The same inputs under SHA-256 must give something different, or one of the
     // branches is not being taken.
     var narrow: Schedule = .init(.aes_128_gcm_sha256);
-    narrow.addMessage(&rfc8448_client_hello);
-    narrow.addMessage(&rfc8448_server_hello);
+    narrow.addMessage(&vectors.client_hello);
+    narrow.addMessage(&vectors.server_hello);
     const narrow_handshake = narrow.setSharedSecret(&shared);
     try testing.expect(!std.mem.eql(
         u8,

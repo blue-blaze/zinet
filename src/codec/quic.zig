@@ -13,6 +13,7 @@
 //! * `crypto` — RFC 9001 §5, packet protection and header protection
 //! * `tls` — RFC 8446 §7.1's key schedule, in the engine shape RFC 9001 §4 needs
 //! * `handshake` — RFC 8446 §4's messages and extensions, with RFC 9001 §8's rules
+//! * `verify` — certificate chains and CertificateVerify (§4.4.2, §4.4.3)
 
 pub const varint = @import("quic/varint.zig");
 pub const packet = @import("quic/packet.zig");
@@ -20,6 +21,9 @@ pub const frame = @import("quic/frame.zig");
 pub const crypto = @import("quic/crypto.zig");
 pub const tls = @import("quic/tls.zig");
 pub const handshake = @import("quic/handshake.zig");
+pub const verify = @import("quic/verify.zig");
+/// RFC 8448 test vectors, shared by the tests of the layers above.
+pub const rfc8448 = @import("quic/rfc8448.zig");
 
 pub const ConnectionId = packet.ConnectionId;
 pub const Version = packet.Version;
@@ -31,4 +35,6 @@ test {
     _ = crypto;
     _ = tls;
     _ = handshake;
+    _ = verify;
+    _ = rfc8448;
 }
