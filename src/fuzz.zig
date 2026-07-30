@@ -35,6 +35,7 @@ const Smith = std.testing.Smith;
 const buffer_mod = @import("buffer.zig");
 const frame = @import("codec/frame.zig");
 const http = @import("codec/http.zig");
+const http2 = @import("codec/http2.zig");
 const json = @import("codec/json.zig");
 const pipeline_mod = @import("pipeline.zig");
 const pool_mod = @import("pool.zig");
@@ -288,31 +289,41 @@ fn expectChunkIndependent(
         rig.finish();
     }
 
-    if (!std.mem.eql(u8, whole.out.items, fragmented.out.items)) {
-        var at: usize = 0;
-        while (at < @min(whole.out.items.len, fragmented.out.items.len) and
-            whole.out.items[at] == fragmented.out.items[at]) : (at += 1)
-        {}
-        std.debug.print(
-            \\chunk dependence detected
-            \\input ({d} bytes): {f}
-            \\first difference at byte {d}
-            \\whole ({d} bytes):
-            \\{f}
-            \\fragmented ({d} bytes):
-            \\{f}
-            \\
-        , .{
-            payload.len,
-            std.ascii.hexEscape(payload, .lower),
-            at,
-            whole.out.items.len,
-            std.ascii.hexEscape(whole.out.items, .lower),
-            fragmented.out.items.len,
-            std.ascii.hexEscape(fragmented.out.items, .lower),
-        });
-        return error.ChunkDependence;
-    }
+    return expectSameTranscript(payload, &whole, &fragmented);
+}
+
+/// Fails with a diff when two transcripts of the same bytes disagree. Shared by
+/// every chunk-independence target, so they all report the same way.
+fn expectSameTranscript(
+    payload: []const u8,
+    whole: *const Transcript,
+    fragmented: *const Transcript,
+) !void {
+    if (std.mem.eql(u8, whole.out.items, fragmented.out.items)) return;
+
+    var at: usize = 0;
+    while (at < @min(whole.out.items.len, fragmented.out.items.len) and
+        whole.out.items[at] == fragmented.out.items[at]) : (at += 1)
+    {}
+    std.debug.print(
+        \\chunk dependence detected
+        \\input ({d} bytes): {f}
+        \\first difference at byte {d}
+        \\whole ({d} bytes):
+        \\{f}
+        \\fragmented ({d} bytes):
+        \\{f}
+        \\
+    , .{
+        payload.len,
+        std.ascii.hexEscape(payload, .lower),
+        at,
+        whole.out.items.len,
+        std.ascii.hexEscape(whole.out.items, .lower),
+        fragmented.out.items.len,
+        std.ascii.hexEscape(fragmented.out.items, .lower),
+    });
+    return error.ChunkDependence;
 }
 
 /// Runs one fuzz iteration on its own allocator and fails if that allocator
@@ -678,6 +689,369 @@ const json_corpus = [_][]const u8{
     "[1,-2.5e3,true,false,null,\"x,y\"]",
     "42",
 };
+
+// -- HTTP/2 ----------------------------------------------------------------
+
+/// Records one stream's pipeline into the connection's transcript, so chunk
+/// independence covers what the *application* saw rather than only what the
+/// connection admitted to.
+const Http2StreamRecorder = struct {
+    transcript: *Transcript,
+
+    pub fn onRead(self: *Http2StreamRecorder, ctx: *HandlerContext, msg: Message) pipeline_mod.Error!void {
+        const gpa = ctx.gpa();
+        var owned = msg;
+        defer owned.deinit(gpa);
+
+        if (owned.take(gpa, http2.Headers)) |taken| {
+            var headers = taken;
+            defer headers.deinit(gpa);
+            self.transcript.line("H2 HEADERS {d} end={} trailers={}\n", .{
+                headers.stream_id, headers.end_stream, headers.trailers,
+            });
+            for (headers.fields) |field| {
+                self.transcript.line("  {s}={s}\n", .{ field.name, field.value });
+            }
+            return;
+        }
+        if (owned.bytes()) |body| self.transcript.line("H2 DATA {d}\n", .{body.len});
+    }
+
+    pub fn onInactive(self: *Http2StreamRecorder, ctx: *HandlerContext) pipeline_mod.Error!void {
+        self.transcript.line("H2 STREAM END\n", .{});
+        ctx.fireInactive();
+    }
+
+    pub fn onEvent(
+        self: *Http2StreamRecorder,
+        ctx: *HandlerContext,
+        event: pipeline_mod.Event,
+    ) pipeline_mod.Error!void {
+        self.transcript.line("H2 STREAM EVENT {s}\n", .{event.name()});
+        ctx.fireEvent(event);
+    }
+};
+
+/// Builds a recorder for every stream. The pipeline owns each one, since nothing
+/// needs it after the stream ends.
+const Http2Streams = struct {
+    transcript: *Transcript,
+
+    pub fn initPipeline(self: *Http2Streams, pipeline: *Pipeline) anyerror!void {
+        const recorder = try pipeline.gpa.create(Http2StreamRecorder);
+        recorder.* = .{ .transcript = self.transcript };
+        errdefer pipeline.gpa.destroy(recorder);
+        _ = try pipeline.addLast("recorder", .initOwned(recorder));
+    }
+};
+
+/// Feeds `payload` to a server codec, whole or fragmented, recording both the
+/// connection's events and every stream's.
+fn transcribeHttp2(
+    gpa: Allocator,
+    io: Io,
+    transcript: *Transcript,
+    payload: []const u8,
+    splitter: ?Splitter,
+) !void {
+    var sink_impl: NullSink = .{ .gpa = gpa };
+    var streams: Http2Streams = .{ .transcript = transcript };
+    var recorder: Recorder = .{ .transcript = transcript };
+
+    const pipeline = try Pipeline.create(.{ .gpa = gpa, .io = io, .sink = sink_impl.sink() });
+    defer pipeline.destroy();
+
+    _ = try http2.addServerCodec(pipeline, .{ .streams = .init(&streams) });
+    _ = try pipeline.addLast("parent", .init(&recorder));
+    pipeline.fireActive();
+
+    var rig: Rig = .{
+        .gpa = gpa,
+        .sink_impl = &sink_impl,
+        .recorder = &recorder,
+        .pipeline = pipeline,
+    };
+    if (splitter) |fragments| {
+        try fragments.feedFragmented(&rig, payload);
+    } else {
+        try rig.feed(payload);
+    }
+    pipeline.fireInactive();
+}
+
+/// Assembles a byte stream that gets past the preface, because random bytes never
+/// do: without a valid preface every input would be rejected at byte 24 and the
+/// entire protocol would go untested.
+fn buildHttp2Stream(gpa: Allocator, smith: *Smith, out: *Buffer) !void {
+    // A peer speaking something else, occasionally, so that path is covered too.
+    if (smith.boolWeighted(1, 32)) {
+        try out.writeBytes(gpa, "GET / HTTP/1.1\r\nHost: fuzz.test\r\nAccept: */*\r\n\r\n");
+        return;
+    }
+    try out.writeBytes(gpa, http2.client_preface);
+
+    // §3.4 requires SETTINGS first. Skipping it now and then covers the check.
+    if (!smith.boolWeighted(1, 16)) {
+        try http2.frame.writeSettings(out, gpa, &.{
+            .{ .id = .initial_window_size, .value = smith.valueRangeAtMost(u32, 0, 200_000) },
+            .{ .id = .max_frame_size, .value = 16_384 },
+        });
+    }
+
+    // Header blocks that HPACK can actually decode, so the layers above the
+    // decoder get exercised rather than only its error paths.
+    const blocks = [_][]const u8{
+        // :method GET, :scheme http, :path /
+        "\x82\x86\x84",
+        // The same plus a literal authority.
+        "\x82\x86\x84\x41\x8c\xf1\xe3\xc2\xe5\xf2\x3a\x6b\xa0\xab\x90\xf4\xff",
+        // :status 200, which is malformed in a request and so exercises §8.
+        "\x88",
+        // A literal never-indexed field.
+        "\x82\x86\x84\x10\x08password\x06secret",
+        // Trailers: no pseudo-headers at all.
+        "\x40\x0ax-checksum\x03abc",
+    };
+
+    var remaining = smith.valueRangeAtMost(u8, 1, 12);
+    while (remaining > 0) : (remaining -= 1) {
+        const kinds = [_]http2.frame.FrameType{
+            .data,                           .headers, .priority, .rst_stream,    .settings,
+            .push_promise,                   .ping,    .goaway,   .window_update, .continuation,
+            @fromBackingInt(@intCast(0xef)),
+        };
+        const kind = kinds[smith.index(kinds.len)];
+        const stream_id: u31 = switch (smith.valueRangeAtMost(u8, 0, 4)) {
+            0 => 0,
+            1 => 1,
+            2 => 3,
+            3 => 5,
+            else => 2,
+        };
+
+        var flags: u8 = 0;
+        if (smith.boolWeighted(2, 3)) flags |= http2.frame.Flags.end_headers;
+        if (smith.boolWeighted(1, 3)) flags |= http2.frame.Flags.end_stream;
+        if (smith.boolWeighted(1, 6)) flags |= http2.frame.Flags.padded;
+        if (smith.boolWeighted(1, 8)) flags |= http2.frame.Flags.priority;
+
+        var scratch: [256]u8 = undefined;
+        const payload: []const u8 = switch (kind) {
+            .headers, .continuation, .push_promise => if (smith.boolWeighted(3, 4))
+                blocks[smith.index(blocks.len)]
+            else
+                scratch[0..smith.slice(&scratch)],
+            .ping => brk: {
+                const len = @min(8, smith.slice(&scratch));
+                @memset(scratch[len..8], 0);
+                break :brk scratch[0..8];
+            },
+            .rst_stream, .window_update => brk: {
+                std.mem.writeInt(u32, scratch[0..4], smith.valueRangeAtMost(u32, 0, 12), .big);
+                break :brk scratch[0..4];
+            },
+            .priority => brk: {
+                _ = smith.slice(scratch[0..5]);
+                break :brk scratch[0..5];
+            },
+            .settings => brk: {
+                const count = smith.valueRangeAtMost(u8, 0, 3);
+                var index: usize = 0;
+                while (index < count) : (index += 1) {
+                    const entry = scratch[index * 6 ..][0..6];
+                    std.mem.writeInt(u16, entry[0..2], smith.valueRangeAtMost(u16, 0, 8), .big);
+                    std.mem.writeInt(u32, entry[2..6], smith.valueRangeAtMost(u32, 0, 70_000), .big);
+                }
+                break :brk scratch[0 .. count * 6];
+            },
+            .goaway => brk: {
+                const extra = @min(scratch.len - 8, smith.valueRangeAtMost(u8, 0, 16));
+                @memset(scratch[0 .. 8 + extra], 0);
+                break :brk scratch[0 .. 8 + extra];
+            },
+            else => scratch[0..smith.slice(&scratch)],
+        };
+
+        try http2.frame.writeFrame(out, gpa, kind, .{ .bits = flags }, stream_id, payload);
+    }
+}
+
+fn fuzzHttp2Body(harness: *Harness, smith: *Smith, gpa: Allocator) anyerror!void {
+    var stream: Buffer = .empty;
+    defer stream.deinit(gpa);
+    try buildHttp2Stream(gpa, smith, &stream);
+    const payload = stream.readableSlice();
+
+    // HTTP/2 has three nested places to get chunk independence wrong — the
+    // connection preface, the frame boundary, and the header block — and a socket
+    // respects none of them.
+    var whole: Transcript = .{ .gpa = gpa };
+    defer whole.deinit();
+    try transcribeHttp2(gpa, harness.io(), &whole, payload, null);
+
+    var fragmented: Transcript = .{ .gpa = gpa };
+    defer fragmented.deinit();
+    try transcribeHttp2(gpa, harness.io(), &fragmented, payload, .{ .smith = smith });
+
+    try expectSameTranscript(payload, &whole, &fragmented);
+}
+
+fn fuzzHttp2(harness: *Harness, smith: *Smith) anyerror!void {
+    return withLeakCheck(harness, smith, fuzzHttp2Body);
+}
+
+test "fuzz: HTTP/2 connection" {
+    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
+    defer harness.threaded.deinit();
+    try std.testing.fuzz(&harness, fuzzHttp2, .{ .corpus = &http2_corpus });
+}
+
+const http2_corpus = [_][]const u8{
+    "",
+    "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+    // A preface with a SETTINGS frame behind it, which is the ordinary opening.
+    "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00",
+    "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+};
+
+// -- HPACK -----------------------------------------------------------------
+
+fn fuzzHpackBody(_: *Harness, smith: *Smith, gpa: Allocator) anyerror!void {
+    const hpack = http2.hpack;
+
+    // A field list the fuzzer chose, encoded and decoded again. Round-tripping is
+    // the natural oracle for a compressor, and HPACK's dynamic table makes it a
+    // sharper one than it looks: the two sides only stay in step if insertion and
+    // eviction agree exactly, and they diverge silently when they do not.
+    var encoder: hpack.Encoder = .init(4096);
+    defer encoder.deinit(gpa);
+    var decoder: hpack.Decoder = .init(4096);
+    defer decoder.deinit(gpa);
+
+    const names = [_][]const u8{
+        ":method",    ":path",  ":scheme", ":status",                         ":authority",
+        "cookie",     "date",   "etag",    "x-custom",                        "content-type",
+        "user-agent", "accept", "x",       "a-longer-header-name-than-usual",
+    };
+
+    var rounds = smith.valueRangeAtMost(u8, 1, 4);
+    while (rounds > 0) : (rounds -= 1) {
+        var fields: std.ArrayList(hpack.Field) = .empty;
+        defer fields.deinit(gpa);
+        var values: std.ArrayList([]u8) = .empty;
+        defer {
+            for (values.items) |value| gpa.free(value);
+            values.deinit(gpa);
+        }
+
+        var count = smith.valueRangeAtMost(u8, 0, 8);
+        while (count > 0) : (count -= 1) {
+            var scratch: [96]u8 = undefined;
+            const len = smith.slice(&scratch);
+            const value = try gpa.dupe(u8, scratch[0..len]);
+            try values.append(gpa, value);
+            try fields.append(gpa, .{
+                .name = names[smith.index(names.len)],
+                .value = value,
+                .never_indexed = smith.boolWeighted(1, 8),
+            });
+        }
+
+        var block: Buffer = .empty;
+        defer block.deinit(gpa);
+        try encoder.encode(&block, gpa, fields.items);
+
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var decoded: std.ArrayList(hpack.Field) = .empty;
+        try decoder.decode(gpa, arena.allocator(), block.readableSlice(), &decoded, .{
+            .max_string_len = 4096,
+            .max_header_list_size = 64 * 1024,
+            .max_fields = 64,
+        });
+
+        if (decoded.items.len != fields.items.len) return error.HpackFieldCount;
+        for (fields.items, decoded.items) |sent, got| {
+            if (!std.mem.eql(u8, sent.name, got.name)) return error.HpackName;
+            if (!std.mem.eql(u8, sent.value, got.value)) return error.HpackValue;
+            if (sent.never_indexed != got.never_indexed) return error.HpackNeverIndexed;
+        }
+
+        // The two dynamic tables must stay in step, or every later block decodes to
+        // something else entirely.
+        if (encoder.table.size != decoder.table.size) return error.HpackTableSize;
+        if (encoder.table.count() != decoder.table.count()) return error.HpackTableCount;
+    }
+
+    // And arbitrary bytes must be refused rather than crash or allocate without
+    // bound. A header block is attacker-controlled input by definition.
+    var junk: [512]u8 = undefined;
+    const junk_len = smith.slice(&junk);
+    var loose: hpack.Decoder = .init(4096);
+    defer loose.deinit(gpa);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var decoded: std.ArrayList(hpack.Field) = .empty;
+    loose.decode(gpa, arena.allocator(), junk[0..junk_len], &decoded, .{}) catch {};
+}
+
+fn fuzzHpack(harness: *Harness, smith: *Smith) anyerror!void {
+    return withLeakCheck(harness, smith, fuzzHpackBody);
+}
+
+test "fuzz: HPACK round trip" {
+    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
+    defer harness.threaded.deinit();
+    try std.testing.fuzz(&harness, fuzzHpack, .{ .corpus = &.{
+        "",
+        "\x82\x86\x84",
+        "\x40\x0acustom-key\x0dcustom-header",
+    } });
+}
+
+// -- Huffman ---------------------------------------------------------------
+
+fn fuzzHuffmanBody(_: *Harness, smith: *Smith, gpa: Allocator) anyerror!void {
+    const huffman = http2.huffman;
+
+    var source: [1024]u8 = undefined;
+    const len = smith.slice(&source);
+    const plain = source[0..len];
+
+    const encoded = try gpa.alloc(u8, huffman.encodedLen(plain));
+    defer gpa.free(encoded);
+    const written = huffman.encode(encoded, plain);
+
+    // The length has to be predictable before the fact, because that is what lets a
+    // decoder size an allocation exactly and check a limit before filling it.
+    if (try huffman.decodedLen(written) != plain.len) return error.HuffmanLength;
+
+    const back = try gpa.alloc(u8, plain.len);
+    defer gpa.free(back);
+    if (!std.mem.eql(u8, plain, try huffman.decode(back, written))) return error.HuffmanRoundTrip;
+
+    // Arbitrary bytes: §5.2 makes most of them invalid padding, and every one of
+    // them has to be refused rather than read past the end.
+    var junk: [256]u8 = undefined;
+    const junk_len = smith.slice(&junk);
+    var out: [2048]u8 = undefined;
+    _ = huffman.decode(&out, junk[0..junk_len]) catch {};
+    _ = huffman.decodedLen(junk[0..junk_len]) catch {};
+}
+
+fn fuzzHuffman(harness: *Harness, smith: *Smith) anyerror!void {
+    return withLeakCheck(harness, smith, fuzzHuffmanBody);
+}
+
+test "fuzz: Huffman round trip" {
+    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
+    defer harness.threaded.deinit();
+    try std.testing.fuzz(&harness, fuzzHuffman, .{ .corpus = &.{
+        "",
+        "www.example.com",
+        "\xff\xff\xff\xff",
+    } });
+}
 
 // -- WebSocket -------------------------------------------------------------
 
@@ -1543,6 +1917,18 @@ test "stress: framing decoders over random inputs" {
 
 test "stress: JSON value framing over random inputs" {
     try runStress(fuzzJson, 0x150F);
+}
+
+test "stress: HTTP/2 connection over random inputs" {
+    try runStress(fuzzHttp2, 0x2000);
+}
+
+test "stress: HPACK over random inputs" {
+    try runStress(fuzzHpack, 0x7541);
+}
+
+test "stress: Huffman over random inputs" {
+    try runStress(fuzzHuffman, 0xB00B);
 }
 
 test "stress: WebSocket frame decoder over random inputs" {
