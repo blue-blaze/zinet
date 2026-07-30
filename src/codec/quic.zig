@@ -17,6 +17,7 @@
 //! * `transport` — §18's transport parameters, which TLS carries and QUIC means
 //! * `cid` — §5.1's connection ID sets, one per direction
 //! * `client` — the client half of the handshake: bytes in, keys out
+//! * `connection` — datagrams in, events out: packets, Retry, connection IDs
 
 pub const varint = @import("quic/varint.zig");
 pub const packet = @import("quic/packet.zig");
@@ -28,6 +29,7 @@ pub const verify = @import("quic/verify.zig");
 pub const transport = @import("quic/transport.zig");
 pub const cid = @import("quic/cid.zig");
 pub const client = @import("quic/client.zig");
+pub const connection = @import("quic/connection.zig");
 /// RFC 8448 test vectors, shared by the tests of the layers above.
 pub const rfc8448 = @import("quic/rfc8448.zig");
 
@@ -45,5 +47,6 @@ test {
     _ = transport;
     _ = cid;
     _ = client;
+    _ = connection;
     _ = rfc8448;
 }

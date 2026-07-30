@@ -725,7 +725,14 @@ test "client: alerts map onto CRYPTO_ERROR codes" {
 /// Not a QUIC server: it has no packets, no flow control and no certificate. Its
 /// only job is to be a second implementation of the *transcript*, so that a
 /// direction mix-up or an ordering error cannot pass unnoticed.
-const TestServer = struct {
+/// The other side of the handshake, for tests.
+///
+/// Not a QUIC server: it speaks no packets and owns no sockets. It is a *second
+/// implementation of the transcript*, driving the same `tls.Schedule` from the
+/// opposite side, which is what makes "both ends agree" a real assertion rather
+/// than a tautology about one code path. `connection.zig` reuses it to complete a
+/// handshake over genuine datagrams.
+pub const TestServer = struct {
     private_key: [handshake.X25519.secret_length]u8,
     public_key: [handshake.X25519.public_length]u8,
     schedule: ?tls.Schedule = null,
@@ -740,13 +747,13 @@ const TestServer = struct {
     peer_algorithm: std.crypto.Certificate.AlgorithmCategory = .rsaEncryption,
     hello_buf: [256]u8 = undefined,
 
-    fn init(seed_byte: u8) TestServer {
+    pub fn init(seed_byte: u8) TestServer {
         const seed: [32]u8 = @splat(seed_byte);
         const pair = handshake.X25519.KeyPair.generateDeterministic(seed) catch unreachable;
         return .{ .private_key = pair.secret_key, .public_key = pair.public_key };
     }
 
-    fn writeServerHello(self: *TestServer, client_hello: []const u8) []const u8 {
+    pub fn writeServerHello(self: *TestServer, client_hello: []const u8) []const u8 {
         var builder: handshake.Builder = .init(&self.hello_buf);
         builder.byte(@backingInt(tls.MessageType.server_hello));
         const message = builder.begin24();
@@ -809,7 +816,7 @@ const TestServer = struct {
     }
 
     /// EncryptedExtensions and Finished, in one flight.
-    fn writeFlight(
+    pub fn writeFlight(
         self: *TestServer,
         dest: []u8,
         alpn: []const u8,
@@ -857,7 +864,7 @@ const TestServer = struct {
         return builder.written();
     }
 
-    fn verifyClientFinished(self: *TestServer, verify_data: []const u8) !void {
+    pub fn verifyClientFinished(self: *TestServer, verify_data: []const u8) !void {
         try self.schedule.?.verifyFinished(
             self.handshake_secrets.?.client.slice(),
             verify_data,

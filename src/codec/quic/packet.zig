@@ -367,9 +367,16 @@ pub fn packetNumberLen(pn: u64, largest_acked: ?u64) u4 {
 pub fn encodePacketNumber(dest: []u8, pn: u64, len: u4) void {
     assert(len >= 1 and len <= max_pn_len);
     assert(dest.len >= len);
-    var i: u4 = 0;
+    // The shift is computed in usize, not u4: `(len - 1 - i) * 8` reaches 24 for
+    // a four-byte packet number, which overflows the u4 the loop counter would
+    // otherwise impose. In Debug that panics; in ReleaseFast it wraps silently and
+    // writes the wrong packet number, so the peer builds the wrong AEAD nonce, the
+    // packet fails to authenticate and is discarded — indistinguishable from
+    // ordinary loss, which is the same failure mode `decodePacketNumber` is
+    // written so carefully to avoid.
+    var i: usize = 0;
     while (i < len) : (i += 1) {
-        const shift: u6 = @intCast((len - 1 - i) * 8);
+        const shift: u6 = @intCast((@as(usize, len) - 1 - i) * 8);
         dest[i] = @truncate(pn >> shift);
     }
 }
@@ -677,4 +684,44 @@ test "packet: a protected packet too short to unprotect is refused" {
     try buf.appendNTimes(gpa, 0xff, 19);
 
     try testing.expectError(error.PacketMalformed, parse(buf.items, 0));
+}
+
+test "packet: a packet number round trips at every encoded length" {
+    // This test exists because its absence hid a real defect: `encodePacketNumber`
+    // computed its shift in u4, which overflows at 24 — so any three- or four-byte
+    // packet number was written wrong. Nothing caught it, because the Appendix A.3
+    // vectors exercise the *decode* path and the encode path had only ever been
+    // asked for one- and two-byte numbers.
+    //
+    // The symptom would have been silent: a wrong packet number means a wrong AEAD
+    // nonce, so the peer discards the packet exactly as though the network had
+    // dropped it.
+    const cases = [_]u64{
+        0,          1,        0x7f,      0xff,
+        0x100,      0x1234,   0xffff,    0x10000,
+        0xabcdef,   0xffffff, 0x1000000, 0xdeadbeef,
+        0xffffffff,
+        0xac5c02, // Appendix A.3's packet number
+        654360564, // Appendix A.5's
+    };
+
+    for (cases) |pn| {
+        var len: u4 = 1;
+        while (len <= max_pn_len) : (len += 1) {
+            var buf: [max_pn_len]u8 = @splat(0);
+            encodePacketNumber(buf[0..len], pn, len);
+
+            // The encoded bytes are the low `len` bytes of the number, big endian.
+            var expected: u64 = 0;
+            for (buf[0..len]) |byte| expected = (expected << 8) | byte;
+            const mask: u64 = if (len == 8) std.math.maxInt(u64) else (@as(u64, 1) << (@as(u6, len) * 8)) - 1;
+            try std.testing.expectEqual(pn & mask, expected);
+
+            // And a receiver expecting a number near this one reconstructs it.
+            // §17.1's whole point: the truncated form is unambiguous within its
+            // window, so a decoder primed with the previous number gets it back.
+            const largest: ?u64 = if (pn == 0) null else pn - 1;
+            try std.testing.expectEqual(pn, decodePacketNumber(largest, expected, len));
+        }
+    }
 }
