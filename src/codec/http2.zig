@@ -26,6 +26,7 @@ pub const Codec = codec.Codec;
 pub const Headers = multiplex.Headers;
 pub const OutgoingHeaders = multiplex.OutgoingHeaders;
 pub const StreamChannel = multiplex.StreamChannel;
+pub const InboundComplete = multiplex.InboundComplete;
 pub const StreamReset = multiplex.StreamReset;
 pub const WritabilityChanged = multiplex.WritabilityChanged;
 pub const addClientCodec = codec.addClientCodec;

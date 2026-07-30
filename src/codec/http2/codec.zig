@@ -144,14 +144,6 @@ pub const Codec = struct {
         if (codec.failed) return;
 
         try codec.input.writeBytes(gpa, bytes);
-        // `poll` refuses a frame larger than the negotiated maximum before waiting
-        // for it, so the accumulation cannot exceed one frame plus its header.
-        const ceiling: usize = frame.header_len + codec.connection.local_settings.max_frame_size;
-        if (codec.input.readableLen() > ceiling) {
-            codec.failed = true;
-            return error.Http2InputOverflow;
-        }
-
         codec.pump(ctx) catch |err| {
             codec.failed = true;
             // GOAWAY is already queued and the peer needs it before the connection
@@ -159,6 +151,22 @@ pub const Codec = struct {
             codec.drain(ctx) catch {};
             return err;
         };
+
+        // The bound is on what is *left* after pumping, not on what arrived. One
+        // socket read routinely delivers many frames — checking the input before
+        // parsing it mistakes a busy connection for an attack, which is exactly what
+        // a 300 KiB upload through curl demonstrated. After pumping, the residue is
+        // at most one incomplete frame, because `poll` consumes whole frames and
+        // refuses an over-long one before waiting for the rest of it.
+        const ceiling: usize = frame.header_len + codec.connection.local_settings.max_frame_size;
+        if (codec.input.readableLen() > ceiling) {
+            codec.failed = true;
+            return error.Http2InputOverflow;
+        }
+        // Reclaim what has been consumed. Without this the buffer's capacity grows
+        // for the life of the connection even though its contents never do.
+        codec.input.discardReadBytes();
+
         try codec.drain(ctx);
     }
 
@@ -193,11 +201,29 @@ pub const Codec = struct {
             codec.fireConnectionEvent(ctx, event);
         }
 
-        if (codec.multiplexer.needs_flush) {
-            codec.multiplexer.needs_flush = false;
+        // Keep running write passes until one grants nothing. A pass gives each
+        // stream a single frame, which is what interleaves them — but stopping after
+        // one pass would leave the rest of a large body waiting for the peer to send
+        // something, and a peer that has finished its request sends nothing at all.
+        // A 300 KiB echo through curl stalled at exactly that point.
+        //
+        // Each pass either moves bytes or grants nothing, and the queued bytes are
+        // finite, so this terminates. Writability events fire inside the loop, which
+        // is what lets a handler that writes in chunks refill as the queue drains.
+        codec.multiplexer.needs_flush = false;
+        while (true) {
+            const before = codec.connection.out.readableLen();
             var transitions: [32]Connection.Writability = undefined;
             const changed = try codec.connection.flush(gpa, &transitions);
             codec.multiplexer.applyWritability(changed);
+            // Streams this side has just finished are torn down here rather than on
+            // the inbound end: the connection is the single source of truth for
+            // whether a stream is over.
+            codec.multiplexer.sweepAll();
+            if (codec.connection.out.readableLen() == before) break;
+            // Put the bytes on the wire as they are granted, so `out` never has to
+            // hold a whole response body.
+            try codec.drain(ctx);
         }
     }
 

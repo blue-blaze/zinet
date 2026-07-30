@@ -954,15 +954,37 @@ pub const Connection = struct {
     ) Error![]Writability {
         var candidates: std.ArrayList(flow.Candidate) = .empty;
         defer candidates.deinit(gpa);
+        // Streams whose only remaining business is END_STREAM. Collected rather
+        // than sent inside the walk, because sending one can close the stream and
+        // removing an entry while iterating the map is not allowed.
+        var ends: std.ArrayList(u31) = .empty;
+        defer ends.deinit(gpa);
 
         var iterator = connection.registry.streams.valueIterator();
         while (iterator.next()) |stream| {
-            if (stream.pending.readableLen() == 0 and !stream.pending_end_stream) continue;
+            if (stream.pending.readableLen() == 0) {
+                if (stream.pending_end_stream) try ends.append(gpa, stream.id);
+                continue;
+            }
             try candidates.append(gpa, .{
                 .stream_id = stream.id,
                 .pending = @intCast(stream.pending.readableLen()),
                 .window = &stream.send_window,
             });
+        }
+
+        // An empty DATA frame carrying END_STREAM is not waiting for credit. §6.9
+        // charges the payload, and this one has none — so it must not go through
+        // the scheduler, which skips anything with nothing pending and would
+        // therefore park the stream for ever. A response with an empty body ends
+        // exactly this way, which is how the omission showed up: curl waited
+        // through a 404 with no body and never saw the stream close.
+        for (ends.items) |stream_id| {
+            const stream = connection.registry.get(stream_id) orelse continue;
+            stream.pending_end_stream = false;
+            try frame.writeData(&connection.out, gpa, stream_id, "", true);
+            stream.onData(.local, true) catch {};
+            if (stream.state.isClosed()) connection.registry.remove(gpa, stream_id);
         }
         // A stable order, so round robin means something across passes.
         std.mem.sort(flow.Candidate, candidates.items, {}, lessByStreamId);
@@ -1757,4 +1779,33 @@ test "connection: the same bytes decode the same however they are fragmented" {
             return err;
         };
     }
+}
+
+test "connection: a response with no body still ends its stream" {
+    const gpa = testing.allocator;
+    var pair: Pair = try .init(gpa, .{}, .{});
+    defer pair.deinit();
+    _ = try pair.settle();
+
+    try pair.client.sendHeaders(gpa, 1, &.{.{ .name = ":path", .value = "/empty" }}, true);
+    try pair.transfer();
+    _ = (try pair.pollServer()).?;
+
+    // Headers, then nothing but END_STREAM. An empty DATA frame is not waiting for
+    // credit — §6.9 charges the payload and this one has none — so it must not go
+    // through the scheduler, which skips anything with nothing pending.
+    var transitions: [4]Connection.Writability = undefined;
+    try pair.server.sendHeaders(gpa, 1, &.{.{ .name = ":status", .value = "204" }}, false);
+    _ = try pair.server.sendData(gpa, 1, "", true);
+    _ = try pair.server.flush(gpa, &transitions);
+    try pair.transfer();
+
+    const response = (try pair.pollClient()).?;
+    try testing.expect(!response.headers.end_stream);
+    const end = (try pair.pollClient()).?;
+    try testing.expectEqual(@as(usize, 0), end.data.bytes.len);
+    // Without this the peer waits for ever for a stream that will never close.
+    try testing.expect(end.data.end_stream);
+    try testing.expect(pair.server.registry.get(1) == null);
+    try testing.expect(pair.client.registry.get(1) == null);
 }

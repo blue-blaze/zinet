@@ -5,6 +5,7 @@ const examples: []const []const u8 = &.{
     "echo",
     "line_echo",
     "http_server",
+    "http2_server",
     "http_client",
     "ws_echo",
     "ws_client",

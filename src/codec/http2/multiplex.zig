@@ -87,6 +87,16 @@ pub const WritabilityChanged = struct { writable: bool };
 /// tell a reset from an ordinary end.
 pub const StreamReset = struct { code: frame.ErrorCode };
 
+/// Fired when the peer has finished sending on this stream — the request body at a
+/// server, the response body at a client. The stream is still open the other way.
+///
+/// Distinct from `onInactive`, which means the stream is over in *both* directions.
+/// Collapsing the two is tempting and wrong: a server hears the end of the request
+/// and only then starts writing the response, so tearing the pipeline down here
+/// would make an asynchronous reply impossible — a handler could reply only from
+/// inside the callback that told it the request had arrived.
+pub const InboundComplete = struct {};
+
 /// One stream's channel: a pipeline whose sink writes onto that stream.
 ///
 /// Heap-allocated by the multiplexer, because the sink holds its address.
@@ -219,6 +229,7 @@ pub const Multiplexer = struct {
             .headers => |incoming| {
                 const child = try multiplexer.childFor(incoming.stream_id);
                 try multiplexer.deliverHeaders(child, incoming);
+                if (incoming.end_stream) multiplexer.finishInbound(incoming.stream_id);
                 return true;
             },
             .data => |incoming| {
@@ -226,7 +237,7 @@ pub const Multiplexer = struct {
                 if (incoming.bytes.len > 0) {
                     child.pipeline.fireRead(try Message.initBytes(multiplexer.gpa, incoming.bytes));
                 }
-                if (incoming.end_stream) multiplexer.endStream(incoming.stream_id);
+                if (incoming.end_stream) multiplexer.finishInbound(incoming.stream_id);
                 return true;
             },
             .reset => |incoming| {
@@ -312,6 +323,40 @@ pub const Multiplexer = struct {
         return child;
     }
 
+    /// The peer has finished sending. Tells the handler, then tears the stream down
+    /// only if that also finished the stream — which it does when this side had
+    /// already sent its own `END_STREAM`, and does not when a response is still owed.
+    fn finishInbound(multiplexer: *Multiplexer, stream_id: u31) void {
+        const child = multiplexer.children.get(stream_id) orelse return;
+        var complete: InboundComplete = .{};
+        child.pipeline.fireEvent(.init(&complete));
+        multiplexer.sweep(stream_id);
+    }
+
+    /// Tears down a child whose stream the connection has finished with. The
+    /// connection is the single source of truth for whether a stream is over: it
+    /// drops the entry when the state machine reaches a closed state, whichever
+    /// direction closed last.
+    pub fn sweep(multiplexer: *Multiplexer, stream_id: u31) void {
+        if (multiplexer.connection.registry.get(stream_id) != null) return;
+        multiplexer.endStream(stream_id);
+    }
+
+    /// Tears down every child whose stream the connection has finished with. Called
+    /// after a write pass, since that is when this side's `END_STREAM` goes out.
+    pub fn sweepAll(multiplexer: *Multiplexer) void {
+        var done: [64]u31 = undefined;
+        var found: usize = 0;
+        var iterator = multiplexer.children.keyIterator();
+        while (iterator.next()) |stream_id| {
+            if (multiplexer.connection.registry.get(stream_id.*) != null) continue;
+            if (found == done.len) break;
+            done[found] = stream_id.*;
+            found += 1;
+        }
+        for (done[0..found]) |stream_id| multiplexer.endStream(stream_id);
+    }
+
     fn deliverHeaders(
         multiplexer: *Multiplexer,
         child: *StreamChannel,
@@ -340,7 +385,6 @@ pub const Multiplexer = struct {
             .arena = arena,
         });
         child.pipeline.fireRead(message);
-        if (incoming.end_stream) multiplexer.endStream(incoming.stream_id);
     }
 };
 
@@ -369,6 +413,7 @@ const Recorder = struct {
     inactive: bool = false,
     writable_events: std.ArrayList(bool) = .empty,
     reset_code: ?frame.ErrorCode = null,
+    inbound_complete: bool = false,
     /// A response to write when headers arrive, if the test wants one.
     respond_with: ?[]const hpack.Field = null,
 
@@ -420,6 +465,7 @@ const Recorder = struct {
             try recorder.writable_events.append(recorder.gpa, changed.writable);
         }
         if (event.get(StreamReset)) |reset| recorder.reset_code = reset.code;
+        if (event.is(InboundComplete)) recorder.inbound_complete = true;
         ctx.fireEvent(event);
     }
 };
@@ -579,7 +625,7 @@ test "multiplex: body bytes go to the stream they belong to" {
     try testing.expectEqualStrings("three", recorders.made.items[1].body.items);
 }
 
-test "multiplex: END_STREAM ends the child pipeline, and only that one" {
+test "multiplex: inbound END_STREAM half-closes, it does not tear the stream down" {
     const gpa = testing.allocator;
     var recorders: Recorders = .{ .gpa = gpa };
     defer recorders.deinit();
@@ -590,10 +636,26 @@ test "multiplex: END_STREAM ends the child pipeline, and only that one" {
     try rig.request(3, "/open", false);
     try rig.pump();
 
-    // The finished stream's handler heard onInactive and its pipeline is gone; the
-    // other is untouched.
+    // The request is complete, and the handler was told — but the stream is only
+    // half closed, because a response is still owed. Tearing the pipeline down here
+    // would mean a handler could reply only from inside the callback that told it the
+    // request had arrived, which is no way to write a server.
+    try testing.expect(recorders.made.items[0].inbound_complete);
+    try testing.expect(!recorders.made.items[0].inactive);
+    try testing.expectEqual(@as(usize, 2), rig.multiplexer.count());
+    try testing.expect(rig.multiplexer.get(1) != null);
+
+    // The other stream heard nothing, since its request is still arriving.
+    try testing.expect(!recorders.made.items[1].inbound_complete);
+
+    // Once this side ends the stream too, it is over and the pipeline goes.
+    var transitions: [4]Connection.Writability = undefined;
+    try rig.server.sendHeaders(gpa, 1, &.{.{ .name = ":status", .value = "204" }}, false);
+    _ = try rig.server.sendData(gpa, 1, "", true);
+    _ = try rig.server.flush(gpa, &transitions);
+    rig.multiplexer.sweepAll();
+
     try testing.expect(recorders.made.items[0].inactive);
-    try testing.expect(!recorders.made.items[1].inactive);
     try testing.expectEqual(@as(usize, 1), rig.multiplexer.count());
     try testing.expect(rig.multiplexer.get(1) == null);
     try testing.expect(rig.multiplexer.get(3) != null);
@@ -614,8 +676,10 @@ test "multiplex: a response written through a child lands on that child's stream
     try rig.pump();
 
     // The client, which knows nothing about multiplexers, decoded a response on
-    // stream 1 — so the child's sink really did write onto the right stream.
-    try testing.expect(recorders.made.items[0].inactive);
+    // stream 1 — so the child's sink really did write onto the right stream. The
+    // handler replied from its `InboundComplete`, and the stream ended once that
+    // reply's END_STREAM went out.
+    try testing.expect(recorders.made.items[0].inbound_complete);
     try testing.expectEqual(@as(usize, 1), recorders.made.items[0].reads);
 }
 
