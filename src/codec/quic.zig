@@ -12,12 +12,14 @@
 //! * `frame` — §19, every frame type, parsed and serialized
 //! * `crypto` — RFC 9001 §5, packet protection and header protection
 //! * `tls` — RFC 8446 §7.1's key schedule, in the engine shape RFC 9001 §4 needs
+//! * `handshake` — RFC 8446 §4's messages and extensions, with RFC 9001 §8's rules
 
 pub const varint = @import("quic/varint.zig");
 pub const packet = @import("quic/packet.zig");
 pub const frame = @import("quic/frame.zig");
 pub const crypto = @import("quic/crypto.zig");
 pub const tls = @import("quic/tls.zig");
+pub const handshake = @import("quic/handshake.zig");
 
 pub const ConnectionId = packet.ConnectionId;
 pub const Version = packet.Version;
@@ -28,4 +30,5 @@ test {
     _ = frame;
     _ = crypto;
     _ = tls;
+    _ = handshake;
 }
