@@ -13,6 +13,7 @@ pub const headers = @import("http2/headers.zig");
 pub const stream = @import("http2/stream.zig");
 pub const huffman = @import("http2/huffman.zig");
 pub const limits = @import("http2/limits.zig");
+pub const multiplex = @import("http2/multiplex.zig");
 
 pub const ErrorCode = frame.ErrorCode;
 pub const FrameType = frame.FrameType;
@@ -28,4 +29,5 @@ test {
     _ = stream;
     _ = huffman;
     _ = limits;
+    _ = multiplex;
 }
