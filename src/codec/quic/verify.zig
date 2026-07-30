@@ -42,6 +42,10 @@ pub const Error = error{
 /// us parse an unbounded chain. Ten is far beyond any real deployment.
 pub const max_chain_len = 10;
 
+/// Enough for any public key the schemes above can use, matching the bound
+/// `std.crypto.tls.Client` chose for the same job.
+pub const max_public_key_len = 600;
+
 /// How much to trust, and against what.
 pub const Options = struct {
     /// The trust anchors. Null skips chain verification entirely, which is only
@@ -133,6 +137,22 @@ pub fn verifySignature(
     signature: []const u8,
     content: []const u8,
 ) !void {
+    return verifySignatureWithKey(peer.algorithm(), peer.publicKey(), scheme, signature, content);
+}
+
+/// The same check, given the key rather than the parsed certificate.
+///
+/// This exists because a handshake sees Certificate and CertificateVerify as two
+/// messages and may consume the buffer holding the first before the second
+/// arrives. A `Peer` borrows its certificate's DER, so the caller keeps a copy of
+/// the key instead — which is all the signature check actually needs.
+pub fn verifySignatureWithKey(
+    algorithm: Certificate.AlgorithmCategory,
+    public_key: []const u8,
+    scheme: handshake.SignatureScheme,
+    signature: []const u8,
+    content: []const u8,
+) !void {
     // §4.4.3: the scheme has to match the key. A certificate with an ECDSA key
     // cannot produce an RSA signature, and accepting the mismatch would mean
     // verifying against a key type the certificate never committed to.
@@ -148,9 +168,7 @@ pub fn verifySignature(
         .ed25519 => .curveEd25519,
         _ => return error.UnsupportedSignatureScheme,
     };
-    if (peer.algorithm() != expected_algorithm) return error.UnsupportedSignatureScheme;
-
-    const public_key = peer.publicKey();
+    if (algorithm != expected_algorithm) return error.UnsupportedSignatureScheme;
 
     switch (scheme) {
         inline .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384 => |comptime_scheme| {
