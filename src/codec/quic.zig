@@ -14,6 +14,7 @@
 //! * `tls` — RFC 8446 §7.1's key schedule, in the engine shape RFC 9001 §4 needs
 //! * `handshake` — RFC 8446 §4's messages and extensions, with RFC 9001 §8's rules
 //! * `verify` — certificate chains and CertificateVerify (§4.4.2, §4.4.3)
+//! * `transport` — §18's transport parameters, which TLS carries and QUIC means
 //! * `client` — the client half of the handshake: bytes in, keys out
 
 pub const varint = @import("quic/varint.zig");
@@ -23,6 +24,7 @@ pub const crypto = @import("quic/crypto.zig");
 pub const tls = @import("quic/tls.zig");
 pub const handshake = @import("quic/handshake.zig");
 pub const verify = @import("quic/verify.zig");
+pub const transport = @import("quic/transport.zig");
 pub const client = @import("quic/client.zig");
 /// RFC 8448 test vectors, shared by the tests of the layers above.
 pub const rfc8448 = @import("quic/rfc8448.zig");
@@ -38,6 +40,7 @@ test {
     _ = tls;
     _ = handshake;
     _ = verify;
+    _ = transport;
     _ = client;
     _ = rfc8448;
 }
