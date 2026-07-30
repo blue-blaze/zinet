@@ -349,8 +349,15 @@ pub const Recv = struct {
         return self.highest_offset;
     }
 
-    /// Apply a STREAM frame. Returns how much new connection-level credit this
-    /// consumed, so the caller can check the connection limit.
+    /// Apply a STREAM frame, returning how much new connection-level credit it
+    /// consumed.
+    ///
+    /// `connection_room` is how much of §4.1's connection window is left. Both
+    /// levels are checked here rather than one here and one in the caller, because
+    /// **a frame that violates flow control must not change any state** — and a
+    /// caller that checked afterwards would already have had the offset advanced
+    /// underneath it. The same rule as the connection layer's "an unauthenticated
+    /// packet changes nothing": the check has to precede the commit, not follow it.
     pub fn receive(
         self: *Recv,
         gpa: Allocator,
@@ -358,6 +365,7 @@ pub const Recv = struct {
         data: []const u8,
         fin: bool,
         max_buffered: usize,
+        connection_room: u64,
     ) Error!u64 {
         // §4.5: offset+len cannot exceed the varint range. Checked by the frame
         // parser too, but this is the layer that would wrap.
@@ -391,6 +399,10 @@ pub const Recv = struct {
         // the receiver must hold the gap as well.
         if (end > self.max_data) return error.FlowControlError;
 
+        // The connection window, computed without committing anything.
+        const increment = if (end > self.highest_offset) end - self.highest_offset else 0;
+        if (increment > connection_room) return error.FlowControlError;
+
         const before = self.flowControlUsed();
         if (end > self.highest_offset) self.highest_offset = end;
         if (fin) {
@@ -413,7 +425,13 @@ pub const Recv = struct {
     /// Apply a RESET_STREAM frame (§19.4). Returns the new connection-level credit
     /// this consumed, which may be positive even though no data arrived — that is
     /// the point of §4.5's accounting.
-    pub fn reset(self: *Recv, gpa: Allocator, code: u64, final_size: u64) Error!u64 {
+    pub fn reset(
+        self: *Recv,
+        gpa: Allocator,
+        code: u64,
+        final_size: u64,
+        connection_room: u64,
+    ) Error!u64 {
         // Again, consistency before the early exit: a repeated RESET_STREAM is an
         // ordinary retransmission, while one that reports a different final size
         // is §4.5's error whatever state the stream is in.
@@ -427,6 +445,12 @@ pub const Recv = struct {
         }
 
         if (final_size > self.max_data) return error.FlowControlError;
+
+        const increment = if (final_size > self.highest_offset)
+            final_size - self.highest_offset
+        else
+            0;
+        if (increment > connection_room) return error.FlowControlError;
 
         if (self.state == .reset_recvd or self.state == .reset_read) return 0;
 
@@ -452,6 +476,20 @@ pub const Recv = struct {
     /// Data the application can read.
     pub fn readable(self: *const Recv) []const u8 {
         return self.buffer.readable();
+    }
+
+    /// Take the reset the application has not been told about yet, moving to
+    /// §3.2's terminal state.
+    ///
+    /// This exists because without it there is no way to reach `reset_read`, so a
+    /// reset stream is never finished and never forgotten — memory that grows for
+    /// the life of the connection, driven by the peer. It is the counterpart of
+    /// `consume`: data read to the end finishes a stream, and a reset
+    /// acknowledged by the application does too.
+    pub fn takeReset(self: *Recv) ?u64 {
+        if (self.state != .reset_recvd) return null;
+        self.state = .reset_read;
+        return self.reset_code;
     }
 
     /// Consume `n` bytes, advancing the state machine if that finishes the stream.
@@ -638,6 +676,10 @@ pub const Limits = struct {
 
 const testing = std.testing;
 
+/// The tests here exercise one stream, so the connection window is not what is
+/// under test. `streams.zig` covers the interaction.
+const unlimited: u64 = std.math.maxInt(u64);
+
 test "stream: §2.1's two low bits decide everything about a stream" {
     // Worth a test rather than trusting the arithmetic, because every other rule
     // in §3 and §4.6 is expressed in terms of these two bits, and getting the
@@ -753,10 +795,10 @@ test "stream: §4.1's limit applies to the offset, not the byte count" {
 
     try testing.expectError(
         error.FlowControlError,
-        recv.receive(gpa, 99, "ab", false, 4096),
+        recv.receive(gpa, 99, "ab", false, 4096, unlimited),
     );
     // Exactly at the limit is allowed; §4.1's limit is the maximum offset.
-    _ = try recv.receive(gpa, 98, "ab", false, 4096);
+    _ = try recv.receive(gpa, 98, "ab", false, 4096, unlimited);
     try testing.expectEqual(@as(u64, 100), recv.highest_offset);
 }
 
@@ -767,11 +809,11 @@ test "stream: §4.5's final size cannot change, in any of the three ways" {
     {
         var recv: Recv = .init(1000);
         defer recv.deinit(gpa);
-        _ = try recv.receive(gpa, 0, "hello", true, 4096);
+        _ = try recv.receive(gpa, 0, "hello", true, 4096, unlimited);
         try testing.expectEqual(@as(?u64, 5), recv.final_size);
         try testing.expectError(
             error.FinalSizeError,
-            recv.receive(gpa, 5, "more", false, 4096),
+            recv.receive(gpa, 5, "more", false, 4096, unlimited),
         );
     }
 
@@ -779,32 +821,32 @@ test "stream: §4.5's final size cannot change, in any of the three ways" {
     {
         var recv: Recv = .init(1000);
         defer recv.deinit(gpa);
-        _ = try recv.receive(gpa, 0, "hello", true, 4096);
+        _ = try recv.receive(gpa, 0, "hello", true, 4096, unlimited);
         try testing.expectError(
             error.FinalSizeError,
-            recv.receive(gpa, 0, "hi", true, 4096),
+            recv.receive(gpa, 0, "hi", true, 4096, unlimited),
         );
         // The identical FIN again is a retransmission and is fine.
-        _ = try recv.receive(gpa, 0, "hello", true, 4096);
+        _ = try recv.receive(gpa, 0, "hello", true, 4096, unlimited);
     }
 
     // (3) A final size below data already received.
     {
         var recv: Recv = .init(1000);
         defer recv.deinit(gpa);
-        _ = try recv.receive(gpa, 10, "xyz", false, 4096);
+        _ = try recv.receive(gpa, 10, "xyz", false, 4096, unlimited);
         try testing.expectError(
             error.FinalSizeError,
-            recv.receive(gpa, 0, "ab", true, 4096),
+            recv.receive(gpa, 0, "ab", true, 4096, unlimited),
         );
         // And through RESET_STREAM, which carries a final size for the same
         // reason: both ends must agree on the credit consumed.
-        try testing.expectError(error.FinalSizeError, recv.reset(gpa, 7, 5));
+        try testing.expectError(error.FinalSizeError, recv.reset(gpa, 7, 5, unlimited));
         // A reset at or above what we have is accepted.
-        _ = try recv.reset(gpa, 7, 13);
+        _ = try recv.reset(gpa, 7, 13, unlimited);
         try testing.expectEqual(RecvState.reset_recvd, recv.state);
         // A second reset must agree with the first.
-        try testing.expectError(error.FinalSizeError, recv.reset(gpa, 7, 20));
+        try testing.expectError(error.FinalSizeError, recv.reset(gpa, 7, 20, unlimited));
     }
 }
 
@@ -819,10 +861,10 @@ test "stream: a reset stream still accounts for its connection credit" {
     defer recv.deinit(gpa);
 
     // Two bytes arrive, then the stream is reset claiming 500 bytes were sent.
-    const first = try recv.receive(gpa, 0, "ab", false, 4096);
+    const first = try recv.receive(gpa, 0, "ab", false, 4096, unlimited);
     try testing.expectEqual(@as(u64, 2), first);
 
-    const on_reset = try recv.reset(gpa, 0x10, 500);
+    const on_reset = try recv.reset(gpa, 0x10, 500, unlimited);
     // The credit jumps to the final size even though 498 bytes never arrived —
     // the peer spent them, so they are spent. Asserting `highest_offset` directly
     // is the point: that is the quantity §4.5 governs, and a `flowControlUsed`
@@ -838,7 +880,7 @@ test "stream: a reset stream still accounts for its connection credit" {
     // peer cannot claim to have spent credit it never had.
     var other: Recv = .init(100);
     defer other.deinit(gpa);
-    try testing.expectError(error.FlowControlError, other.reset(gpa, 0, 101));
+    try testing.expectError(error.FlowControlError, other.reset(gpa, 0, 101, unlimited));
 }
 
 test "stream: the receive state machine follows §3.2" {
@@ -847,18 +889,18 @@ test "stream: the receive state machine follows §3.2" {
     defer recv.deinit(gpa);
 
     try testing.expectEqual(RecvState.recv, recv.state);
-    _ = try recv.receive(gpa, 0, "abc", false, 4096);
+    _ = try recv.receive(gpa, 0, "abc", false, 4096, unlimited);
     try testing.expectEqual(RecvState.recv, recv.state);
 
     // A FIN makes the size known. Data may still be missing.
-    _ = try recv.receive(gpa, 10, "xyz", true, 4096);
+    _ = try recv.receive(gpa, 10, "xyz", true, 4096, unlimited);
     try testing.expectEqual(RecvState.size_known, recv.state);
     try testing.expectEqual(@as(?u64, 13), recv.final_size);
 
     // Filling the gap moves to Data Recvd, which persists until the application
     // has read everything — §3.2 tracks delivery to the application, which the
     // sender cannot observe.
-    _ = try recv.receive(gpa, 3, "defghij", false, 4096);
+    _ = try recv.receive(gpa, 3, "defghij", false, 4096, unlimited);
     try testing.expectEqual(RecvState.data_recvd, recv.state);
     try testing.expectEqualStrings("abcdefghijxyz", recv.readable());
 
@@ -870,8 +912,8 @@ test "stream: the receive state machine follows §3.2" {
     // an error, because the network can deliver it at any time.
     var after_reset: Recv = .init(1000);
     defer after_reset.deinit(gpa);
-    _ = try after_reset.reset(gpa, 1, 10);
-    try testing.expectEqual(@as(u64, 0), try after_reset.receive(gpa, 0, "late", false, 4096));
+    _ = try after_reset.reset(gpa, 1, 10, unlimited);
+    try testing.expectEqual(@as(u64, 0), try after_reset.receive(gpa, 0, "late", false, 4096, unlimited));
 
     // But §4.5 applies "even after a stream is closed": data beyond the final size
     // is still an error. Being discarded and being unchecked are different things,
@@ -879,7 +921,7 @@ test "stream: the receive state machine follows §3.2" {
     // accepted simply by sending it late.
     try testing.expectError(
         error.FinalSizeError,
-        after_reset.receive(gpa, 8, "overrun", false, 4096),
+        after_reset.receive(gpa, 8, "overrun", false, 4096, unlimited),
     );
 }
 
@@ -895,7 +937,7 @@ test "stream: MAX_STREAM_DATA is sent only when it would say something new" {
     // Nothing consumed yet, so the limit would not move.
     try testing.expect(recv.creditUpdate(window) == null);
 
-    _ = try recv.receive(gpa, 0, &@as([600]u8, @splat('x')), false, 4096);
+    _ = try recv.receive(gpa, 0, &@as([600]u8, @splat('x')), false, 4096, unlimited);
     recv.consume(600);
     // Now the window can move by 600, which is over the half-window threshold.
     try testing.expectEqual(@as(?u64, 1600), recv.creditUpdate(window));
@@ -903,7 +945,7 @@ test "stream: MAX_STREAM_DATA is sent only when it would say something new" {
     // A small consumption is not worth a frame.
     var small: Recv = .init(1000);
     defer small.deinit(gpa);
-    _ = try small.receive(gpa, 0, "abc", false, 4096);
+    _ = try small.receive(gpa, 0, "abc", false, 4096, unlimited);
     small.consume(3);
     try testing.expect(small.creditUpdate(window) == null);
 
@@ -913,7 +955,7 @@ test "stream: MAX_STREAM_DATA is sent only when it would say something new" {
     // would return null for the wrong reason and the test would prove nothing.
     var done: Recv = .init(1000);
     defer done.deinit(gpa);
-    _ = try done.receive(gpa, 0, &@as([600]u8, @splat('y')), true, 4096);
+    _ = try done.receive(gpa, 0, &@as([600]u8, @splat('y')), true, 4096, unlimited);
     done.consume(600);
     try testing.expectEqual(RecvState.data_read, done.state);
     try testing.expect(done.creditUpdate(window) == null);
