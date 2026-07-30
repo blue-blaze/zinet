@@ -25,6 +25,11 @@ From the review and the fuzzer:
 | R4.1 | major | Latent heap overflow: unchecked addition ahead of the checked one in `ensureWritable` | `buffer.zig` |
 | R6.1 | major | HTTP response splitting: the encoder validated no header it wrote | `codec/http.zig` |
 | R6.2/6.3 | hardening | Decoder accepted control characters in headers; trailers could inject framing and routing fields | `codec/http.zig` |
+| R8.1 | major | HTTP/2 client read the response it asked for as trailers on its own request | `codec/http2/stream.zig` |
+| R8.2 | major | A response with no body never ended its stream: END_STREAM went through the write scheduler, which skips anything with nothing pending | `codec/http2/connection.zig` |
+| R8.3 | major | Input bound checked before parsing rather than on the residue, so one read holding many frames looked like an attack | `codec/http2/codec.zig` |
+| R8.4 | major | A stream's pipeline was destroyed when its inbound half closed, making an asynchronous reply impossible | `codec/http2/multiplex.zig` |
+| R8.5 | major | One write pass per read is not enough: a peer that has finished asking sends nothing to carry the next pass | `codec/http2/codec.zig` |
 | R2.2/2.3, R1.1, R1.3, R3.2 | minor | Busy-spin on empty reads, two inbound limits, millisecond deadline rounding, `serve` twice under ReleaseFast, failed `onAdded` left in the chain | various |
 
 Everything above is FIXED, each with a regression test. What follows is the
@@ -331,3 +336,67 @@ neighbours with it.
   `onRemoved` forwarding: the client's first frame arriving in the same read as
   its upgrade request. A harness self-check asserts the target really observes
   the handshake, so it cannot pass by testing nothing.
+
+## R8 HTTP/2 (codec/http2/)
+
+Five defects, found by three different methods. None of the methods would have
+found the others' — which is the point of running all three.
+
+Found by wiring a client and a server made of this same implementation to each
+other, so that every byte one side writes is parsed by the other:
+
+- R8.1 FIXED (**major**) The client treated the response it had asked for as
+  trailers on its own request. `headers_seen` was set both when a header block was
+  *sent* and when one was *received*, and §8.1's "a second block is trailers"
+  is strictly about the receive direction. A one-sided test cannot see this, because
+  one side never does both.
+
+Found by `curl` — every one of these passed the entire test suite first:
+
+- R8.2 FIXED (**major**) A response with no body never ended its stream. `flush`
+  routed the END_STREAM-only case through the write scheduler, and the scheduler
+  skips any candidate with nothing pending, so the stream was parked for ever. A
+  zero-length `DATA` frame is not waiting for credit: §6.9 charges the payload and
+  this one has none, so it must bypass the scheduler entirely.
+- R8.3 FIXED (**major**) The input bound was checked *before* parsing rather than
+  on the residue after it. One socket read routinely delivers many frames, so a
+  300 KiB upload looked like an attack. The same edit added the missing
+  `discardReadBytes`, without which the accumulation's capacity grew for the life
+  of the connection although its contents never did.
+- R8.4 FIXED (**major**) A stream's pipeline was torn down when its inbound half
+  closed — which is exactly when a server has learned what to reply to. So a
+  handler could only respond from inside the callback that told it the request had
+  arrived, and an asynchronous reply was impossible. Inbound `END_STREAM` is now an
+  `InboundComplete` event, and the pipeline is destroyed when the connection says
+  the stream is over in both directions.
+- R8.5 FIXED (**major**) One write pass is not enough. A pass grants each stream a
+  single frame, which is what interleaves them, but a peer that has finished its
+  request sends nothing more — so there is no next read to carry the next pass and a
+  large response stopped halfway. The codec now runs passes until one grants
+  nothing, which is also what makes water marks usable: writability events fire
+  inside the loop, so a handler writing in chunks refills as the queue drains.
+
+Verified rather than assumed:
+
+- R8.6 OK Chunk independence covers HTTP/2's three nested fragmentation points —
+  the connection preface, the frame boundary, and the header block. Random bytes
+  would test almost nothing, since without a valid preface every input dies at byte
+  24, so the target assembles a frame stream instead. Self-checked by injecting a
+  deliberate chunk dependence, which is caught at the first iteration of the first
+  seed.
+- R8.7 OK The Huffman table is verified structurally, not only by round trip. A
+  round trip proves nothing about a typo in an entry the test vectors do not use,
+  because encode and decode would agree on the same wrong code. Kraft's equality
+  checks all 257 lengths at once, and prefix-freeness is asserted while the decoding
+  DFA is built at comptime.
+- R8.8 OK Flow control charges the whole `DATA` payload including padding (§6.1),
+  which is more than the application sees. It has a test rather than a comment
+  because getting it wrong is invisible until a peer pads its frames, and then the
+  two sides' windows drift apart and the connection stalls with neither at fault.
+- R8.9 OK Each published denial-of-service class has an explicit bound and a test:
+  Rapid Reset (CVE-2023-44487) by reset rate, the 2024 CONTINUATION flood by *two*
+  bounds because a byte ceiling alone still admits unbounded empty frames, the HPACK
+  header-list bomb by charging per field during the decode, and the `SETTINGS`,
+  `PING` and empty-`DATA` floods by rate. The rate limits are a shape nothing else in
+  this codebase needs, because what those attacks consume is work rather than a held
+  resource.

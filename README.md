@@ -32,34 +32,37 @@ try server.serve();
 ## Status
 
 Working and tested: the core framework, framing codecs, HTTP/1.1 and WebSocket in
-both directions with `permessage-deflate`, Redis RESP2/RESP3, datagram (UDP)
-endpoints, and TLS 1.3 client connections. 286 tests pass on Linux and macOS in
-Debug, ReleaseSafe and ReleaseFast, all under a leak-checking allocator, plus
-twelve fuzz targets. The same suite also runs **on fibers** rather than threads —
+both directions with `permessage-deflate`, **HTTP/2** over cleartext, Redis
+RESP2/RESP3, datagram (UDP) endpoints, and TLS 1.3 client connections. 405 tests
+pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast, all under a
+leak-checking allocator, plus fifteen fuzz targets. The same suite also runs **on fibers** rather than threads —
 see [Choosing an `Io`](#choosing-an-io). Every protocol is checked against
 other people's code, not only its own counterpart: the HTTP server against
 `curl`, the HTTP client against Python's `http.server`, the WebSocket client *and*
 server against the third-party `websockets` library, the RESP server against
-`redis-py`, the UDP endpoint against Python's `socket` and `nc -u`, and the TLS
-client against OpenSSL's `s_server`.
+`redis-py`, the UDP endpoint against Python's `socket` and `nc -u`, the TLS client
+against OpenSSL's `s_server`, and the HTTP/2 server against `curl` with `nghttp2`
+underneath it — multiplexed, and with 300 KiB crossing the flow-control window in
+both directions.
 
-Those cross-implementation checks run in CI, not only by hand, which is what
-caught the last defect on the list: a closing handshake that was skipped about
-one run in five. The review's findings and all eighteen defects it, the fuzzer and
-cross-implementation testing turned up are written down in
-[REVIEW.md](REVIEW.md).
+Those cross-implementation checks run in CI, not only by hand, and they keep
+earning it: they caught a closing handshake that was skipped about one run in five,
+and later four HTTP/2 defects that had each passed the entire test suite first. The
+review's findings and every defect it, the fuzzer and cross-implementation testing
+turned up are written down in [REVIEW.md](REVIEW.md).
 
-Not done: HTTP/2, and TLS on the server side. Both are blocked upstream rather
-than merely unwritten — the server needs a `std.crypto.tls.Server` that does not
-exist, and HTTP/2 needs ALPN, which `std.crypto.tls.Client` never offers.
-[HTTP2.md](HTTP2.md) works through what HTTP/2 would cost and what it would
-break; the short version is that it would also force write water marks back into
-a framework that argues against them.
+Not done: TLS on the server side, which needs a `std.crypto.tls.Server` that does
+not exist. And `h2` **over TLS** — not the protocol, which works, but the one way
+of announcing it: RFC 9113 §3.1 identifies `h2` by ALPN, and
+`std.crypto.tls.Client` cannot send it. Cleartext HTTP/2 with prior knowledge is
+what gRPC between services and a reverse proxy to a backend use, and that works
+today. [HTTP2.md](HTTP2.md) is the implementation record, including the one
+framework decision it forced.
 
 ### Blocked upstream
 
-Four things are absent because the standard library does not yet provide what
-they need. They are listed separately from the design choices below on purpose:
+Four things are absent or reduced because the standard library does not yet
+provide what they need. They are listed separately from the design choices below on purpose:
 these would be built tomorrow if the pieces existed, and each is stated with the
 specific thing that is missing so the claim can be checked rather than taken on
 trust.
@@ -68,7 +71,7 @@ trust.
 |---|---|---|
 | `remoteAddress()` on a stream | `getpeername` | `std.Io` 0.17 exposes no such operation. Datagrams have the address anyway, because `recvmsg` reports it per message. |
 | TLS on the server side | `std.crypto.tls.Server` | `std/crypto/tls/` contains `Client.zig` and nothing else. Accepting a connection would mean hand-rolling certificate loading, `CertificateVerify` signing and session tickets. |
-| HTTP/2 over TLS | ALPN in the TLS client | `tls.Client.Options` has no ALPN field, and the `ClientHello` is built from five extensions of which ALPN is not one. RFC 9113 §3.1 identifies `h2` by ALPN, so every conforming server answers HTTP/1.1. See [HTTP2.md](HTTP2.md). |
+| Announcing `h2` over TLS | ALPN in the TLS client | `tls.Client.Options` has no ALPN field, and the `ClientHello` is built from five extensions of which ALPN is not one. RFC 9113 §3.1 identifies `h2` by ALPN, so every conforming server answers HTTP/1.1. The protocol itself is implemented and reachable over cleartext; only this negotiation is missing. See [HTTP2.md](HTTP2.md). |
 | An evented `Io` *in the standard library* | a backend that can listen, accept and connect | the table below. In 0.17-dev those three are stubs on every platform. A third-party one works today; see [Choosing an `Io`](#choosing-an-io) |
 
 The evented case deserves its own detail, because Zinet takes its `Io` as a
@@ -150,7 +153,7 @@ capability. These are decisions, not gaps:
 |---|---|
 | `AttributeMap` | Java handlers cannot see each other's types. Zig ones hold their own state and reach the channel through `ctx.owner()`. |
 | `ChannelPromise` | Its main use, "flush then close", is structural here: `close` travels the same queue as writes, so ordering is guaranteed without a future. |
-| Write water marks | Netty's write queue is unbounded, so the application must be told to stop. Zinet's is bounded and blocks the producer — backpressure that cannot be ignored. `isWritable` reports how close it is. One protocol would overturn this: see [HTTP2.md](HTTP2.md) §3. |
+| Write water marks *outside HTTP/2* | Netty's write queue is unbounded, so the application must be told to stop. Zinet's is bounded and blocks the producer — backpressure that cannot be ignored. `isWritable` reports how close it is. **HTTP/2 is the stated exception**, and the boundary is exact: blocking where one exchange owns the connection, water marks where many share a credit pool, because there a blocked producer cannot receive what would unblock it. Even then the marks are advice and a hard ceiling is still the rule. See [HTTP2.md](HTTP2.md). |
 | `autoRead` | Netty needs it because epoll keeps reporting readability. Zinet reads by blocking, so not reading *is* the backpressure. |
 
 ## Architecture
@@ -212,6 +215,16 @@ graph TB
 | `ReadTimeoutHandler` | `addReadTimeout` | Idle detection plus `IdleCloser` |
 | `HttpServerCodec` | `http.addServerCodec` | |
 | `HttpClientCodec` | `http.addClientCodec` | Encoder and decoder share a `MethodTracker` |
+| `Http2FrameCodec` | `http2.addServerCodec` / `addClientCodec` | Cleartext, prior knowledge; see [HTTP2.md](HTTP2.md) |
+| `Http2MultiplexHandler` | `http2.multiplex.Multiplexer` | One `Pipeline` per stream, all on the connection's reader task |
+| `Http2StreamChannel` | `http2.StreamChannel` | `ctx.close()` ends the stream, not the connection |
+| `Http2HeadersFrame` | `http2.Headers` / `http2.OutgoingHeaders` | Inbound owns an arena, outbound borrows |
+| `DefaultHttp2ConnectionEncoder`/`Decoder` | `http2.connection.Connection` | Bytes in, events out, no sockets involved |
+| `Http2FrameWriter` / `Http2FrameReader` | `http2.frame` | Pure functions, not handlers |
+| HPACK `Encoder` / `Decoder` | `http2.hpack` | RFC 7541, verified against Appendix C |
+| `WeightedFairQueueByteDistributor` | `http2.flow.Scheduler` | Round robin, one frame per stream per pass; no priority tree (§5.3.1 deprecates it) |
+| `Http2MaxRstFrameDecoder` | `http2.limits.RateLimiter` | Rapid Reset, and the control-frame floods, share the mechanism |
+| `WriteBufferWaterMark` | `http2.flow.WaterMark` | HTTP/2 only, and paired with a hard ceiling |
 | `WebSocketServerProtocolHandler` | `websocket.Handshaker` | |
 | `WebSocketClientProtocolHandler` | `websocket.ClientHandshaker` | Sends the upgrade, verifies `Sec-WebSocket-Accept` |
 | `PerMessageDeflateHandler` | `permessage_deflate` | Negotiated by the handshakers; off by default |
@@ -557,6 +570,7 @@ Both snippets are compiled as part of the build; see
 zig build run-echo         -- 8007     # nc localhost 8007
 zig build run-line-echo    -- 8008     # line framing; send "quit" to disconnect
 zig build run-http-server  -- 8080     # curl -v http://localhost:8080/echo -d hi
+zig build run-http2-server -- 8081     # curl -v --http2-prior-knowledge http://localhost:8081/
 zig build run-ws-echo      -- 8090     # websocat ws://localhost:8090/
 zig build run-http-client  -- localhost 8080 /echo
 zig build run-ws-client    -- 127.0.0.1 8090 /

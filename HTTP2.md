@@ -1,181 +1,311 @@
-# HTTP/2 in Zinet: an evaluation
+# HTTP/2 in Zinet
 
-This is an evaluation, not a plan of record. It asks three questions in order —
-*can* Zinet speak HTTP/2 at all, *what would it cost*, and *what would it break*
-— and reaches a conclusion for each. No HTTP/2 code exists.
+This was an evaluation that concluded "not now". It is now an implementation record.
+The evaluation's own §4.3 said what would change the answer — *a concrete cleartext
+use appears* — and named the order to build in: frame layer, HPACK, stream states,
+then the write scheduler and the backpressure decision last, because that decision is
+the one that touches the rest of the framework. That is the order this was built in,
+and the last item did turn out to be the only one that changed anything outside
+`src/codec/http2/`.
 
-**Conclusion up front: not now.** One upstream gap makes the version of HTTP/2
-that people actually use unreachable, and the framework change it would force is
-a reversal of a decision Zinet argued for on the merits. The precise conditions
-that would change the answer are in [When to revisit](#when-to-revisit).
+**What works:** the protocol, over cleartext, with prior knowledge. 7991 lines in
+`src/codec/http2/`, 119 tests, three fuzz targets, and a CI step that checks it against
+`curl` on every run.
 
-## 1. Reachability: what can be spoken today
+**What does not:** `h2` over TLS, because it cannot be *negotiated*. That is the one
+thing still blocked upstream, and it is worth being precise about what it does and
+does not mean — see [Reachability](#reachability).
 
-HTTP/2 arrives three ways (RFC 9113 §3):
+## Contents
 
-| Path | Needs | Available? |
+* [Reachability](#reachability)
+* [The layers, and the decision in each](#the-layers-and-the-decision-in-each)
+* [Backpressure: the one framework change](#backpressure-the-one-framework-change)
+* [Every limit, and what it stops](#every-limit-and-what-it-stops)
+* [What found the defects](#what-found-the-defects)
+* [Deliberately not done](#deliberately-not-done)
+
+## Reachability
+
+RFC 9113 §3 lists three ways to arrive at HTTP/2:
+
+| Path | Needs | State |
 |---|---|---|
-| `h2` over TLS | ALPN advertising `h2` | **No** |
-| `h2c` via `Upgrade:` | HTTP/1.1 upgrade dance | Removed from the spec in RFC 9113 §3.2 |
-| `h2c` with prior knowledge | A server configured for cleartext HTTP/2 | Yes |
+| `h2c` with prior knowledge | a peer configured for cleartext HTTP/2 | **Works.** `addServerCodec` / `addClientCodec` |
+| `h2c` via `Upgrade:` | the HTTP/1.1 upgrade dance | Removed from the specification in §3.2 |
+| `h2` over TLS | ALPN advertising `h2` | Blocked upstream |
 
-The first row is the blocking one, and it is upstream. `std.crypto.tls.Client`
-never offers ALPN:
+The distinction that matters: **the protocol is implemented; one way of announcing it
+is not available.** §3.1 identifies `h2` by ALPN, and `std.crypto.tls.Client` offers no
+way to send it — `Client.Options` has no ALPN field, the `ClientHello` is assembled
+from five extensions of which ALPN is not one, and
+`tls.ExtensionType.application_layer_protocol_negotiation` exists in
+`std/crypto/tls.zig` as an enum constant that appears nowhere else. Checked again on
+Zig 0.17-dev: `alpn` occurs zero times in `Client.zig`.
 
-* `Client.Options` (`std/crypto/tls/Client.zig`) has fields for `host`, `ca`,
-  buffers, `entropy`, `realtime_now`, `ssl_key_log`, `allow_truncation_attacks`
-  and `alert`. There is no ALPN field, so there is no way for a caller to ask
-  for one.
-* The `ClientHello` is assembled from exactly five extensions —
-  `supported_versions`, `signature_algorithms`, `supported_groups`,
-  `psk_key_exchange_modes`, `key_share` — plus SNI. ALPN is not among them.
-* `tls.ExtensionType.application_layer_protocol_negotiation` exists in
-  `std/crypto/tls.zig` as an enum constant and appears nowhere else in the
-  standard library.
+When ALPN appears, `h2` needs the negotiated protocol name checked and nothing else.
+Nothing in the implementation is conditional on the transport.
 
-RFC 9113 §3.1 is unambiguous that `h2` is identified by ALPN. A client that does
-not send it gets HTTP/1.1 from every conforming server, which is the correct
-behaviour and also the end of the road. This cannot be worked around from
-Zinet's side without hand-writing a TLS `ClientHello`, which would mean
-replacing the standard library's TLS client — the opposite of the reason for
-using it.
+Prior knowledge is not a consolation prize. It is what gRPC between services uses, and
+what a reverse proxy uses to reach a backend. What it cannot do is talk to a browser.
 
-On the server side the situation is the one D5 already recorded: there is no
-`std.crypto.tls.Server` at all, so `h2` over TLS cannot be accepted either.
+## The layers, and the decision in each
 
-That leaves cleartext HTTP/2 with prior knowledge. It is genuinely used —
-gRPC between services, a reverse proxy talking to a backend — but it is not the
-case that motivates HTTP/2: no browser will ever use it, and no public API is
-reachable with it. So the honest summary is that roughly 5000 lines of
-protocol work (§2) would buy a transport usable only where both ends are
-configured for cleartext, on a machine the operator controls.
+Each file below is a layer, and each one exists as a separate file because it has a
+decision in it that is worth finding.
 
-For reference, `std.http` itself has no HTTP/2: `std.http.Version` lists only
-`HTTP/1.0` and `HTTP/1.1`, and there is no HPACK anywhere in the standard
-library. Everything below would be written from scratch.
+### `frame.zig` — RFC 9113 §4, §6
 
-## 2. Cost: what would have to be built
+All ten frame types, parsed and serialized, with every length and stream-identifier
+rule in §6.
 
-| Piece | Rough size | Notes |
+**Severity is not decided here.** §5.4 splits failures into connection errors, which
+end everything, and stream errors, which reset one stream — and which applies often
+depends on context a parser does not have. So parsing returns a plain Zig error that
+maps one-to-one onto an `ErrorCode`, and `connection.zig` decides severity with an RFC
+citation at each site. The frame layer is also not a pipeline handler: HTTP/2's frames
+are internal machinery, since what reaches an application is a stream's headers and
+body rather than a `WINDOW_UPDATE`. Netty draws the line in the same place.
+
+`Flags` is accessors rather than a packed struct with one name per bit, because bit
+0x1 is `END_STREAM` on `DATA` and `ACK` on `SETTINGS`, and a struct field would invite
+reading the wrong one.
+
+### `huffman.zig` — RFC 7541 Appendix B
+
+The canonical code, decoded through a `comptime`-built DFA indexed four bits at a time.
+
+**The table is verified structurally, not only by round trip.** The Appendix C vectors
+pin the actual bit values, but only for the octets those strings use — and a round trip
+proves nothing about a typo in an unused entry, because encode and decode would agree
+on the same wrong code. Kraft's equality checks all 257 lengths at once: a prefix-free
+code is complete exactly when the sum of 2^-len is one, and any single wrong length
+breaks it. Prefix-freeness itself is asserted while the DFA is built, so two symbols
+landing on one node fails the build.
+
+### `hpack.zig` — RFC 7541
+
+Integer and string primitives, the static table, the dynamic table with eviction, and
+both directions.
+
+**Decoded fields are always copied into the caller's arena.** The cheap implementation
+hands back slices into the tables — but the dynamic table evicts, and it evicts *while
+a later field in the same block is still being decoded*, so a size update or an
+insertion can free what a previous field pointed at. Static entries are program
+constants and are borrowed; everything else is copied. It is the same copy
+`http.Request` makes, for the same reason.
+
+**The limits are charged during the decode, not after.** One indexed field is a single
+byte on the wire and 42 bytes of header list, so a small block can name a very large
+one — the same shape as the zip bomb the WebSocket compression path had to bound.
+Checking the total afterwards means having already built it.
+
+Verified against the RFC 7541 Appendix C sequences including the dynamic table size
+after each step: 57, 110, 164 for the request examples, and 222, 222, 215 for the
+responses, where the last one evicts three entries to add two.
+
+### `headers.zig` — RFC 9113 §6.10
+
+Reassembling a header block across `CONTINUATION` frames.
+
+The frame boundaries are not part of the block: HPACK decodes over the concatenation.
+That is why §6.10 forbids interleaving any frame, from any stream, into one — the
+header block is the single place HTTP/2 stops being multiplexed. Tested by cutting a
+real HPACK block at all eighteen possible positions and requiring identical fields.
+
+**The CONTINUATION flood of 2024 needs two bounds, not one.** A byte ceiling alone
+still admits an unbounded number of *empty* `CONTINUATION` frames, which cost no memory
+but pin the connection; a frame ceiling alone admits sixteen frames of 16 KiB. Both are
+tested.
+
+### `stream.zig` — RFC 9113 §5.1, §5.1.1, §5.1.2
+
+The state machine, the identifier rules, and the reset rate limit.
+
+**`closed` is two states, not one**, because §5.1 gives the same late frame two
+different severities: after `RST_STREAM` it is a *stream* error, after `END_STREAM` a
+*connection* error. That is not arbitrary. A `RST_STREAM` and a frame already in flight
+cross on the wire constantly, so punishing the connection for a race the peer could not
+avoid would be wrong; anything after `END_STREAM` means the two sides no longer agree
+about what the stream is. The error set names the severity, so the connection layer
+cannot get it wrong by accident.
+
+### `flow.zig` — RFC 9113 §5.2, §6.9
+
+Both window levels, and the write scheduler.
+
+**A window is signed**, because §6.9.2 says a change to
+`SETTINGS_INITIAL_WINDOW_SIZE` "can cause the available space in a flow-control window
+to become negative". That is not an error: it means the sender has already sent bytes
+it is no longer entitled to and must wait for credit covering the shortfall.
+
+**Flow control charges the whole `DATA` payload including padding** (§6.1), which is
+more than the application sees. That has a test rather than a comment, because getting
+it wrong is invisible until a peer pads its frames — and then the two sides' windows
+drift apart and the connection stalls with neither side at fault.
+
+The scheduler is round robin with a cap of one frame per stream per pass. Round robin
+stops a chatty stream starving a quiet one; the per-pass cap turns a megabyte on one
+stream into sixty-four frames interleaved with everyone else's rather than sixty-four
+back to back. **A stream with no credit is stepped over, never waited on** — that one
+line is the deadlock argument below, and it has a test that fails if a blocked stream
+can hold up a stream that has credit.
+
+### `connection.zig` — RFC 9113 §3.4, §6.5, §6.7, §6.8
+
+The piece that drives every layer below it. Bytes in through `poll`, application events
+out, and anything owed the peer accumulated in `out` for the caller to flush.
+
+That seam is what makes the protocol testable without a socket, and the tests use it to
+wire a client and a server to each other so every byte one side writes is parsed by the
+other with no test-only shortcut between them.
+
+Severity is acted on here. A stream error never surfaces: `RST_STREAM` goes out, the
+stream is dropped, and `poll` carries on — the peer's other streams never noticed. A
+connection error writes `GOAWAY` and returns an error, and the caller must flush before
+closing or the peer learns nothing about why.
+
+### `multiplex.zig` — one `Pipeline` per stream
+
+Netty's `Http2MultiplexHandler` and `Http2StreamChannel`.
+
+The evaluation worried this contradicted the threading model. Written down carefully it
+does not, and the reason is worth stating exactly: Zinet gives each connection one
+reader task and handler state is lock free because of that, but the guarantee was
+always "one task per connection", never "one pipeline per task". `dispatch` is an
+ordinary function call from the parent's reader task, so every child pipeline runs
+there. Multiplexing is logical, not parallel.
+
+**Inbound `END_STREAM` half-closes; it does not tear the stream down.** The first
+version conflated them, and that made an asynchronous reply impossible — a handler
+could only respond from inside the callback that told it the request had arrived, since
+its pipeline was destroyed on the way out. Now the inbound end is an
+`InboundComplete` event and the pipeline is torn down when the *connection* says the
+stream is over, in whichever direction closed last.
+
+### `semantics.zig` — RFC 9113 §8
+
+Where a header list becomes a request or a response. Two of its rules are security
+properties rather than tidiness:
+
+**Connection-specific fields are refused** (§8.2.2). `Connection`,
+`Transfer-Encoding`, `Keep-Alive`, `Proxy-Connection` and `Upgrade` each describe a
+single HTTP/1.1 hop, and HTTP/2 has no hops. A gateway that forwards one while
+translating back to HTTP/1.1 emits framing headers the HTTP/2 sender chose, which is
+request smuggling — the same argument the HTTP/1.1 decoder here already makes about two
+sources of framing truth, arriving from the other direction.
+
+**Field names must be lowercase** (§8.2.1). `Content-Length` and `content-length` are
+unequal as bytes, so a peer sending both hands two different values to anything
+matching case-sensitively.
+
+Both are stream errors per §8.1.1: the message is malformed, not the connection.
+
+### `codec.zig` — the entry points
+
+`addServerCodec` and `addClientCodec`. One handler nearest the socket, owning the
+connection and the multiplexer. An application that wants per-request handlers puts
+them in the stream initializer and needs nothing in the parent pipeline at all.
+
+## Backpressure: the one framework change
+
+The evaluation identified this as the real cost, and it was right that it is the only
+part that touches the rest of the framework. It turned out to be statable in one
+sentence and to cost less than feared.
+
+Everywhere else, Zinet's outbound queue is bounded and **blocks the producer**, and
+write water marks are listed in the README under "deliberately absent" because blocking
+is backpressure that cannot be ignored. That argument is sound, and it is specifically
+about a connection carrying one exchange.
+
+It does not survive HTTP/2. With many exchanges sharing one credit pool, a writer
+blocked because one stream's window is exhausted is a writer that is sending *nothing*
+— including on the streams that still have credit, and including the frames the peer is
+waiting for before it will send the `WINDOW_UPDATE` that would release the block. The
+thing that unblocks the writer can only arrive if the writer is not blocked.
+
+So the boundary is:
+
+> **Blocking where one exchange owns the connection, water marks where many share it.**
+
+Not a preference. A consequence of whether the thing that would unblock the producer
+can arrive while it is blocked.
+
+And the exception does not cost the "nothing is unbounded" invariant, because there are
+two mechanisms rather than one. Netty's write queue is unbounded, so its water marks
+are the only defence and an application that ignores them is merely misbehaving. Here
+the marks are **advice** — heed them and the ceiling is never reached — and
+`max_pending` is the **rule**: exceeding it fails the write.
+[examples/http2_server.zig](examples/http2_server.zig) writes in 16 KiB chunks against
+a 64 KiB mark and resumes on `WritabilityChanged`, because this is the shape HTTP/2
+forces and it deserves demonstrating rather than describing.
+
+## Every limit, and what it stops
+
+The evaluation observed that an unusually large share of HTTP/2 is bounds rather than
+parsing. That held up. Every one of these is a published denial-of-service class:
+
+| Bound | Default | Stops |
 |---|---|---|
-| Frame layer | ~600 | 9-byte header, ten frame types, `max_frame_size` negotiation |
-| HPACK (RFC 7541) | ~900 | Static table of 61 entries, dynamic table with eviction, canonical Huffman table, prefixed integers |
-| Stream state machine | ~700 | RFC 9113 §5.1, per stream, plus ID validity and half-close rules |
-| Flow control + write scheduler | ~500 | Two window levels, `WINDOW_UPDATE`, fair interleaving |
-| Connection management | ~300 | `SETTINGS`, `PING`, `GOAWAY`, `RST_STREAM` |
-| Multiplexed child pipelines | ~400 | Framework change, see §3 |
-| Tests and fuzz targets | ~1500 | HPACK round trips, state machine transitions, every bound below |
+| `max_concurrent_streams` | 128 | Unbounded concurrent state per connection (§5.1.2) |
+| reset rate | 200 / 30 s | **Rapid Reset**, CVE-2023-44487 |
+| `max_continuation_frames` | 16 | **CONTINUATION flood** (2024), the empty-frame half |
+| `max_block_size` | 16 KiB | The same flood's memory half |
+| `max_header_list_size` | 32 KiB | HPACK header-list bomb, charged per field while decoding |
+| `max_string_len` | 8 KiB | One enormous header name or value |
+| `max_fields` | 128 | Many tiny fields, which cost little size but a slot each |
+| control frame rate | 100 / 10 s | `SETTINGS` and `PING` floods — each obliges a reply |
+| idle frame rate | 10 000 / 10 s | `WINDOW_UPDATE`, `PRIORITY`, empty `DATA`, unknown types |
+| `max_pending` | 256 KiB | An application that ignores its water mark |
+| `max_frame_size` | 16 KiB | §6.5.2's own ceiling on one frame |
 
-That is on the order of 5000 lines against a `src/` tree that is currently
-20083, so a quarter of the codebase for one protocol. The estimate is not the
-argument against it — HTTP/1.1 plus its client is 2988 lines and was worth it —
-but it sets the bar for what the protocol has to buy, and §1 says it currently
-buys cleartext-only.
+The reset and frame rates are a shape nothing else in this codebase has. Every other
+limit here is a ceiling on a *quantity*, which works because the resource is held.
+These attacks hold nothing — a reset stream frees its slot immediately, a `PING` is
+answered and forgotten, an empty `DATA` frame occupies no memory. What they consume is
+work, and work is only bounded per unit of time. Time is injected rather than read, and
+a clock that goes backwards cannot open the gate.
 
-An unusually large share of that work is bounds rather than parsing. Every one of
-these is a published denial-of-service class with its own explicit limit:
+## What found the defects
 
-* **Rapid Reset** (CVE-2023-44487): open a stream, immediately `RST_STREAM`,
-  repeat. Streams closed this way do not count against
-  `SETTINGS_MAX_CONCURRENT_STREAMS`, so the limit has to be on resets per
-  interval — a rate limit, which is a shape Zinet does not have anywhere yet.
-* **CONTINUATION flood** (2024): unbounded `CONTINUATION` frames that never
-  complete a header block. Needs a cap on frames per header block *and* on
-  accumulated header bytes before the block completes.
-* **HPACK header-list bomb**: the same shape as the zip bomb D4 dealt with, and
-  the same answer — `SETTINGS_MAX_HEADER_LIST_SIZE` enforced *while* decoding,
-  not after.
-* **Frame floods**: `SETTINGS`, `PING` and `WINDOW_UPDATE` all demand a response
-  and all cost nothing to send.
+Worth recording, because the three methods found different things and none of them
+would have found the others'.
 
-Zinet's discipline (every limit explicit and caller-visible) is exactly right for
-this, which is a point in favour of doing it here rather than elsewhere. It is
-also a warning: the protocol is not finished when it works, it is finished when
-each of these has a bound and a test.
+**Chunk independence** — the fuzz oracle that had already found four defects elsewhere
+in this repository — covers HTTP/2's three nested places to get fragmentation wrong: the
+connection preface, the frame boundary, and the header block. Random bytes test almost
+nothing here, since without a valid preface every input dies at byte 24, so the target
+assembles a frame stream instead.
 
-## 3. Fit: what it would break
+**Two-sided tests**, wiring a client and a server made of this same implementation to
+each other, found a defect no one-sided test could see: the client treated the response
+it had asked for as trailers on its own request, because `headers_seen` conflated
+sending a header block with receiving one, and §8.1's "a second block is trailers" is
+strictly about the receive direction.
 
-### The multiplexing conflict that turns out not to be one
+**`curl`** found four more, every one of which had passed the entire test suite:
 
-The obvious worry is that HTTP/2 runs many concurrent exchanges over one
-connection while Zinet gives each connection exactly one reader task, and that
-handler state is lock free *because* of that. Written down carefully, these do
-not conflict. Netty's own answer — `Http2MultiplexHandler` creating a child
-`Http2StreamChannel` with its own pipeline per stream — keeps every child on the
-parent's event loop. Multiplexing is logical, not parallel.
+1. A response with no body never ended its stream, because `flush` routed the
+   END_STREAM-only case through the scheduler and the scheduler skips a candidate with
+   nothing pending. A zero-length `DATA` frame is not waiting for credit.
+2. The input bound was checked *before* parsing, so a 300 KiB upload — one socket read
+   holding many frames — looked like an attack. The bound belongs on the residue.
+3. A stream was torn down when its inbound half closed, which is exactly when a server
+   has learned what to reply to.
+4. One write pass is not enough. A pass grants each stream one frame, but a peer that
+   has finished its request sends nothing more, so there is no next read to carry the
+   next pass and a large response stopped halfway.
 
-The same move works here: one reader task decodes frames and dispatches each to a
-per-stream `Pipeline`. N pipelines on one task preserves the guarantee, which is
-about one task per connection and never was about one pipeline per task. So this
-is work (§2's "multiplexed child pipelines") but not a contradiction.
+The lesson is not that the tests were weak. It is that a test suite written alongside an
+implementation shares its assumptions, and another implementation does not. That is why
+the repository's rule is that every protocol is checked against somebody else's code, in
+CI rather than by hand.
 
-### The write path, which is a real structural change
+## Deliberately not done
 
-Zinet's outbound side is a single bounded FIFO drained by one writer task. HTTP/2
-needs frames from different streams interleaved, so a large `DATA` frame for one
-stream cannot be allowed to sit in front of another stream's `HEADERS`. That
-means per-stream send queues plus a scheduler choosing between them, replacing
-the FIFO for this protocol. Sizeable, but ordinary.
-
-### The backpressure model, which is the actual objection
-
-This is the part that decides the design rather than the schedule.
-
-Zinet's backpressure is stated in the README as a deliberate difference from
-Netty: the outbound queue is bounded and **blocks the producer**, and write water
-marks are listed under "Deliberately absent" because blocking is backpressure
-that cannot be ignored.
-
-HTTP/2 has its own credit-based flow control, per stream *and* per connection.
-Combine the two and the failure is not inefficiency, it is a deadlock: a writer
-task blocked because a stream's window is exhausted is a writer task that is not
-sending anything — including on the streams that still have credit, and including
-the frames the peer is waiting for before it will send the `WINDOW_UPDATE` that
-would release the block. The thing that unblocks the writer can only arrive if
-the writer is not blocked.
-
-So under HTTP/2 the writer must never block on a window. It has to park the
-stream and move on, which means a stream's pending bytes must be bounded
-somewhere the application can see, which means the application has to be *told*
-to stop rather than stopped by blocking — which is Netty's write water marks,
-the facility Zinet argued it did not need. HTTP/2 is the case where that argument
-does not hold, and the reason is precise: blocking a producer is safe when the
-connection carries one exchange, and is a deadlock when it carries many that
-share a credit pool.
-
-Zinet already has half of the replacement: `isWritable` and `pendingOutbound`
-were added (phase three, A4) for observability. Turning those into the primary
-mechanism for one protocol, while blocking remains the mechanism everywhere else,
-would leave the framework with two backpressure models and a rule about which
-applies where. That is the cost that is not measured in lines.
-
-### What survives unchanged
-
-Worth recording, because it is the reason this is a "not now" rather than a
-"no": the fuzzing story holds up. Chunk independence still applies — the
-connection is still one byte stream that must decode identically however it is
-fragmented — and it is the invariant that found four real bugs. HPACK gains a
-round-trip oracle for free. So HTTP/2 would be testable to the standard the rest
-of the codebase is held to.
-
-## 4. When to revisit
-
-The answer changes when any of these does:
-
-1. **`std.crypto.tls.Client` gains ALPN.** This alone makes `h2` clients
-   reachable and is by far the cheapest change upstream — an options field and an
-   extension in the `ClientHello`. It would move HTTP/2 from "unreachable" to
-   "expensive".
-2. **`std.crypto.tls.Server` appears.** Needed for `h2` servers, and already
-   recorded as blocking server-side TLS generally.
-3. **A concrete cleartext use appears.** gRPC between services on a controlled
-   network is a real target that needs neither of the above. If that is the goal,
-   the evaluation above is a plan rather than a rejection — and the order to
-   build in is frame layer, HPACK, stream states, then the write scheduler and
-   the water-mark decision last, because that decision is the one that touches
-   the rest of the framework.
-
-Until then, the framework-level piece worth extracting independently is the
-multiplexed child pipeline from §3: it is not HTTP/2-specific, it is what any
-multiplexed protocol needs, and unlike the backpressure question it costs the
-existing design nothing.
+| Thing | Why |
+|---|---|
+| The priority tree (§5.3) | §5.3.1 deprecates the scheme and §5.3 permits ignoring it. `PRIORITY` is parsed, reported and counted against the idle-frame limit; it is not acted on. Netty's default scheduler weights by it, which is the difference. |
+| Sending `PUSH_PROMISE` | Receiving one works — the promised stream is reserved and reported. Sending one has no convenience API, because server push is disabled by default in every current browser and `SETTINGS_ENABLE_PUSH` is 0 here as a result. The frame layer can write it if that changes. |
+| `h2` over TLS | Not a decision. See [Reachability](#reachability). |
+| Automatic `content-length` | The HTTP/1.1 encoder controls framing headers because two sources of framing truth is what smuggling is made of. HTTP/2 frames itself, so `content-length` is advisory and left to the application. |
