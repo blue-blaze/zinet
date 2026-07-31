@@ -5,13 +5,13 @@
 //! it never touches a socket. `receive` takes one UDP payload; `send` fills one.
 //! Task 12 attaches those two to a datagram endpoint.
 //!
-//! This layer owns the parts of RFC 9000 that make a handshake reach the far end:
-//! packet assembly and coalescing (§12.2), the CRYPTO stream's reassembly (§7.5),
-//! Retry and address validation (§8.1, §17.2.5), and the §7.3 connection ID
-//! check that authenticates packet headers. Streams and flow control are the next
-//! layer up; loss recovery and congestion control the one after. Both are absent
-//! here rather than stubbed, and the two places it shows are marked: ACK
-//! generation reports a single range, and nothing is retransmitted.
+//! This layer owns the parts of RFC 9000 that make packets reach the far end:
+//! assembly and coalescing (§12.2), the CRYPTO stream's reassembly (§7.5), Retry
+//! and address validation (§8.1, §17.2.5), the §7.3 connection ID check that
+//! authenticates packet headers, and the wiring from frames to `streams.zig`.
+//! Loss recovery and congestion control are the next layer up, and absent here
+//! rather than stubbed: ACK generation reports a single range, and nothing is
+//! retransmitted.
 //!
 //! **Randomness and time are parameters, not calls.** Connection IDs come from
 //! the caller, as does the handshake seed, so a whole handshake is reproducible
@@ -30,6 +30,8 @@ const packet = @import("packet.zig");
 const transport = @import("transport.zig");
 const varint = @import("varint.zig");
 const cid_mod = @import("cid.zig");
+const stream_mod = @import("stream.zig");
+const streams_mod = @import("streams.zig");
 
 const ConnectionId = packet.ConnectionId;
 const Level = client.Level;
@@ -53,7 +55,10 @@ pub const Error = error{
     StatelessReset,
     /// The connection is closed and will not send or receive again.
     ConnectionClosed,
-};
+} || Allocator.Error;
+// Allocation failure is included rather than folded into a protocol error, for the
+// reason stream.zig gives: telling the peer PROTOCOL_VIOLATION because malloc
+// failed sends it looking for a bug it does not have.
 
 /// §14.1: any datagram containing an Initial packet that a client sends must be
 /// at least this large. It is an anti-amplification rule rather than an MTU one:
@@ -102,6 +107,16 @@ pub const Event = union(enum) {
     /// A Retry was accepted and the handshake restarted. Surfaced because it
     /// changes the connection ID and invalidates any packet already in flight.
     retry_received,
+    /// Data is readable on a stream. The bytes stay in the stream's reassembly
+    /// buffer; the application reads them with `read` and releases flow control
+    /// credit with `consume`. Delivering the slice here would mean either copying
+    /// it or promising a lifetime this layer cannot keep.
+    stream_readable: struct { id: u64, fin: bool },
+    /// §19.4: the peer abandoned its side of a stream.
+    stream_reset: struct { id: u64, code: u64 },
+    /// §19.5: the peer no longer wants what we are sending on a stream, and §3.5
+    /// obliges us to reset it.
+    stream_stop_sending: struct { id: u64, code: u64 },
 };
 
 pub const Options = struct {
@@ -126,6 +141,10 @@ pub const Options = struct {
     /// §8.1: a token from a previous connection or a Retry, replayed to skip
     /// address validation. Empty is normal.
     token: []const u8 = &.{},
+    /// §4's initial windows and §4.6's stream counts, as we advertise them. The
+    /// values in `parameters` and these must agree, so they are derived from
+    /// `parameters` rather than given twice.
+    stream_window: u64 = 256 * 1024,
 };
 
 /// One packet number space: RFC 9000 §12.3 has three, and 0-RTT shares the
@@ -278,6 +297,17 @@ pub const Connection = struct {
     /// A CONNECTION_CLOSE we owe the peer.
     pending_close: ?struct { code: u64, application: bool } = null,
 
+    streams: streams_mod.Streams,
+    /// Whether a stream has something to put in a packet. A flag rather than a
+    /// scan, because `hasSomethingToSend` runs for every datagram and walking every
+    /// stream to answer "is there anything" would make an idle connection with many
+    /// streams cost more than a busy one with few.
+    pending_stream_data: bool = false,
+    /// Round-robin cursor over streams, so one busy stream cannot starve the rest.
+    /// §2.3 leaves prioritisation to the application; this is the floor beneath any
+    /// scheme it chooses.
+    send_cursor: u64 = 0,
+
     events: std.ArrayList(Event) = .empty,
     /// Storage the events borrow. A fixed buffer rather than an allocation per
     /// event, which is why `Event`'s slices are documented as valid only until
@@ -302,6 +332,15 @@ pub const Connection = struct {
                 .transport_parameters = encoded[0..params_len],
                 .verification = options.verification,
             }, seed),
+            .streams = .init(.client, .{
+                // Derived from the transport parameters rather than configured
+                // separately: two places to state the same window is two places
+                // for them to disagree, and the peer would believe the parameters.
+                .local_max_data = parameters.initial_max_data,
+                .local_max_stream_data = parameters.initial_max_stream_data_bidi_local,
+                .local_max_streams_bidi = parameters.initial_max_streams_bidi,
+                .local_max_streams_uni = parameters.initial_max_streams_uni,
+            }),
             .local = .init(options.local_cid),
             .remote = .init(options.initial_destination, parameters.active_connection_id_limit),
             .original_destination = options.initial_destination,
@@ -323,6 +362,7 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection, gpa: Allocator) void {
+        self.streams.deinit(gpa);
         for (&self.spaces) |*space| space.deinit(gpa);
         self.engine.deinit(gpa);
         self.events.deinit(gpa);
@@ -356,6 +396,71 @@ pub const Connection = struct {
     pub fn close(self: *Connection, code: u64, application: bool) void {
         if (self.closed) return;
         self.pending_close = .{ .code = code, .application = application };
+    }
+
+    // ── The application's view of streams ────────────────────────────────────
+
+    /// Open a stream, returning its ID. Fails with StreamLimitError until the
+    /// handshake has authenticated the peer's §4.6 limits, because before that we
+    /// have no permission to open anything.
+    pub fn openStream(self: *Connection, gpa: Allocator, bidirectional: bool) Error!u64 {
+        const id = self.streams.open(gpa, bidirectional) catch |err| {
+            try self.mapStreamError(err);
+            unreachable;
+        };
+        return id.value;
+    }
+
+    /// Queue data on a stream, returning how many bytes were accepted. A short
+    /// write is flow control rather than failure, and it is the caller's business
+    /// to try again once a MAX_DATA or MAX_STREAM_DATA arrives.
+    pub fn write(self: *Connection, gpa: Allocator, id: u64, data: []const u8) Error!usize {
+        const n = self.streams.write(gpa, .init(id), data) catch |err| {
+            try self.mapStreamError(err);
+            unreachable;
+        };
+        if (n > 0) self.pending_stream_data = true;
+        return n;
+    }
+
+    /// End our side of a stream (§19.8's FIN).
+    pub fn finishStream(self: *Connection, id: u64) Error!void {
+        const s = self.streams.get(.init(id)) orelse return error.ProtocolViolation;
+        const sender = &(s.send orelse return error.ProtocolViolation);
+        sender.finish() catch |err| {
+            try self.mapStreamError(err);
+            unreachable;
+        };
+        self.pending_stream_data = true;
+    }
+
+    /// Abandon our side of a stream (§19.4).
+    pub fn resetStream(self: *Connection, id: u64, code: u64) Error!void {
+        const s = self.streams.get(.init(id)) orelse return error.ProtocolViolation;
+        const sender = &(s.send orelse return error.ProtocolViolation);
+        _ = sender.abandon(code) catch |err| {
+            try self.mapStreamError(err);
+            unreachable;
+        };
+        self.pending_stream_data = true;
+    }
+
+    /// Readable bytes on a stream. They stay in the stream's buffer until
+    /// `consume`, which is what releases flow control credit — a reader that never
+    /// consumes stalls the peer, which is the honest outcome.
+    pub fn read(self: *Connection, id: u64) []const u8 {
+        const s = self.streams.get(.init(id)) orelse return &.{};
+        const recv = &(s.recv orelse return &.{});
+        return recv.readable();
+    }
+
+    pub fn consume(self: *Connection, gpa: Allocator, id: u64, n: usize) void {
+        self.streams.consume(gpa, .init(id), n);
+    }
+
+    /// Take a stream's reset code, which is what lets the stream be forgotten.
+    pub fn takeStreamReset(self: *Connection, gpa: Allocator, id: u64) ?u64 {
+        return self.streams.takeReset(gpa, .init(id));
     }
 
     fn spaceFor(self: *Connection, level: Level) *Space {
@@ -651,12 +756,95 @@ pub const Connection = struct {
                     } });
                     return;
                 },
-                // Streams and flow control are the next layer's. Refusing them
-                // here rather than ignoring them keeps "implemented" honest: a
-                // peer that opens a stream gets an error instead of silence.
-                else => return error.ProtocolViolation,
+                .stream => |sf| {
+                    const id: stream_mod.Id = .init(sf.id);
+                    try self.mapStreamError(self.streams.receiveStream(
+                        gpa,
+                        id,
+                        sf.offset,
+                        sf.data,
+                        sf.fin,
+                    ));
+                    if (self.streams.get(id)) |s| {
+                        if (s.recv) |*r| {
+                            if (r.readable().len > 0 or sf.fin) {
+                                try self.events.append(gpa, .{ .stream_readable = .{
+                                    .id = sf.id,
+                                    .fin = r.final_size != null,
+                                } });
+                            }
+                        }
+                    }
+                },
+                .reset_stream => |sf| {
+                    try self.mapStreamError(self.streams.receiveReset(
+                        gpa,
+                        .init(sf.id),
+                        sf.error_code,
+                        sf.final_size,
+                    ));
+                    try self.events.append(gpa, .{ .stream_reset = .{
+                        .id = sf.id,
+                        .code = sf.error_code,
+                    } });
+                },
+                .stop_sending => |sf| {
+                    try self.mapStreamError(self.streams.receiveStopSending(
+                        gpa,
+                        .init(sf.id),
+                        sf.error_code,
+                    ));
+                    try self.events.append(gpa, .{ .stream_stop_sending = .{
+                        .id = sf.id,
+                        .code = sf.error_code,
+                    } });
+                },
+                .max_data => |limit| self.streams.receiveMaxData(limit),
+                .max_stream_data => |sf| try self.mapStreamError(
+                    self.streams.receiveMaxStreamData(gpa, .init(sf.id), sf.limit),
+                ),
+                .max_streams_bidi => |n| try self.mapStreamError(
+                    self.streams.receiveMaxStreams(true, n),
+                ),
+                .max_streams_uni => |n| try self.mapStreamError(
+                    self.streams.receiveMaxStreams(false, n),
+                ),
+                .stream_data_blocked => |sf| try self.mapStreamError(
+                    self.streams.receiveStreamDataBlocked(gpa, .init(sf.id)),
+                ),
+                // §19.12 and §19.14 are signals that the peer wants to send more.
+                // They carry no obligation — a receiver must not wait for one
+                // before extending credit (§4.2) — so there is nothing to do but
+                // acknowledge the packet, which happens above.
+                .data_blocked, .streams_blocked_bidi, .streams_blocked_uni => {},
+                // §19.17 and §19.18 belong with path validation, which is
+                // connection migration's business. Refused rather than ignored:
+                // answering a PATH_CHALLENGE without validating the path is worse
+                // than not answering, and silently dropping it would make
+                // migration fail in a way no log explains.
+                .path_challenge, .path_response => return error.ProtocolViolation,
             }
         }
+    }
+
+    /// Translate a stream-layer error into this layer's, which is where the QUIC
+    /// error code is decided. Kept in one place so that a new call site cannot
+    /// quietly map FLOW_CONTROL_ERROR onto something more convenient.
+    fn mapStreamError(self: *Connection, result: streams_mod.Error!void) Error!void {
+        _ = self;
+        result catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            // Every one of these is a connection error under §11.1. They differ in
+            // the code sent to the peer, which task 8 will carry; the effect here
+            // is the same.
+            error.FlowControlError,
+            error.StreamLimitError,
+            error.StreamStateError,
+            error.FinalSizeError,
+            error.ProtocolViolation,
+            error.ReassemblyBufferExceeded,
+            => error.ProtocolViolation,
+        };
     }
 
     /// After CRYPTO data reaches the TLS engine, new keys may exist and the
@@ -698,6 +886,10 @@ pub const Connection = struct {
 
         self.peer_parameters = peer;
         self.local.setPeerLimit(peer.active_connection_id_limit);
+        // §7.4: the peer's limits only exist once the handshake authenticated
+        // them. Applying them earlier would mean trusting unauthenticated numbers
+        // about how much we may send.
+        self.streams.applyPeerParameters(&peer);
         self.established = true;
         try self.events.append(gpa, .{ .established = .{ .alpn = self.engine.alpn() } });
     }
@@ -768,7 +960,28 @@ pub const Connection = struct {
         // Retirements owed for the peer's connection IDs need 1-RTT.
         if (level == .one_rtt and self.remote.pendingRetire().len > 0) return true;
 
+        if (level == .one_rtt and self.established) {
+            if (self.pending_stream_data) return true;
+            if (self.streams.maxDataUpdate() != null) return true;
+            if (self.streams.maxStreamsUpdate(true) != null) return true;
+            if (self.streams.maxStreamsUpdate(false) != null) return true;
+            if (self.creditOwed() != null) return true;
+        }
+
         return false;
+    }
+
+    /// The first stream owed a MAX_STREAM_DATA, if any.
+    fn creditOwed(self: *Connection) ?struct { id: u64, limit: u64 } {
+        var it = self.streams.map.iterator();
+        while (it.next()) |entry| {
+            const s = entry.value_ptr;
+            const recv = &(s.recv orelse continue);
+            if (recv.creditUpdate(self.streams.config.local_max_stream_data)) |limit| {
+                return .{ .id = entry.key_ptr.*, .limit = limit };
+            }
+        }
+        return null;
     }
 
     fn highestSendLevel(self: *Connection) Level {
@@ -947,6 +1160,10 @@ pub const Connection = struct {
             }
         }
 
+        if (level == .one_rtt and self.established) {
+            len += self.writeStreamFrames(dest[len..]);
+        }
+
         if (level == .one_rtt) {
             const owed = self.remote.pendingRetire();
             var sent: usize = 0;
@@ -972,6 +1189,152 @@ pub const Connection = struct {
         }
 
         return len;
+    }
+
+    /// Write whatever the streams have to say into one packet's payload.
+    ///
+    /// Control frames come first and data last, which is deliberate: a MAX_DATA that
+    /// loses its place to stream data is a window that does not open, and the sender
+    /// it was meant to unblock waits a round trip for the next chance. Stream data,
+    /// by contrast, is never lost by being deferred — there is always another packet.
+    fn writeStreamFrames(self: *Connection, dest: []u8) usize {
+        var len: usize = 0;
+
+        if (self.streams.maxDataUpdate()) |limit| {
+            const f: frame.Frame = .{ .max_data = limit };
+            if (len + frame.encodedLen(f) <= dest.len) {
+                len += frame.encode(dest[len..], f);
+                self.streams.applyMaxDataSent(limit);
+            }
+        }
+
+        for ([_]bool{ true, false }) |bidirectional| {
+            if (self.streams.maxStreamsUpdate(bidirectional)) |limit| {
+                const f: frame.Frame = if (bidirectional)
+                    .{ .max_streams_bidi = limit }
+                else
+                    .{ .max_streams_uni = limit };
+                if (len + frame.encodedLen(f) <= dest.len) {
+                    len += frame.encode(dest[len..], f);
+                    self.streams.applyMaxStreamsSent(bidirectional, limit);
+                }
+            }
+        }
+
+        while (self.creditOwed()) |owed| {
+            const f: frame.Frame = .{ .max_stream_data = .{ .id = owed.id, .limit = owed.limit } };
+            if (len + frame.encodedLen(f) > dest.len) break;
+            len += frame.encode(dest[len..], f);
+            self.streams.get(.init(owed.id)).?.recv.?.applyCredit(owed.limit);
+        }
+
+        // §19.4: a reset replaces any data still queued, so it goes out before we
+        // consider sending on that stream.
+        var reset_it = self.streams.map.iterator();
+        while (reset_it.next()) |entry| {
+            const s = entry.value_ptr;
+            const sender = &(s.send orelse continue);
+            if (sender.state != .reset_sent or sender.reset_code == null) continue;
+            if (sender.fin_sent) continue; // already sent, awaiting acknowledgement
+            const f: frame.Frame = .{ .reset_stream = .{
+                .id = entry.key_ptr.*,
+                .error_code = sender.reset_code.?,
+                .final_size = sender.written,
+            } };
+            if (len + frame.encodedLen(f) > dest.len) break;
+            len += frame.encode(dest[len..], f);
+            sender.fin_sent = true;
+        }
+
+        // Stream data, round robin: one frame per stream per pass, which is the rule
+        // http2/flow.zig's scheduler follows and for the same reason — a stream with
+        // a lot to say must not be able to hold the others off.
+        //
+        // **The share matters as much as the order.** Giving the first stream all
+        // the remaining room means one frame fills the packet and the rotation never
+        // gets a turn, so a starved stream looks like a hung request rather than an
+        // error. QUIC has no frame size limit to fall back on, unlike HTTP/2, so the
+        // budget has to be divided explicitly.
+        var progressed = false;
+        const waiting = self.countSendable();
+        if (waiting == 0) {
+            if (self.creditOwed() == null) self.pending_stream_data = false;
+            return len;
+        }
+        var visited: usize = 0;
+        const total = self.streams.map.count();
+        while (visited < total) : (visited += 1) {
+            const id_value = self.nextSendable() orelse break;
+            const s = self.streams.get(.init(id_value)).?;
+            const sender = &s.send.?;
+
+            const outstanding = sender.written - sender.sent;
+            const fin_pending = sender.fin_written and !sender.fin_sent;
+            if (outstanding == 0 and !fin_pending) continue;
+
+            // The frame's own header costs a type byte, a stream ID, an offset and a
+            // length, so the payload cannot simply be the remaining room.
+            const overhead = 1 + varint.encodedLen(id_value) +
+                varint.encodedLen(sender.sent) + varint.encodedLen(outstanding);
+            if (len + overhead >= dest.len) break;
+            const room = dest.len - len - overhead;
+            // An equal share of what is left, so every waiting stream fits. A
+            // stream wanting less than its share leaves the rest to the others,
+            // because the divisor is recomputed as the packet fills.
+            const share = @max(room / @max(self.countSendable(), 1), 1);
+            const take: usize = @intCast(@min(@min(room, share), outstanding));
+            if (take == 0 and !fin_pending) break;
+
+            const f: frame.Frame = .{ .stream = .{
+                .id = id_value,
+                .offset = sender.sent,
+                .data = sender.unsent()[0..take],
+                .fin = fin_pending and take == outstanding,
+                .had_length = true,
+            } };
+            if (len + frame.encodedLen(f) > dest.len) break;
+            len += frame.encode(dest[len..], f);
+            sender.markSent(take, f.stream.fin);
+            progressed = true;
+        }
+
+        if (!progressed and self.creditOwed() == null) self.pending_stream_data = false;
+        return len;
+    }
+
+    /// How many streams have something to put in a packet.
+    fn countSendable(self: *Connection) usize {
+        var total: usize = 0;
+        var it = self.streams.map.valueIterator();
+        while (it.next()) |s| {
+            const sender = &(s.send orelse continue);
+            if (sender.written > sender.sent) total += 1;
+            if (sender.fin_written and !sender.fin_sent) total += 1;
+        }
+        return total;
+    }
+
+    /// The next stream with something to send, advancing the round-robin cursor.
+    fn nextSendable(self: *Connection) ?u64 {
+        var best: ?u64 = null;
+        var wrapped: ?u64 = null;
+        var it = self.streams.map.iterator();
+        while (it.next()) |entry| {
+            const s = entry.value_ptr;
+            const sender = &(s.send orelse continue);
+            const has_data = sender.written > sender.sent;
+            const has_fin = sender.fin_written and !sender.fin_sent;
+            if (!has_data and !has_fin) continue;
+            const id_value = entry.key_ptr.*;
+            if (id_value >= self.send_cursor) {
+                if (best == null or id_value < best.?) best = id_value;
+            } else {
+                if (wrapped == null or id_value < wrapped.?) wrapped = id_value;
+            }
+        }
+        const chosen = best orelse wrapped orelse return null;
+        self.send_cursor = chosen + 1;
+        return chosen;
     }
 };
 
@@ -1930,4 +2293,552 @@ fn writeRetry(
     const tag = crypto.retryIntegrityTag(original_dcid.slice(), dest[0..cursor]);
     @memcpy(dest[cursor..][0..crypto.tag_len], &tag);
     return cursor + crypto.tag_len;
+}
+
+/// Drive a client to an established handshake against a `PacketServer`, leaving
+/// both able to exchange 1-RTT packets. Returns the server's 1-RTT keys so the
+/// test can read what the client sends.
+const Established = struct {
+    server: PacketServer,
+    send: crypto.Keys,
+    recv: crypto.Keys,
+    client_cid: ConnectionId,
+    next_pn: u64 = 0,
+
+    fn deinit(self: *Established, gpa: Allocator) void {
+        self.server.deinit(gpa);
+    }
+
+    /// Decrypt a 1-RTT packet and return its frames' payload.
+    fn open(self: *Established, dest: []u8, datagram: []const u8) ![]const u8 {
+        var offset: usize = 0;
+        while (offset < datagram.len) {
+            // A short header carries no connection ID length, so the receiver
+            // supplies its own — and the receiver here is the server, so it is the
+            // *server's* connection ID that appears in the client's packets. Using
+            // the client's length reads the packet number from the wrong offset and
+            // every packet fails to authenticate.
+            const parsed = try packet.parse(datagram[offset..], self.server.local_cid.len);
+            const slice = datagram[offset..][0..parsed.end];
+            offset += parsed.end;
+            const protected = switch (parsed.packet) {
+                .protected => |pr| pr,
+                else => continue,
+            };
+            if (protected.long_type != null) continue; // not 1-RTT
+
+            var work: [max_datagram]u8 = undefined;
+            @memcpy(work[0..slice.len], slice);
+            const buf = work[0..slice.len];
+            const pn_len = crypto.unprotectHeader(buf, protected.pn_offset, &self.recv.header);
+            const pn = readPacketNumber(buf[protected.pn_offset..][0..pn_len]);
+            const header = buf[0 .. protected.pn_offset + pn_len];
+            const body = buf[protected.pn_offset + pn_len ..];
+            const n = try self.recv.open(dest, pn, header, body);
+            return dest[0..n];
+        }
+        return &.{};
+    }
+
+    /// Build a 1-RTT packet carrying `frames`.
+    fn seal(self: *Established, dest: []u8, destination: ConnectionId, frames: []const u8) !usize {
+        const pn = self.next_pn;
+        const pn_len: u4 = 4;
+        var cursor: usize = 0;
+        dest[0] = packet.fixed_bit | (pn_len - 1);
+        cursor = 1;
+        @memcpy(dest[cursor..][0..destination.len], destination.slice());
+        cursor += destination.len;
+        const pn_offset = cursor;
+        packet.encodePacketNumber(dest[cursor..][0..pn_len], pn, pn_len);
+        cursor += pn_len;
+        const sealed = try self.send.seal(dest[cursor..], pn, dest[0..cursor], frames);
+        const total = cursor + sealed;
+        crypto.protectHeader(dest[0..total], pn_offset, pn_len, &self.send.header);
+        self.next_pn += 1;
+        return total;
+    }
+};
+
+fn establish(
+    gpa: Allocator,
+    conn: *Connection,
+    client_cid: ConnectionId,
+    server_cid: ConnectionId,
+    initial_dcid: ConnectionId,
+    server_params: *transport.Parameters,
+) !Established {
+    var server: PacketServer = .init(0xa7, initial_dcid, server_cid);
+    errdefer server.deinit(gpa);
+
+    var out: [max_datagram]u8 = undefined;
+    const first = try conn.send(gpa, &out);
+    try server.receive(gpa, out[0..first]);
+
+    server_params.initial_source_connection_id = server_cid;
+    server_params.original_destination_connection_id = initial_dcid;
+    var params_buf: [256]u8 = undefined;
+    const params_len = transport.encode(&params_buf, server_params, .server);
+
+    var reply: [max_datagram]u8 = undefined;
+    const reply_len = try server.reply(&reply, client_cid, "h3", params_buf[0..params_len]);
+    try conn.receive(gpa, reply_len_slice(&reply, reply_len));
+
+    // The client's Finished, so the server's own state machine completes.
+    const second = try conn.send(gpa, &out);
+    try server.receive(gpa, out[0..second]);
+
+    const suite = server.inner.schedule.?.suite;
+    const app = server.inner.application_secrets.?;
+    return .{
+        .server = server,
+        .send = .fromSecret(suite, app.server.slice()),
+        .recv = .fromSecret(suite, app.client.slice()),
+        .client_cid = client_cid,
+    };
+}
+
+fn reply_len_slice(buf: []u8, len: usize) []const u8 {
+    return buf[0..len];
+}
+
+test "connection: a stream carries data to the peer and back" {
+    // The point of wiring streams to packets: application bytes cross a real
+    // datagram in both directions, through flow control, framing, AEAD and header
+    // protection, with a peer that derived its own keys.
+    const gpa = testing.allocator;
+
+    const client_cid = cid(&.{ 0xc0, 0xc1, 0xc2 });
+    const server_cid = cid(&.{ 0x50, 0x51 });
+    const initial_dcid = cid(&.{ 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80 });
+
+    var conn = try Connection.initClient(testOptions(client_cid, initial_dcid), @splat(0x64));
+    defer conn.deinit(gpa);
+    try conn.start(gpa);
+
+    var server_params: transport.Parameters = .{
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 64 * 1024,
+        .initial_max_streams_bidi = 4,
+    };
+    var peer = try establish(gpa, &conn, client_cid, server_cid, initial_dcid, &server_params);
+    defer peer.deinit(gpa);
+    try testing.expect(conn.isEstablished());
+
+    // §4.6: the peer's limits only became usable when the handshake authenticated
+    // them, so opening works now and would not have before.
+    const id = try conn.openStream(gpa, true);
+    try testing.expectEqual(@as(u64, 0), id); // client-initiated bidirectional, index 0
+
+    const request = "GET / HTTP/3-ish";
+    try testing.expectEqual(request.len, try conn.write(gpa, id, request));
+    try conn.finishStream(id);
+
+    var out: [max_datagram]u8 = undefined;
+    const len = try conn.send(gpa, &out);
+    try testing.expect(len > 0);
+
+    // The server reads the stream frame out of a genuine 1-RTT packet.
+    var plain: [max_datagram]u8 = undefined;
+    var rest = try peer.open(&plain, out[0..len]);
+    try testing.expect(rest.len > 0);
+
+    var saw: ?frame.Stream = null;
+    while (rest.len > 0) {
+        const f = try frame.parse(&rest);
+        switch (f) {
+            .stream => |sf| saw = sf,
+            else => {},
+        }
+    }
+    const got = saw.?;
+    try testing.expectEqual(id, got.id);
+    try testing.expectEqual(@as(u64, 0), got.offset);
+    try testing.expectEqualStrings(request, got.data);
+    try testing.expect(got.fin);
+
+    // And the reply comes back the same way: the server answers on the same
+    // bidirectional stream.
+    const response = "hello from the server";
+    var frames: [128]u8 = undefined;
+    const frames_len = frame.encode(&frames, .{ .stream = .{
+        .id = id,
+        .offset = 0,
+        .data = response,
+        .fin = true,
+        .had_length = true,
+    } });
+    var packet_buf: [max_datagram]u8 = undefined;
+    const packet_len = try peer.seal(&packet_buf, client_cid, frames[0..frames_len]);
+    try conn.receive(gpa, packet_buf[0..packet_len]);
+
+    var readable = false;
+    while (conn.nextEvent()) |event| {
+        switch (event) {
+            .stream_readable => |e| {
+                try testing.expectEqual(id, e.id);
+                try testing.expect(e.fin);
+                readable = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(readable);
+    try testing.expectEqualStrings(response, conn.read(id));
+
+    // Consuming is what releases flow control credit, and it is also what lets the
+    // stream be forgotten once both halves are done.
+    conn.consume(gpa, id, response.len);
+    try testing.expectEqual(@as(usize, 0), conn.read(id).len);
+}
+
+test "connection: §4.1's connection window is enforced across streams over real packets" {
+    // The two-level check, end to end. The peer grants a small connection window
+    // and a large per-stream one, so a second stream is refused credit even though
+    // its own window is untouched — and the refusal is a short write rather than an
+    // error, because flow control is not a failure.
+    const gpa = testing.allocator;
+
+    const client_cid = cid(&.{ 0xd0, 0xd1 });
+    const server_cid = cid(&.{ 0x60, 0x61 });
+    const initial_dcid = cid(&.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(testOptions(client_cid, initial_dcid), @splat(0x71));
+    defer conn.deinit(gpa);
+    try conn.start(gpa);
+
+    var server_params: transport.Parameters = .{
+        .initial_max_data = 100,
+        .initial_max_stream_data_bidi_remote = 1000,
+        .initial_max_streams_bidi = 4,
+    };
+    var peer = try establish(gpa, &conn, client_cid, server_cid, initial_dcid, &server_params);
+    defer peer.deinit(gpa);
+
+    const a = try conn.openStream(gpa, true);
+    const b = try conn.openStream(gpa, true);
+
+    const payload: [80]u8 = @splat('x');
+    try testing.expectEqual(@as(usize, 80), try conn.write(gpa, a, &payload));
+    // Only 20 of the connection's 100 bytes are left, so the second stream gets
+    // 20 despite having 1000 of its own.
+    try testing.expectEqual(@as(usize, 20), try conn.write(gpa, b, &payload));
+    try testing.expectEqual(@as(usize, 0), try conn.write(gpa, b, &payload));
+    try testing.expect(conn.streams.isBlocked());
+
+    // A MAX_DATA from the peer opens it again: 400 total, 100 spent, so the next
+    // write is bounded by the payload rather than by either window.
+    var frames: [32]u8 = undefined;
+    const frames_len = frame.encode(&frames, .{ .max_data = 400 });
+    var packet_buf: [max_datagram]u8 = undefined;
+    const packet_len = try peer.seal(&packet_buf, client_cid, frames[0..frames_len]);
+    try conn.receive(gpa, packet_buf[0..packet_len]);
+
+    try testing.expect(!conn.streams.isBlocked());
+    try testing.expectEqual(@as(usize, 80), try conn.write(gpa, b, &payload));
+    // And the connection window is what stops it again: 300 were granted beyond
+    // the 100 already spent, so 80 + 80 + 80 + 60 exhausts it.
+    try testing.expectEqual(@as(usize, 80), try conn.write(gpa, b, &payload));
+    try testing.expectEqual(@as(usize, 80), try conn.write(gpa, b, &payload));
+    try testing.expectEqual(@as(usize, 60), try conn.write(gpa, b, &payload));
+    try testing.expect(conn.streams.isBlocked());
+}
+
+test "connection: two streams share the wire round robin" {
+    // §2.3 leaves prioritisation to the application, so the floor beneath any
+    // scheme is that one stream with a lot to say cannot hold the others off. The
+    // failure this prevents is a starved stream, which looks like a hung request
+    // rather than an error.
+    const gpa = testing.allocator;
+
+    const client_cid = cid(&.{ 0xe0, 0xe1 });
+    const server_cid = cid(&.{ 0x70, 0x71 });
+    const initial_dcid = cid(&.{ 8, 7, 6, 5, 4, 3, 2, 1 });
+
+    var conn = try Connection.initClient(testOptions(client_cid, initial_dcid), @splat(0x35));
+    defer conn.deinit(gpa);
+    try conn.start(gpa);
+
+    var server_params: transport.Parameters = .{
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 64 * 1024,
+        .initial_max_streams_bidi = 4,
+    };
+    var peer = try establish(gpa, &conn, client_cid, server_cid, initial_dcid, &server_params);
+    defer peer.deinit(gpa);
+
+    const a = try conn.openStream(gpa, true);
+    const b = try conn.openStream(gpa, true);
+
+    // Enough on each that neither fits in one packet.
+    const bulk: [4000]u8 = @splat('b');
+    _ = try conn.write(gpa, a, &bulk);
+    _ = try conn.write(gpa, b, &bulk);
+
+    // **Both streams appear in the very first packet.** That is the assertion worth
+    // making: "both appear eventually" would pass with a first-come scheduler too,
+    // once the first stream simply ran out of data. Sharing the packet is the
+    // property, and the failure it prevents is a starved stream — which looks like a
+    // hung request rather than an error.
+    var out: [max_datagram]u8 = undefined;
+    const len = try conn.send(gpa, &out);
+    try testing.expect(len > 0);
+
+    var plain: [max_datagram]u8 = undefined;
+    var rest = try peer.open(&plain, out[0..len]);
+    var bytes_a: usize = 0;
+    var bytes_b: usize = 0;
+    while (rest.len > 0) {
+        const f = try frame.parse(&rest);
+        switch (f) {
+            .stream => |sf| {
+                if (sf.id == a) bytes_a += sf.data.len;
+                if (sf.id == b) bytes_b += sf.data.len;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(bytes_a > 0);
+    try testing.expect(bytes_b > 0);
+    // Roughly equal shares, since neither stream asked for less than its share.
+    const ratio = @max(bytes_a, bytes_b) / @max(@min(bytes_a, bytes_b), 1);
+    try testing.expect(ratio <= 2);
+
+    // And both keep making progress on the next pass rather than one being
+    // permanently behind.
+    const second = try conn.send(gpa, &out);
+    rest = try peer.open(&plain, out[0..second]);
+    var again_a = false;
+    var again_b = false;
+    while (rest.len > 0) {
+        const f = try frame.parse(&rest);
+        switch (f) {
+            .stream => |sf| {
+                if (sf.id == a) again_a = true;
+                if (sf.id == b) again_b = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(again_a and again_b);
+}
+
+test "connection: a peer's RESET_STREAM is reported and the stream is reclaimed" {
+    const gpa = testing.allocator;
+
+    const client_cid = cid(&.{ 0xf0, 0xf1 });
+    const server_cid = cid(&.{ 0x80, 0x81 });
+    const initial_dcid = cid(&.{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 });
+
+    var conn = try Connection.initClient(testOptions(client_cid, initial_dcid), @splat(0x46));
+    defer conn.deinit(gpa);
+    try conn.start(gpa);
+
+    var server_params: transport.Parameters = .{
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 4096,
+        .initial_max_streams_bidi = 4,
+    };
+    var peer = try establish(gpa, &conn, client_cid, server_cid, initial_dcid, &server_params);
+    defer peer.deinit(gpa);
+
+    const id = try conn.openStream(gpa, true);
+    _ = try conn.write(gpa, id, "partial");
+
+    // The server abandons its side, claiming it sent 12 bytes.
+    var frames: [64]u8 = undefined;
+    const frames_len = frame.encode(&frames, .{ .reset_stream = .{
+        .id = id,
+        .error_code = 0x2a,
+        .final_size = 12,
+    } });
+    var packet_buf: [max_datagram]u8 = undefined;
+    const packet_len = try peer.seal(&packet_buf, client_cid, frames[0..frames_len]);
+    try conn.receive(gpa, packet_buf[0..packet_len]);
+
+    var code: ?u64 = null;
+    while (conn.nextEvent()) |event| {
+        switch (event) {
+            .stream_reset => |e| code = e.code,
+            else => {},
+        }
+    }
+    try testing.expectEqual(@as(?u64, 0x2a), code);
+    // §4.5: the 12 bytes are charged to the connection window even though none
+    // arrived, because the peer spent that credit.
+    try testing.expectEqual(@as(u64, 12), conn.streams.recv_used);
+
+    // Taking the reset and abandoning our own half lets the stream go.
+    try testing.expectEqual(@as(?u64, 0x2a), conn.takeStreamReset(gpa, id));
+    try conn.resetStream(id, 0);
+    conn.streams.get(.init(id)).?.send.?.markAcked(7, true);
+    conn.streams.reapIfFinished(gpa, .init(id));
+    try testing.expect(conn.streams.get(.init(id)) == null);
+    // The credit stays charged after the stream is gone.
+    try testing.expectEqual(@as(u64, 12), conn.streams.recv_used);
+}
+
+test "connection: MAX_STREAM_DATA goes out as the application consumes" {
+    // §4.2: a receiver credits what it has room for, and it must not wait for a
+    // STREAM_DATA_BLOCKED before doing so — waiting would block the sender for at
+    // least a round trip, and indefinitely if it never sends one.
+    const gpa = testing.allocator;
+
+    const client_cid = cid(&.{ 0x0a, 0x0b });
+    const server_cid = cid(&.{ 0x90, 0x91 });
+    const initial_dcid = cid(&.{ 9, 9, 8, 8, 7, 7, 6, 6 });
+
+    var options = testOptions(client_cid, initial_dcid);
+    // The connection window is deliberately close to the stream window, so that one
+    // stream's consumption clears the half-window threshold at both levels. With a
+    // 64 KiB connection window, 900 bytes would not be worth a MAX_DATA — correctly
+    // — and the test would then prove nothing about the connection level.
+    options.parameters.initial_max_data = 1200;
+    options.parameters.initial_max_stream_data_bidi_local = 1000;
+    options.parameters.initial_max_streams_bidi = 4;
+
+    var conn = try Connection.initClient(options, @splat(0x57));
+    defer conn.deinit(gpa);
+    try conn.start(gpa);
+
+    var server_params: transport.Parameters = .{
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 4096,
+        .initial_max_streams_bidi = 4,
+    };
+    var peer = try establish(gpa, &conn, client_cid, server_cid, initial_dcid, &server_params);
+    defer peer.deinit(gpa);
+
+    const id = try conn.openStream(gpa, true);
+
+    // The server fills most of the stream's window.
+    const bulk: [900]u8 = @splat('s');
+    var frames: [1024]u8 = undefined;
+    const frames_len = frame.encode(&frames, .{ .stream = .{
+        .id = id,
+        .offset = 0,
+        .data = &bulk,
+        .fin = false,
+        .had_length = true,
+    } });
+    var packet_buf: [max_datagram]u8 = undefined;
+    const packet_len = try peer.seal(&packet_buf, client_cid, frames[0..frames_len]);
+    try conn.receive(gpa, packet_buf[0..packet_len]);
+    try testing.expectEqual(@as(usize, 900), conn.read(id).len);
+
+    // Received but unread: there is nowhere to put more, so no credit is due.
+    try testing.expect(conn.creditOwed() == null);
+
+    conn.consume(gpa, id, 900);
+    const owed = conn.creditOwed().?;
+    try testing.expectEqual(id, owed.id);
+    try testing.expectEqual(@as(u64, 1900), owed.limit);
+
+    // And it actually goes out on the wire, together with the connection-level
+    // MAX_DATA that the same consumption earned.
+    var out: [max_datagram]u8 = undefined;
+    const len = try conn.send(gpa, &out);
+    var plain: [max_datagram]u8 = undefined;
+    var rest = try peer.open(&plain, out[0..len]);
+
+    var saw_stream_credit = false;
+    var saw_connection_credit = false;
+    while (rest.len > 0) {
+        const f = try frame.parse(&rest);
+        switch (f) {
+            .max_stream_data => |sf| {
+                try testing.expectEqual(id, sf.id);
+                try testing.expectEqual(@as(u64, 1900), sf.limit);
+                saw_stream_credit = true;
+            },
+            .max_data => saw_connection_credit = true,
+            else => {},
+        }
+    }
+    try testing.expect(saw_stream_credit);
+    try testing.expect(saw_connection_credit);
+    // Sent once: repeating a limit the peer already has is pure overhead (§4.1
+    // requires it to be ignored).
+    try testing.expect(conn.creditOwed() == null);
+}
+
+test "connection: credit frames keep their place when the packet is full" {
+    // The ordering inside a packet matters exactly when the packet is full, which
+    // is the case this test constructs. A MAX_DATA that loses its place to stream
+    // data is a window that does not open, and the sender it was meant to unblock
+    // waits a round trip for the next chance. Stream data deferred loses nothing —
+    // there is always another packet.
+    const gpa = testing.allocator;
+
+    const client_cid = cid(&.{ 0x1a, 0x1b });
+    const server_cid = cid(&.{ 0xa0, 0xa1 });
+    const initial_dcid = cid(&.{ 3, 3, 3, 3, 4, 4, 4, 4 });
+
+    var options = testOptions(client_cid, initial_dcid);
+    options.parameters.initial_max_data = 2000;
+    options.parameters.initial_max_stream_data_bidi_local = 1500;
+    options.parameters.initial_max_streams_bidi = 4;
+
+    var conn = try Connection.initClient(options, @splat(0x2c));
+    defer conn.deinit(gpa);
+    try conn.start(gpa);
+
+    var server_params: transport.Parameters = .{
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 64 * 1024,
+        .initial_max_streams_bidi = 4,
+    };
+    var peer = try establish(gpa, &conn, client_cid, server_cid, initial_dcid, &server_params);
+    defer peer.deinit(gpa);
+
+    const id = try conn.openStream(gpa, true);
+
+    // The peer fills the stream's window, we read it all, and credit is now owed at
+    // both levels.
+    const bulk: [1400]u8 = @splat('f');
+    var frames: [1600]u8 = undefined;
+    const frames_len = frame.encode(&frames, .{ .stream = .{
+        .id = id,
+        .offset = 0,
+        .data = &bulk,
+        .fin = false,
+        .had_length = true,
+    } });
+    var packet_buf: [max_datagram]u8 = undefined;
+    const packet_len = try peer.seal(&packet_buf, client_cid, frames[0..frames_len]);
+    try conn.receive(gpa, packet_buf[0..packet_len]);
+    conn.consume(gpa, id, 1400);
+    try testing.expect(conn.creditOwed() != null);
+    try testing.expect(conn.streams.maxDataUpdate() != null);
+
+    // And we have far more to send than one packet holds, so the packet will be
+    // full and something has to be left out.
+    const outbound: [8000]u8 = @splat('o');
+    _ = try conn.write(gpa, id, &outbound);
+
+    var out: [max_datagram]u8 = undefined;
+    const len = try conn.send(gpa, &out);
+    var plain: [max_datagram]u8 = undefined;
+    var rest = try peer.open(&plain, out[0..len]);
+
+    var saw_max_data = false;
+    var saw_max_stream_data = false;
+    var stream_bytes: usize = 0;
+    while (rest.len > 0) {
+        const f = try frame.parse(&rest);
+        switch (f) {
+            .max_data => saw_max_data = true,
+            .max_stream_data => saw_max_stream_data = true,
+            .stream => |sf| stream_bytes += sf.data.len,
+            else => {},
+        }
+    }
+
+    // Both credit frames made it, and the stream data filled what was left rather
+    // than the other way round.
+    try testing.expect(saw_max_data);
+    try testing.expect(saw_max_stream_data);
+    try testing.expect(stream_bytes > 1000);
+    // The packet really was full: there is more to send.
+    try testing.expect(conn.pending_stream_data);
 }

@@ -343,7 +343,7 @@ pub const Streams = struct {
     ///
     /// Bounded by both levels of §4.1: the stream's own limit and the connection's.
     /// A short write is normal and means flow control, not failure.
-    pub fn write(self: *Streams, id: Id, data: []const u8) Error!usize {
+    pub fn write(self: *Streams, gpa: Allocator, id: Id, data: []const u8) Error!usize {
         const s = self.map.getPtr(id.value) orelse return error.StreamStateError;
         const send = &(s.send orelse return error.StreamStateError);
 
@@ -356,7 +356,7 @@ pub const Streams = struct {
         const take: usize = @intCast(@min(@min(stream_room, connection_room), data.len));
         if (take == 0) return 0;
 
-        try send.write(take);
+        try send.write(gpa, data[0..take]);
         self.send_used += take;
         return take;
     }
@@ -454,7 +454,7 @@ pub const Streams = struct {
     /// §4.5 permits this explicitly, and the counters make it safe: a late frame
     /// for a forgotten stream is recognised by its index rather than by finding it
     /// in the map, so forgetting does not resurrect it.
-    fn reapIfFinished(self: *Streams, gpa: Allocator, id: Id) void {
+    pub fn reapIfFinished(self: *Streams, gpa: Allocator, id: Id) void {
         const s = self.map.getPtr(id.value) orelse return;
         if (!s.isFinished()) return;
         var owned = self.map.fetchRemove(id.value).?;
@@ -755,21 +755,21 @@ test "streams: writing is bounded by both levels of flow control" {
 
     const payload: [1000]u8 = @splat('z');
     // The stream's own limit truncates the first write.
-    try testing.expectEqual(@as(usize, 500), try streams.write(a, &payload));
-    try testing.expectEqual(@as(usize, 0), try streams.write(a, &payload));
+    try testing.expectEqual(@as(usize, 500), try streams.write(gpa, a, &payload));
+    try testing.expectEqual(@as(usize, 0), try streams.write(gpa, a, &payload));
 
     // The connection's limit truncates the second, even though that stream has
     // its whole window free. A short write is flow control, not failure.
-    try testing.expectEqual(@as(usize, 200), try streams.write(b, &payload));
+    try testing.expectEqual(@as(usize, 200), try streams.write(gpa, b, &payload));
     try testing.expect(streams.isBlocked());
-    try testing.expectEqual(@as(usize, 0), try streams.write(b, &payload));
+    try testing.expectEqual(@as(usize, 0), try streams.write(gpa, b, &payload));
 
     // MAX_DATA unblocks the connection; a value that does not increase is ignored.
     streams.receiveMaxData(600);
     try testing.expect(streams.isBlocked());
     streams.receiveMaxData(1200);
     try testing.expect(!streams.isBlocked());
-    try testing.expectEqual(@as(usize, 300), try streams.write(b, &payload));
+    try testing.expectEqual(@as(usize, 300), try streams.write(gpa, b, &payload));
 }
 
 test "streams: MAX_DATA and MAX_STREAMS are sent only when they would say something" {

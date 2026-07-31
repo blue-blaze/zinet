@@ -530,6 +530,18 @@ pub const Send = struct {
     state: SendState = .ready,
     /// The largest offset the peer will accept.
     max_data: u64,
+    /// Data written but not yet acknowledged.
+    ///
+    /// Acknowledged bytes are dropped and unacknowledged ones are kept, because
+    /// §13.3 retransmits *information* rather than packets: a lost STREAM frame is
+    /// resent as a new frame from the same offset, which is only possible if the
+    /// bytes are still here. Sizing it is the application's choice rather than the
+    /// peer's — `write` returns how much it accepted, and that is bounded by the
+    /// smaller of the two flow control windows, so a caller that respects the
+    /// return value cannot make this grow without bound.
+    queue: std.ArrayList(u8) = .empty,
+    /// The stream offset of `queue.items[0]`.
+    queue_base: u64 = 0,
     /// How much the application has handed us.
     written: u64 = 0,
     /// How much has been put into packets.
@@ -547,6 +559,23 @@ pub const Send = struct {
         return .{ .max_data = peer_max_data };
     }
 
+    pub fn deinit(self: *Send, gpa: Allocator) void {
+        self.queue.deinit(gpa);
+    }
+
+    /// Bytes written but not yet put into a packet.
+    pub fn unsent(self: *const Send) []const u8 {
+        const from: usize = @intCast(self.sent - self.queue_base);
+        return self.queue.items[from..];
+    }
+
+    /// Bytes from `offset` onwards that are still held, for retransmission.
+    pub fn bytesFrom(self: *const Send, offset: u64) []const u8 {
+        assert(offset >= self.queue_base);
+        const from: usize = @intCast(offset - self.queue_base);
+        return self.queue.items[from..];
+    }
+
     /// How many more bytes flow control permits right now.
     pub fn available(self: *const Send) u64 {
         if (self.written >= self.max_data) return 0;
@@ -561,14 +590,15 @@ pub const Send = struct {
         return self.state == .send and self.written == self.max_data and !self.fin_written;
     }
 
-    /// Record that the application wrote `n` bytes. The caller must have checked
-    /// `available` and the connection limit first.
-    pub fn write(self: *Send, n: u64) Error!void {
+    /// Take `data` from the application. The caller must have checked `available`
+    /// and the connection limit first.
+    pub fn write(self: *Send, gpa: Allocator, data: []const u8) Error!void {
         if (self.state.isTerminal() or self.state == .reset_sent) return error.StreamStateError;
         if (self.fin_written) return error.StreamStateError;
-        if (self.written + n > self.max_data) return error.FlowControlError;
-        self.written += n;
-        if (self.state == .ready and n > 0) self.state = .send;
+        if (self.written + data.len > self.max_data) return error.FlowControlError;
+        try self.queue.appendSlice(gpa, data);
+        self.written += data.len;
+        if (self.state == .ready and data.len > 0) self.state = .send;
     }
 
     /// The application has no more data (§3.1's "Data Sent" transition happens
@@ -593,9 +623,21 @@ pub const Send = struct {
         }
     }
 
-    /// Record acknowledgement up to `offset`.
+    /// Record acknowledgement up to `offset`, releasing the bytes below it.
     pub fn markAcked(self: *Send, offset: u64, fin_acked: bool) void {
-        if (offset > self.acked) self.acked = offset;
+        if (offset > self.acked) {
+            self.acked = offset;
+            // Drop what the peer has confirmed. Everything above stays, because
+            // §13.3 may still need to resend it. Without this the queue grows for
+            // the life of the stream, holding every byte ever written.
+            const drop: usize = @intCast(@min(self.acked, self.written) - self.queue_base);
+            if (drop > 0) {
+                const rest = self.queue.items.len - drop;
+                std.mem.copyForwards(u8, self.queue.items[0..rest], self.queue.items[drop..]);
+                self.queue.shrinkRetainingCapacity(rest);
+                self.queue_base += drop;
+            }
+        }
         if (self.state == .reset_sent) {
             if (fin_acked) self.state = .reset_recvd;
             return;
@@ -657,6 +699,7 @@ pub const Stream = struct {
 
     pub fn deinit(self: *Stream, gpa: Allocator) void {
         if (self.recv) |*r| r.deinit(gpa);
+        if (self.send) |*sd| sd.deinit(gpa);
     }
 
     /// Both directions are finished, so the stream can be forgotten.
@@ -968,15 +1011,23 @@ test "stream: MAX_STREAM_DATA is sent only when it would say something new" {
 }
 
 test "stream: the send state machine follows §3.1" {
+    const gpa = testing.allocator;
     var send: Send = .init(100);
+    defer send.deinit(gpa);
     try testing.expectEqual(SendState.ready, send.state);
 
-    try send.write(10);
+    try send.write(gpa, "0123456789");
     try testing.expectEqual(SendState.send, send.state);
     try testing.expectEqual(@as(u64, 90), send.available());
+    try testing.expectEqualStrings("0123456789", send.unsent());
 
     send.markSent(10, false);
     try testing.expectEqual(SendState.send, send.state);
+    try testing.expectEqual(@as(usize, 0), send.unsent().len);
+    // Sent but unacknowledged data is still held, because §13.3 resends the
+    // information rather than the packet — which is impossible once the bytes are
+    // gone.
+    try testing.expectEqualStrings("0123456789", send.bytesFrom(0));
 
     try send.finish();
     send.markSent(0, true);
@@ -984,22 +1035,31 @@ test "stream: the send state machine follows §3.1" {
 
     // Writing after a FIN is a state error, not silently dropped: the
     // application has already promised the stream ended.
-    try testing.expectError(error.StreamStateError, send.write(1));
+    try testing.expectError(error.StreamStateError, send.write(gpa, "x"));
 
-    // Only the acknowledgement of everything, FIN included, is terminal.
+    // A partial acknowledgement releases only what it covers, and holding the rest
+    // is what makes retransmission possible.
     send.markAcked(5, false);
     try testing.expectEqual(SendState.data_sent, send.state);
+    try testing.expectEqualStrings("56789", send.bytesFrom(5));
+    try testing.expectEqual(@as(u64, 5), send.queue_base);
+
     send.markAcked(10, true);
     try testing.expectEqual(SendState.data_recvd, send.state);
     try testing.expect(send.state.isTerminal());
+    // Everything acknowledged, so nothing is held: without this the queue grows
+    // for the life of the stream.
+    try testing.expectEqual(@as(usize, 0), send.queue.items.len);
 }
 
 test "stream: flow control blocks the sender rather than letting it overrun" {
+    const gpa = testing.allocator;
     var send: Send = .init(10);
-    try send.write(10);
+    defer send.deinit(gpa);
+    try send.write(gpa, "0123456789");
     try testing.expectEqual(@as(u64, 0), send.available());
     try testing.expect(send.isBlocked());
-    try testing.expectError(error.FlowControlError, send.write(1));
+    try testing.expectError(error.FlowControlError, send.write(gpa, "x"));
 
     // Credit unblocks it. A decrease is ignored, because loss and reordering make
     // a smaller value ordinary rather than hostile.
@@ -1007,12 +1067,13 @@ test "stream: flow control blocks the sender rather than letting it overrun" {
     try testing.expectEqual(@as(u64, 10), send.max_data);
     send.applyCredit(20);
     try testing.expect(!send.isBlocked());
-    try send.write(10);
+    try send.write(gpa, "abcdefghij");
 
     // A stream that has written its FIN is not "blocked": there is nothing left
     // to send, so announcing a block would be a lie that costs a frame.
     var finished: Send = .init(4);
-    try finished.write(4);
+    defer finished.deinit(gpa);
+    try finished.write(gpa, "abcd");
     try finished.finish();
     try testing.expect(!finished.isBlocked());
 }
@@ -1021,8 +1082,10 @@ test "stream: STOP_SENDING obliges a RESET_STREAM, and the reset reports what wa
     // §3.5: STOP_SENDING is a request, and an endpoint in Ready or Send must
     // comply. §4.5: the RESET_STREAM reports the final size the sender reached, so
     // both ends agree on the credit consumed even though the data never arrives.
+    const gpa = testing.allocator;
     var send: Send = .init(1000);
-    try send.write(40);
+    defer send.deinit(gpa);
+    try send.write(gpa, &@as([40]u8, @splat('m')));
     send.markSent(40, false);
 
     try testing.expect(!send.owesReset());
@@ -1037,7 +1100,7 @@ test "stream: STOP_SENDING obliges a RESET_STREAM, and the reset reports what wa
 
     // Writing after a reset is a state error (§3.3: no STREAM frames after
     // RESET_STREAM).
-    try testing.expectError(error.StreamStateError, send.write(1));
+    try testing.expectError(error.StreamStateError, send.write(gpa, "x"));
     try testing.expectError(error.StreamStateError, send.finish());
 
     send.markAcked(40, true);
