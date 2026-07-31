@@ -626,6 +626,21 @@ pub const Connection = struct {
         self.loss.onProbeTimeout();
         const level = self.highestSendLevel();
         self.probe_pending[@backingInt(level)] = true;
+
+        // §6.2.4: a probe SHOULD carry unacknowledged data, not merely a PING.
+        // For the handshake this is load-bearing, not an optimisation: a lost
+        // ClientHello can only be declared lost by an ACK-driven mechanism,
+        // and the ACK would come from the very server that never received it —
+        // a deadlock a PING cannot break, because a PING carries nothing the
+        // server can answer. Requeueing the oldest in-flight packet's
+        // *information* (§13.3) puts the CRYPTO bytes back in the next packet.
+        // The packet itself is not declared lost — it may still arrive, and a
+        // duplicate of any of this content is harmless at the peer.
+        const metas = &self.sent_meta[@backingInt(level)];
+        if (metas.items.len > 0) {
+            const oldest = metas.items[0];
+            try self.onPacketLost(gpa, level, &oldest);
+        }
     }
 
     pub fn nextEvent(self: *Connection) ?Event {
@@ -1958,7 +1973,7 @@ pub const PacketServer = struct {
     /// Only ever non-empty in the test that checks §17.2.2 refuses it.
     send_token: []const u8 = &.{},
 
-    fn init(seed: u8, client_dcid: ConnectionId, local_cid: ConnectionId) PacketServer {
+    pub fn init(seed: u8, client_dcid: ConnectionId, local_cid: ConnectionId) PacketServer {
         const keys = crypto.InitialKeys.derive(client_dcid.slice());
         return .{
             .inner = .init(seed),
@@ -1968,7 +1983,7 @@ pub const PacketServer = struct {
         };
     }
 
-    fn deinit(self: *PacketServer, gpa: Allocator) void {
+    pub fn deinit(self: *PacketServer, gpa: Allocator) void {
         for (&self.inbound_crypto) |*list| list.deinit(gpa);
     }
 
@@ -1981,7 +1996,7 @@ pub const PacketServer = struct {
     }
 
     /// Decrypt every packet in a datagram and collect the CRYPTO bytes.
-    fn receive(self: *PacketServer, gpa: Allocator, datagram: []const u8) !void {
+    pub fn receive(self: *PacketServer, gpa: Allocator, datagram: []const u8) !void {
         var offset: usize = 0;
         while (offset < datagram.len) {
             const parsed = packet.parse(datagram[offset..], self.local_cid.len) catch return;
@@ -2037,7 +2052,7 @@ pub const PacketServer = struct {
 
     /// Produce the server's reply: an Initial with the ServerHello, coalesced
     /// with a Handshake packet carrying the rest of the flight.
-    fn reply(
+    pub fn reply(
         self: *PacketServer,
         dest: []u8,
         client_dcid: ConnectionId,

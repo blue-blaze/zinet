@@ -175,8 +175,24 @@ pub const DatagramChannel = struct {
         /// is the only answer. This is the one place Zinet polls, which is why it
         /// is opt-in.
         close_poll: ?Io.Duration = null,
+        /// Fire a `Tick` pipeline event whenever a receive waits this long, the
+        /// same contract as `Channel.Tick` and for the same reason: the reader
+        /// blocks in a receive, so the read itself must carry the deadline. A
+        /// QUIC connection is the motivating consumer — its loss-detection and
+        /// idle timers have to fire on a connection the peer has gone quiet on,
+        /// which is precisely when no datagram will arrive to run them.
+        tick_interval: ?Io.Duration = null,
         /// Optional recycler for receive buffers.
         pool: ?*BufferPool = null,
+    };
+
+    /// Fired as a pipeline event when `tick_interval` elapses without a
+    /// datagram arriving. See `Channel.Tick` for the design; the semantics are
+    /// identical, including the imprecision: a tick arrives no earlier than the
+    /// interval and possibly later, so handlers compare timestamps rather than
+    /// counting ticks.
+    pub const Tick = struct {
+        at: Io.Timestamp,
     };
 
     pub const Stats = struct {
@@ -394,16 +410,30 @@ pub const DatagramChannel = struct {
             assert(destination.len > 0);
 
             const incoming = receive: {
-                if (channel.options.close_poll) |poll| {
+                // The nearer of the two optional deadlines: close polling and
+                // ticks share the mechanism, they differ in what happens when
+                // the deadline passes (nothing vs. a pipeline event).
+                const wait: ?Io.Duration = nearest(
+                    channel.options.close_poll,
+                    channel.options.tick_interval,
+                );
+                if (wait) |poll| {
                     const deadline = Io.Timestamp.now(io, .awake)
                         .addDuration(poll)
                         .withClock(.awake);
                     break :receive channel.socket.receiveTimeout(io, destination, .{
                         .deadline = deadline,
                     }) catch |err| switch (err) {
-                        // Not an event: it is how the loop gets a chance to
-                        // notice a `requestClose` from another task.
-                        error.Timeout => continue,
+                        error.Timeout => {
+                            // A tick, if ticks were asked for. Delivered on the
+                            // reader task like every other pipeline event, which
+                            // is what keeps handler state lock free.
+                            if (channel.options.tick_interval != null) {
+                                var tick: Tick = .{ .at = Io.Timestamp.now(io, .awake) };
+                                channel.pipeline.fireEvent(.init(&tick));
+                            }
+                            continue;
+                        },
                         error.Canceled => return,
                         else => {
                             channel.pipeline.fireError(err);
@@ -503,6 +533,12 @@ pub const DatagramChannel = struct {
 /// A bound endpoint with its tasks running.
 ///
 /// The thin wrapper exists because a datagram endpoint is usually a single
+fn nearest(a: ?Io.Duration, b: ?Io.Duration) ?Io.Duration {
+    const first = a orelse return b;
+    const second = b orelse return first;
+    return if (first.nanoseconds <= second.nanoseconds) first else second;
+}
+
 /// long-lived socket rather than one of many connections, so there is no
 /// acceptor and no event loop group to hand it to.
 pub const Endpoint = struct {
@@ -535,6 +571,8 @@ pub const Endpoint = struct {
         /// is the only answer. This is the one place Zinet polls, which is why it
         /// is opt-in.
         close_poll: ?Io.Duration = null,
+        /// See `DatagramChannel.Options.tick_interval`.
+        tick_interval: ?Io.Duration = null,
         pool: ?*BufferPool = null,
     };
 
@@ -548,6 +586,7 @@ pub const Endpoint = struct {
             .truncation = options.truncation,
             .outbound_capacity = options.outbound_capacity,
             .close_poll = options.close_poll,
+            .tick_interval = options.tick_interval,
             .pool = options.pool,
         });
         // Retained before the task starts, so the handle stays valid even if the
