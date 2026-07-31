@@ -12,6 +12,7 @@ const examples: []const []const u8 = &.{
     "redis_server",
     "udp_echo",
     "https_client",
+    "http3_client",
     "readme_snippets",
 };
 
