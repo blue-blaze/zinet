@@ -1942,7 +1942,9 @@ fn cid(bytes: []const u8) ConnectionId {
 /// handshake itself. Like that one it is a second implementation rather than a
 /// mirror of the code under test: it derives its own keys, assembles its own
 /// packets and would notice if the client's idea of either were wrong.
-const PacketServer = struct {
+/// Test fixture: a minimal QUIC server that derives its own keys. Pub so the
+/// HTTP/3 layer's tests can drive a real peer over real datagrams.
+pub const PacketServer = struct {
     inner: client.TestServer,
     local_cid: ConnectionId,
     initial_send: crypto.Keys,
@@ -2115,7 +2117,7 @@ const PacketServer = struct {
     }
 };
 
-fn testOptions(local: ConnectionId, initial_dcid: ConnectionId) Options {
+pub fn testOptions(local: ConnectionId, initial_dcid: ConnectionId) Options {
     return .{
         .host = "example.com",
         .alpn = &.{"h3"},
@@ -2882,19 +2884,21 @@ fn writeRetry(
 /// Drive a client to an established handshake against a `PacketServer`, leaving
 /// both able to exchange 1-RTT packets. Returns the server's 1-RTT keys so the
 /// test can read what the client sends.
-const Established = struct {
+/// Test fixture: 1-RTT seal/open for an established connection. Pub for the
+/// same reason as PacketServer.
+pub const Established = struct {
     server: PacketServer,
     send: crypto.Keys,
     recv: crypto.Keys,
     client_cid: ConnectionId,
     next_pn: u64 = 0,
 
-    fn deinit(self: *Established, gpa: Allocator) void {
+    pub fn deinit(self: *Established, gpa: Allocator) void {
         self.server.deinit(gpa);
     }
 
     /// Decrypt a 1-RTT packet and return its frames' payload.
-    fn open(self: *Established, dest: []u8, datagram: []const u8) ![]const u8 {
+    pub fn open(self: *Established, dest: []u8, datagram: []const u8) ![]const u8 {
         var offset: usize = 0;
         while (offset < datagram.len) {
             // A short header carries no connection ID length, so the receiver
@@ -2925,7 +2929,7 @@ const Established = struct {
     }
 
     /// Build a 1-RTT packet carrying `frames`.
-    fn seal(self: *Established, dest: []u8, destination: ConnectionId, frames: []const u8) !usize {
+    pub fn seal(self: *Established, dest: []u8, destination: ConnectionId, frames: []const u8) !usize {
         const pn = self.next_pn;
         const pn_len: u4 = 4;
         var cursor: usize = 0;
@@ -2944,7 +2948,7 @@ const Established = struct {
     }
 };
 
-fn establish(
+pub fn establish(
     gpa: Allocator,
     conn: *Connection,
     client_cid: ConnectionId,

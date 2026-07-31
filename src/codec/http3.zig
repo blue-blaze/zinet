@@ -20,8 +20,10 @@
 
 pub const frame = @import("http3/frame.zig");
 pub const qpack = @import("http3/qpack.zig");
+pub const connection = @import("http3/connection.zig");
 
 test {
     _ = frame;
     _ = qpack;
+    _ = connection;
 }
