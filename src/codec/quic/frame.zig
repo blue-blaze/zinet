@@ -93,9 +93,10 @@ pub const Ack = struct {
     /// acknowledged, so the first range is `largest - first_range ..= largest`.
     first_range: u64,
     range_count: u64,
-    /// The additional ranges, kept as raw bytes and walked by `iterator`
-    /// rather than allocated. Already validated during parsing, so iteration
-    /// cannot fail.
+    /// The additional ranges, kept as raw bytes and walked by `iterator` rather
+    /// than allocated. Already validated during parsing, so iteration cannot
+    /// fail. **This excludes the range containing `largest`** — use `allRanges`
+    /// unless the distinction is the point.
     ranges: []const u8,
     ecn: ?Ecn,
 
@@ -106,6 +107,43 @@ pub const Ack = struct {
 
     pub fn first(self: Ack) Range {
         return .{ .largest = self.largest, .smallest = self.largest - self.first_range };
+    }
+
+    /// Every acknowledged range, first one included.
+    ///
+    /// This exists because `additionalRanges` is a trap: the first range's bounds
+    /// live in explicit fields while the rest are raw bytes, so an iterator over
+    /// the bytes alone silently omits the range containing `largest` — and a
+    /// caller looking for the largest acknowledged packet number would find
+    /// nothing at all in the common case of a single-range ACK. That defect was
+    /// live in the connection layer until this method existed. The fix is the
+    /// shape of the interface rather than a comment: the obvious call is now the
+    /// correct one.
+    pub fn allRanges(self: Ack) AllRanges {
+        return .{ .ack = self, .rest = self.iterator(), .gave_first = false };
+    }
+
+    pub const AllRanges = struct {
+        ack: Ack,
+        rest: RangeIterator,
+        gave_first: bool,
+
+        pub fn next(self: *AllRanges) ?Range {
+            if (!self.gave_first) {
+                self.gave_first = true;
+                return self.ack.first();
+            }
+            return self.rest.next();
+        }
+    };
+
+    /// Does any acknowledged range contain `pn`?
+    pub fn covers(self: Ack, pn: u64) bool {
+        var it = self.allRanges();
+        while (it.next()) |range| {
+            if (pn <= range.largest and pn >= range.smallest) return true;
+        }
+        return false;
     }
 
     pub fn iterator(self: Ack) RangeIterator {

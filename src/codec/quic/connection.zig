@@ -704,7 +704,12 @@ pub const Connection = struct {
             switch (f) {
                 .padding, .ping => {},
                 .ack => |ack| {
-                    var it = ack.iterator();
+                    // `allRanges` rather than `iterator`: the latter omits the
+                    // range containing `largest`, so a single-range ACK — the
+                    // common case — updated nothing at all. The symptom was
+                    // invisible, since `largest_acked` staying null only costs
+                    // three bytes of packet number per packet.
+                    var it = ack.allRanges();
                     const sp = self.spaceFor(level);
                     while (it.next()) |range| {
                         if (sp.largest_acked == null or range.largest > sp.largest_acked.?) {

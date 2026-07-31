@@ -18,6 +18,7 @@
 //! * `cid` — §5.1's connection ID sets, one per direction
 //! * `stream` — §2, §3 and the per-stream half of §4: one stream in isolation
 //! * `streams` — §3.2's implicit creation, §4.1's connection window, §4.6's counts
+//! * `recovery` — RFC 9002: ACK ranges, RTT, loss detection, NewReno
 //! * `client` — the client half of the handshake: bytes in, keys out
 //! * `connection` — datagrams in, events out: packets, Retry, connection IDs
 
@@ -32,6 +33,7 @@ pub const transport = @import("quic/transport.zig");
 pub const cid = @import("quic/cid.zig");
 pub const stream = @import("quic/stream.zig");
 pub const streams = @import("quic/streams.zig");
+pub const recovery = @import("quic/recovery.zig");
 pub const client = @import("quic/client.zig");
 pub const connection = @import("quic/connection.zig");
 /// RFC 8448 test vectors, shared by the tests of the layers above.
@@ -52,6 +54,7 @@ test {
     _ = cid;
     _ = stream;
     _ = streams;
+    _ = recovery;
     _ = client;
     _ = connection;
     _ = rfc8448;
