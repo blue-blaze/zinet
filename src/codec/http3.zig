@@ -7,6 +7,8 @@
 //!
 //! * `frame` — §6 and §7: stream types, frame types, SETTINGS, the incremental
 //!   parser (HTTP/3 frames ride streams, so reframing is back), and grease
+//! * `qpack` — RFC 9204: the static table, field line representations, and the
+//!   instruction streams, in the zero-capacity mode every connection starts in
 //!
 //! Where HTTP/2 concepts went is worth recording once: flow control and stream
 //! multiplexing belong to QUIC (§4.1 note), so there is no WINDOW_UPDATE and
@@ -17,7 +19,9 @@
 //! reimplemented.
 
 pub const frame = @import("http3/frame.zig");
+pub const qpack = @import("http3/qpack.zig");
 
 test {
     _ = frame;
+    _ = qpack;
 }
