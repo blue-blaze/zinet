@@ -32,18 +32,24 @@ try server.serve();
 ## Status
 
 Working and tested: the core framework, framing codecs, HTTP/1.1 and WebSocket in
-both directions with `permessage-deflate`, **HTTP/2** over cleartext, Redis
-RESP2/RESP3, datagram (UDP) endpoints, and TLS 1.3 client connections. 405 tests
+both directions with `permessage-deflate`, **HTTP/2** over cleartext, **HTTP/3 over
+QUIC** on the client side — with the QUIC transport written here, because Netty binds
+Quiche and the zero-dependency rule forbids that; see [HTTP3.md](HTTP3.md) — Redis
+RESP2/RESP3, datagram (UDP) endpoints, and TLS 1.3 client connections. 609 tests
 pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast, all under a
-leak-checking allocator, plus fifteen fuzz targets. The same suite also runs **on fibers** rather than threads —
+leak-checking allocator, plus twenty-one fuzz targets. The same suite also runs **on fibers** rather than threads —
 see [Choosing an `Io`](#choosing-an-io). Every protocol is checked against
 other people's code, not only its own counterpart: the HTTP server against
 `curl`, the HTTP client against Python's `http.server`, the WebSocket client *and*
 server against the third-party `websockets` library, the RESP server against
 `redis-py`, the UDP endpoint against Python's `socket` and `nc -u`, the TLS client
-against OpenSSL's `s_server`, and the HTTP/2 server against `curl` with `nghttp2`
+against OpenSSL's `s_server`, the HTTP/2 server against `curl` with `nghttp2`
 underneath it — multiplexed, and with 300 KiB crossing the flow-control window in
-both directions.
+both directions — and the HTTP/3 client against `aioquic`, which also means the QUIC
+transport, the self-written TLS 1.3 handshake and QPACK all interoperate with an
+implementation sharing none of their code. The QUIC packet protection and key
+schedule are additionally verified byte for byte against the published vectors of
+RFC 9001 Appendix A and RFC 8448.
 
 Those cross-implementation checks run in CI, not only by hand, and they keep
 earning it: they caught a closing handshake that was skipped about one run in five,
@@ -71,6 +77,7 @@ trust.
 |---|---|---|
 | `remoteAddress()` on a stream | `getpeername` | `std.Io` 0.17 exposes no such operation. Datagrams have the address anyway, because `recvmsg` reports it per message. |
 | TLS on the server side | `std.crypto.tls.Server` | `std/crypto/tls/` contains `Client.zig` and nothing else. Accepting a connection would mean hand-rolling certificate loading, `CertificateVerify` signing and session tickets. |
+| A QUIC (and HTTP/3) server | RSA signing, or settling for ECDSA/Ed25519 certificates | `std.crypto.Certificate.rsa` can verify signatures but not produce them, and a TLS 1.3 server signs a `CertificateVerify` on every handshake. Ed25519 and ECDSA can sign, so a server limited to those certificate types is buildable; one serving the RSA certificates most CAs still issue is not. The client half is done — see [HTTP3.md](HTTP3.md). |
 | Announcing `h2` over TLS | ALPN in the TLS client | `tls.Client.Options` has no ALPN field, and the `ClientHello` is built from five extensions of which ALPN is not one. RFC 9113 §3.1 identifies `h2` by ALPN, so every conforming server answers HTTP/1.1. The protocol itself is implemented and reachable over cleartext; only this negotiation is missing. See [HTTP2.md](HTTP2.md). |
 | An evented `Io` *in the standard library* | a backend that can listen, accept and connect | the table below. In 0.17-dev those three are stubs on every platform. A third-party one works today; see [Choosing an `Io`](#choosing-an-io) |
 
@@ -222,6 +229,10 @@ graph TB
 | `DefaultHttp2ConnectionEncoder`/`Decoder` | `http2.connection.Connection` | Bytes in, events out, no sockets involved |
 | `Http2FrameWriter` / `Http2FrameReader` | `http2.frame` | Pure functions, not handlers |
 | HPACK `Encoder` / `Decoder` | `http2.hpack` | RFC 7541, verified against Appendix C |
+| `codec-quic` (incubator) | `quic.connection.Connection` | Netty binds Cloudflare's Quiche over JNI; this is RFC 9000/9001/9002 implemented here, client role |
+| `codec-http3` (incubator) | `http3.connection.Connection` | Datagrams in, events out, no sockets; see [HTTP3.md](HTTP3.md) |
+| — | `http3.client.Client` | The connection mounted on a `datagram.Endpoint`, with QUIC's timers driven by ticks |
+| QPACK `QpackEncoder` / `QpackDecoder` | `http3.qpack` | RFC 9204 at zero table capacity — the default every connection starts in; Huffman shared with HPACK |
 | `WeightedFairQueueByteDistributor` | `http2.flow.Scheduler` | Round robin, one frame per stream per pass; no priority tree (§5.3.1 deprecates it) |
 | `Http2MaxRstFrameDecoder` | `http2.limits.RateLimiter` | Rapid Reset, and the control-frame floods, share the mechanism |
 | `WriteBufferWaterMark` | `http2.flow.WaterMark` | HTTP/2 only, and paired with a hard ceiling |
@@ -577,6 +588,7 @@ zig build run-ws-client    -- 127.0.0.1 8090 /
 zig build run-redis-server -- 6380      # redis-cli -p 6380 set k v
 zig build run-udp-echo     -- 9000      # echo hi | nc -u localhost 9000
 zig build run-https-client -- 127.0.0.1 8443 localhost / insecure
+zig build run-http3-client -- 127.0.0.1 4433 localhost /   # against e.g. aioquic
 ```
 
 Each installs a `SIGINT` handler and shuts down gracefully: it stops accepting,
