@@ -293,10 +293,13 @@ pub const ClientHelloOptions = struct {
     /// Sent as SNI, and later checked against the certificate. Empty omits the
     /// extension, which is legal but means no name can be verified.
     server_name: []const u8 = &.{},
-    /// RFC 9001 §8.1: mandatory. A list of protocol names, most preferred first.
+    /// RFC 9001 §8.1 makes this mandatory *for QUIC*; over TCP it is ordinary
+    /// ALPN and an empty list omits the extension. Most preferred first.
     alpn: []const []const u8,
-    /// RFC 9000 §18's encoded transport parameters, opaque here.
-    transport_parameters: []const u8,
+    /// RFC 9000 §18's encoded transport parameters, opaque here. Null omits
+    /// the extension, which is what a ClientHello over TCP must do — the
+    /// extension's presence is what tells the peer it is speaking QUIC.
+    transport_parameters: ?[]const u8,
 };
 
 /// Bytes a ClientHello needs, before its variable parts.
@@ -390,9 +393,10 @@ pub fn writeClientHello(dest: []u8, options: ClientHelloOptions) []const u8 {
             builder.end(ext);
         }
 
-        {
-            // RFC 9001 §8.1. Not conditional: QUIC requires ALPN, and a server
-            // with no protocol in common must close the connection.
+        if (options.alpn.len > 0) {
+            // RFC 9001 §8.1: QUIC requires ALPN, and its callers always pass
+            // one; plain TLS callers may omit it, so an empty list writes no
+            // extension rather than an illegally empty one.
             const ext = builder.beginExtension(.alpn);
             const list = builder.begin16();
             for (options.alpn) |protocol| {
@@ -404,9 +408,9 @@ pub fn writeClientHello(dest: []u8, options: ClientHelloOptions) []const u8 {
             builder.end(ext);
         }
 
-        {
+        if (options.transport_parameters) |transport_parameters| {
             const ext = builder.beginExtension(.quic_transport_parameters);
-            builder.bytes(options.transport_parameters);
+            builder.bytes(transport_parameters);
             builder.end(ext);
         }
 
@@ -507,7 +511,23 @@ pub const EncryptedExtensions = struct {
 /// `wanted` is the ALPN list the client offered; the server's choice must be one
 /// of them. RFC 9001 §8.1 makes this fatal rather than advisory, unlike TLS over
 /// TCP where an absent ALPN merely means no protocol was negotiated.
-pub fn parseEncryptedExtensions(body: []const u8, wanted: []const []const u8) Error!EncryptedExtensions {
+/// What the caller insists EncryptedExtensions must contain. QUIC requires
+/// both (RFC 9001 §8.1/§8.2); TLS over TCP requires neither — a server that
+/// ignores an offered ALPN has merely declined it (RFC 7301 leaves the client
+/// to decide whether that is fatal).
+pub const EncryptedExtensionsRequirements = struct {
+    alpn: bool,
+    transport_parameters: bool,
+
+    pub const quic: EncryptedExtensionsRequirements = .{ .alpn = true, .transport_parameters = true };
+    pub const tcp: EncryptedExtensionsRequirements = .{ .alpn = false, .transport_parameters = false };
+};
+
+pub fn parseEncryptedExtensions(
+    body: []const u8,
+    wanted: []const []const u8,
+    require: EncryptedExtensionsRequirements,
+) Error!EncryptedExtensions {
     var reader: Reader = .init(body);
     var result: EncryptedExtensions = .{ .alpn = &.{}, .transport_parameters = &.{} };
 
@@ -530,10 +550,12 @@ pub fn parseEncryptedExtensions(body: []const u8, wanted: []const []const u8) Er
         else => {},
     };
 
-    if (result.alpn.len == 0) return error.NoApplicationProtocol;
+    if (require.alpn and result.alpn.len == 0) return error.NoApplicationProtocol;
     // RFC 9001 §8.2: a server that omits transport parameters has not agreed to
-    // any, and the connection cannot proceed without them.
-    if (result.transport_parameters.len == 0) return error.MissingExtension;
+    // any, and a QUIC connection cannot proceed without them.
+    if (require.transport_parameters and result.transport_parameters.len == 0) {
+        return error.MissingExtension;
+    }
     return result;
 }
 
@@ -929,24 +951,24 @@ test "handshake: an ALPN mismatch is fatal, and missing transport parameters too
     var scratch: [128]u8 = undefined;
     const wanted: []const []const u8 = &.{"h3"};
 
-    const good = try parseEncryptedExtensions(build.go(&scratch, "h3", &.{ 1, 2 }), wanted);
+    const good = try parseEncryptedExtensions(build.go(&scratch, "h3", &.{ 1, 2 }), wanted, .quic);
     try testing.expectEqualStrings("h3", good.alpn);
     try testing.expectEqualSlices(u8, &.{ 1, 2 }, good.transport_parameters);
 
     // A protocol that was never offered.
     try testing.expectError(
         error.NoApplicationProtocol,
-        parseEncryptedExtensions(build.go(&scratch, "h2", &.{1}), wanted),
+        parseEncryptedExtensions(build.go(&scratch, "h2", &.{1}), wanted, .quic),
     );
     // No ALPN at all.
     try testing.expectError(
         error.NoApplicationProtocol,
-        parseEncryptedExtensions(build.go(&scratch, null, &.{1}), wanted),
+        parseEncryptedExtensions(build.go(&scratch, null, &.{1}), wanted, .quic),
     );
     // No transport parameters.
     try testing.expectError(
         error.MissingExtension,
-        parseEncryptedExtensions(build.go(&scratch, "h3", null), wanted),
+        parseEncryptedExtensions(build.go(&scratch, "h3", null), wanted, .quic),
     );
 }
 

@@ -1,0 +1,558 @@
+//! A TLS 1.3 client connection on the self-written engine, mounted under a
+//! `Pipeline` — the same position `src/tls.zig` gives the standard library's
+//! client, with two differences that both come from the engine being sans-io:
+//!
+//! 1. **ALPN works.** `std.crypto.tls.Client` cannot send it; this engine has
+//!    sent it since it was written for QUIC. That is what makes `h2` over TLS
+//!    negotiable at last.
+//! 2. **Reads carry deadlines.** The standard client pulls its own bytes, so
+//!    src/tls.zig needs a pump-reader contraption to bound a read. Here the
+//!    socket read is a plain `net_receive` with a deadline — decryption is a
+//!    separate step — so a queued write waits at most `write_poll` with no
+//!    machinery beyond the deadline itself.
+//!
+//! Still one task, though. Not for the standard client's reason (its read path
+//! mutates write state); the session here has the same property — a peer
+//! KeyUpdate rotates the read keys and may queue a reply — and one task is
+//! what makes that safe without a lock.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const Io = std.Io;
+
+const buffer_mod = @import("../../buffer.zig");
+const Buffer = buffer_mod.Buffer;
+const channel_mod = @import("../../channel.zig");
+const message_mod = @import("../../message.zig");
+const Message = message_mod.Message;
+const pipeline_mod = @import("../../pipeline.zig");
+const Pipeline = pipeline_mod.Pipeline;
+const Sink = pipeline_mod.Sink;
+const pool_mod = @import("../../pool.zig");
+const BufferPool = pool_mod.BufferPool;
+
+const session_mod = @import("session.zig");
+const verify = @import("../quic/verify.zig");
+pub const ClientSession = session_mod.ClientSession;
+
+pub const Error = error{
+    ConnectionClosed,
+} || Buffer.Error;
+
+/// One connection: a socket, a `ClientSession`, a pipeline and one task.
+pub const Connection = struct {
+    gpa: Allocator,
+    io: Io,
+    options: Options,
+
+    stream: Io.net.Stream,
+    stream_writer: Io.net.Stream.Writer,
+    socket_write_buffer: []u8,
+    session: ClientSession,
+
+    pipeline: Pipeline,
+
+    outbound: Io.Queue(Outbound),
+    outbound_storage: []Outbound,
+    pending: std.atomic.Value(u32),
+
+    /// Set when the peer deserves a close_notify before the socket goes away.
+    /// Only the connection's own task touches it.
+    farewell: bool,
+
+    closing: std.atomic.Value(bool),
+    finished: std.atomic.Value(bool),
+    refs: std.atomic.Value(u32),
+
+    /// Same shape as `Channel.Outbound`: data, flushes and the close travel
+    /// one queue, so their order is the order they were asked for.
+    pub const Outbound = union(enum) {
+        data: Message,
+        submit: Message,
+        flush: void,
+        close: void,
+
+        pub fn deinit(item: *Outbound, gpa: Allocator) void {
+            switch (item.*) {
+                .data, .submit => |*msg| msg.deinit(gpa),
+                .flush, .close => {},
+            }
+        }
+    };
+
+    pub const Options = struct {
+        gpa: Allocator,
+        io: Io,
+        /// Already resolved; `std.Io` has no name resolver.
+        address: Io.net.IpAddress,
+        /// Sent as SNI and checked against the certificate. Must outlive the
+        /// connection.
+        host: []const u8,
+        /// ALPN protocols, most preferred first. Empty offers none. "h2" here
+        /// is how HTTP/2 over TLS is announced (RFC 9113 §3.1).
+        alpn: []const []const u8 = &.{},
+        /// Null skips certificate validation — written down, not defaulted.
+        verification: ?verify.Options,
+        initializer: ?channel_mod.Initializer = null,
+        owner: ?*anyopaque = null,
+        /// Ciphertext bytes requested per socket read.
+        read_chunk: usize = 16 * 1024,
+        max_inbound_capacity: usize = Buffer.default_max_capacity,
+        outbound_capacity: usize = 64,
+        /// Longest a queued write waits while the task is blocked reading.
+        /// This is the read deadline, nothing more.
+        write_poll: Io.Duration = .fromMilliseconds(10),
+        /// Handshake seed; null draws from the Io's CSPRNG. Injectable so a
+        /// test can reproduce a connection.
+        seed: ?[64]u8 = null,
+        pool: ?*BufferPool = null,
+    };
+
+    /// Connects, performs the handshake on the caller's task, and builds the
+    /// pipeline. Returns with one reference held.
+    pub fn connect(options: Options) !*Connection {
+        assert(options.read_chunk > 0);
+        assert(options.outbound_capacity > 0);
+
+        const gpa = options.gpa;
+        const io = options.io;
+
+        const connection = try gpa.create(Connection);
+        errdefer gpa.destroy(connection);
+
+        const outbound_storage = try gpa.alloc(Outbound, options.outbound_capacity);
+        errdefer gpa.free(outbound_storage);
+        const socket_write_buffer = try gpa.alloc(u8, 32 * 1024);
+        errdefer gpa.free(socket_write_buffer);
+
+        var seed: [64]u8 = undefined;
+        if (options.seed) |given| {
+            seed = given;
+        } else {
+            io.randomSecure(&seed) catch io.random(&seed);
+        }
+        defer std.crypto.secureZero(u8, &seed);
+
+        var session: ClientSession = try .init(.{
+            .host = options.host,
+            .alpn = options.alpn,
+            .verification = options.verification,
+        }, seed);
+        errdefer session.deinit(gpa);
+
+        var address = options.address;
+        const stream = try address.connect(io, .{ .mode = .stream });
+        errdefer stream.close(io);
+
+        connection.* = .{
+            .gpa = gpa,
+            .io = io,
+            .options = options,
+            .stream = stream,
+            .stream_writer = undefined,
+            .socket_write_buffer = socket_write_buffer,
+            .session = session,
+            .pipeline = undefined,
+            .outbound_storage = outbound_storage,
+            .outbound = .init(outbound_storage),
+            .pending = .init(0),
+            .farewell = false,
+            .closing = .init(false),
+            .finished = .init(false),
+            .refs = .init(1),
+        };
+        connection.stream_writer = connection.stream.writer(io, socket_write_buffer);
+
+        // The handshake, here and now: a failure to establish trust is a plain
+        // error return rather than an event on a pipeline that never existed.
+        try connection.handshake();
+
+        try connection.pipeline.init(.{
+            .gpa = gpa,
+            .io = io,
+            .sink = connection.sink(),
+            .owner = options.owner orelse connection,
+        });
+        return connection;
+    }
+
+    fn handshake(connection: *Connection) !void {
+        const gpa = connection.gpa;
+        try connection.session.start(gpa);
+        try connection.flushOutput();
+
+        var scratch: [16 * 1024]u8 = undefined;
+        while (!connection.session.isEstablished()) {
+            const n = try connection.readSocket(&scratch, null);
+            if (n == 0) return error.ConnectionResetByPeer;
+            try connection.session.receive(gpa, scratch[0..n]);
+            try connection.flushOutput();
+        }
+    }
+
+    /// Releases a connection that was established but never served.
+    pub fn destroy(connection: *Connection) void {
+        assert(connection.refs.load(.acquire) == 1);
+        connection.pipeline.deinit();
+        connection.stream.close(connection.io);
+        connection.session.deinit(connection.gpa);
+        connection.release();
+    }
+
+    pub fn retain(connection: *Connection) void {
+        const previous = connection.refs.fetchAdd(1, .acq_rel);
+        assert(previous > 0);
+    }
+
+    pub fn release(connection: *Connection) void {
+        const previous = connection.refs.fetchSub(1, .acq_rel);
+        assert(previous > 0);
+        if (previous != 1) return;
+        const gpa = connection.gpa;
+        gpa.free(connection.outbound_storage);
+        gpa.free(connection.socket_write_buffer);
+        gpa.destroy(connection);
+    }
+
+    pub fn referenceCount(connection: *const Connection) u32 {
+        return connection.refs.load(.acquire);
+    }
+
+    pub fn isOpen(connection: *const Connection) bool {
+        return !connection.closing.load(.acquire);
+    }
+
+    pub fn pendingOutbound(connection: *const Connection) usize {
+        return connection.pending.load(.acquire);
+    }
+
+    /// What the server agreed to speak. Empty when ALPN was not negotiated.
+    pub fn negotiatedAlpn(connection: *const Connection) []const u8 {
+        return connection.session.negotiatedAlpn();
+    }
+
+    /// Ends the connection now, without a closing handshake. Callable from any
+    /// task; shutting the socket down unblocks the read.
+    pub fn requestClose(connection: *Connection) void {
+        connection.closing.store(true, .release);
+        connection.stream.shutdown(connection.io, .both) catch {};
+    }
+
+    /// Queues raw bytes, skipping the pipeline. Callable from any task.
+    pub fn write(connection: *Connection, msg: Message) Error!void {
+        return connection.enqueue(msg, .data);
+    }
+
+    /// Queues a message to travel the pipeline on the connection's own task.
+    pub fn submitWrite(connection: *Connection, msg: Message) Error!void {
+        return connection.enqueue(msg, .submit);
+    }
+
+    pub fn writeBytes(connection: *Connection, bytes: []const u8) Error!void {
+        return connection.write(try Message.initBytes(connection.gpa, bytes));
+    }
+
+    fn enqueue(
+        connection: *Connection,
+        msg: Message,
+        comptime kind: std.meta.Tag(Outbound),
+    ) Error!void {
+        var owned = msg;
+        errdefer owned.deinit(connection.gpa);
+        if (connection.finished.load(.acquire)) return error.ConnectionClosed;
+
+        var item: Outbound = @unionInit(Outbound, @tagName(kind), owned.move());
+        connection.outbound.putOne(connection.io, item) catch {
+            item.deinit(connection.gpa);
+            return error.ConnectionClosed;
+        };
+        _ = connection.pending.fetchAdd(1, .monotonic);
+    }
+
+    /// Queues a graceful close: what is queued goes out, then close_notify.
+    pub fn submitClose(connection: *Connection) Error!void {
+        connection.outbound.putOne(connection.io, .close) catch
+            return error.ConnectionClosed;
+        _ = connection.pending.fetchAdd(1, .monotonic);
+    }
+
+    // -- Sink ---------------------------------------------------------------
+
+    fn sink(connection: *Connection) Sink {
+        return .{ .context = connection, .vtable = &sink_vtable };
+    }
+
+    const sink_vtable: Sink.VTable = .{
+        .write = sinkWrite,
+        .flush = sinkFlush,
+        .close = sinkClose,
+    };
+
+    fn sinkWrite(context: *anyopaque, msg: Message) pipeline_mod.Error!void {
+        const connection: *Connection = @ptrCast(@alignCast(context));
+        var owned = msg;
+        defer owned.deinit(connection.gpa);
+        const bytes = owned.bytes() orelse return;
+        connection.session.write(connection.gpa, bytes) catch return error.ChannelClosed;
+    }
+
+    fn sinkFlush(context: *anyopaque) pipeline_mod.Error!void {
+        const connection: *Connection = @ptrCast(@alignCast(context));
+        connection.flushOutput() catch return error.ChannelClosed;
+    }
+
+    fn sinkClose(context: *anyopaque) pipeline_mod.Error!void {
+        const connection: *Connection = @ptrCast(@alignCast(context));
+        connection.farewell = true;
+        connection.closing.store(true, .release);
+    }
+
+    // -- The task -----------------------------------------------------------
+
+    /// Runs the connection's whole lifecycle on this task. Consumes one
+    /// reference.
+    pub fn serve(connection: *Connection) void {
+        defer connection.release();
+        defer connection.drainOutbound();
+        defer connection.teardown();
+
+        if (connection.options.initializer) |initializer| {
+            initializer.apply(&connection.pipeline) catch |err| {
+                connection.pipeline.fireError(err);
+                return;
+            };
+        }
+
+        connection.pipeline.fireActive();
+        connection.readLoop();
+
+        if (connection.farewell) {
+            connection.session.close(connection.gpa) catch {};
+            connection.flushOutput() catch {};
+        }
+
+        connection.pipeline.fireInactive();
+    }
+
+    fn teardown(connection: *Connection) void {
+        connection.closing.store(true, .release);
+        connection.finished.store(true, .release);
+        connection.outbound.close(connection.io);
+        connection.stream.close(connection.io);
+        connection.session.deinit(connection.gpa);
+        connection.pipeline.deinit();
+    }
+
+    fn readLoop(connection: *Connection) void {
+        var scratch: [16 * 1024]u8 = undefined;
+        while (connection.isOpen()) {
+            if (!connection.pumpOutbound()) return;
+
+            const deadline: Io.Timestamp = Io.Timestamp.now(connection.io, .awake)
+                .addDuration(connection.options.write_poll);
+            const n = connection.readSocket(&scratch, deadline) catch |err| {
+                connection.finishRead(err);
+                return;
+            };
+            if (n == 0) continue; // Deadline passed; queued writes get a turn.
+
+            connection.session.receive(connection.gpa, scratch[0..n]) catch |err| {
+                connection.deliverPlaintext();
+                connection.finishRead(err);
+                return;
+            };
+            // Handshake progress (KeyUpdate answers) may want the wire.
+            connection.flushOutput() catch |err| {
+                connection.finishRead(err);
+                return;
+            };
+            connection.deliverPlaintext();
+
+            if (connection.session.state == .peer_closed) {
+                // close_notify: a clean end of stream. Answer in kind.
+                connection.farewell = true;
+                connection.closing.store(true, .release);
+                return;
+            }
+        }
+    }
+
+    fn deliverPlaintext(connection: *Connection) void {
+        const data = connection.session.appData();
+        if (data.len == 0) return;
+        var chunk = connection.acquireInbound(data.len) catch |err| {
+            connection.pipeline.fireError(err);
+            return;
+        };
+        chunk.writeBytes(connection.gpa, data) catch |err| {
+            chunk.deinit(connection.gpa);
+            connection.pipeline.fireError(err);
+            return;
+        };
+        connection.session.consumeAppData(data.len);
+        connection.pipeline.fireRead(.initBuffer(&chunk));
+        connection.pipeline.fireReadComplete();
+    }
+
+    /// Sends everything queued, then flushes. Returns false to stop the loop.
+    fn pumpOutbound(connection: *Connection) bool {
+        const io = connection.io;
+        while (true) {
+            var one: [1]Outbound = undefined;
+            const count = connection.outbound.get(io, &one, 0) catch return false;
+            if (count == 0) break;
+            _ = connection.pending.fetchSub(1, .monotonic);
+
+            switch (one[0]) {
+                .data => |*msg| {
+                    defer msg.deinit(connection.gpa);
+                    const bytes = msg.bytes() orelse continue;
+                    connection.session.write(connection.gpa, bytes) catch return false;
+                },
+                .submit => |*msg| {
+                    const owned = msg.move();
+                    connection.pipeline.write(owned) catch |err| {
+                        connection.pipeline.fireError(err);
+                    };
+                },
+                .flush => connection.flushOutput() catch return false,
+                .close => {
+                    connection.farewell = true;
+                    connection.closing.store(true, .release);
+                    return false;
+                },
+            }
+        }
+
+        // Flush before blocking in the read: plaintext sitting in the record
+        // queue would be waiting for a reply to a request that was never sent.
+        connection.flushOutput() catch return false;
+        return true;
+    }
+
+    fn drainOutbound(connection: *Connection) void {
+        while (true) {
+            var item = connection.outbound.getOneUncancelable(connection.io) catch return;
+            _ = connection.pending.fetchSub(1, .monotonic);
+            item.deinit(connection.gpa);
+        }
+    }
+
+    fn finishRead(connection: *Connection, err: anyerror) void {
+        connection.closing.store(true, .release);
+        if (err == error.EndOfStream) return;
+        connection.pipeline.fireError(err);
+    }
+
+    /// One socket read. With a deadline, expiry is a zero-byte result rather
+    /// than an error; without one, blocks until data or end of stream.
+    fn readSocket(connection: *Connection, dest: []u8, deadline: ?Io.Timestamp) !usize {
+        var incoming: Io.net.IncomingMessage = .init;
+        const result = connection.io.operateTimeout(.{ .net_receive = .{
+            .socket_handle = connection.stream.socket.handle,
+            .message_buffer = (&incoming)[0..1],
+            .data_buffer = dest,
+            .flags = .{},
+        } }, if (deadline) |d|
+            .{ .deadline = d.withClock(.awake) }
+        else
+            .none) catch |err| switch (err) {
+            error.Timeout => return 0,
+            error.Canceled => return error.Canceled,
+            error.ConcurrencyUnavailable => return error.SystemResources,
+        };
+        const maybe_err, const count = result.net_receive;
+        if (maybe_err) |err| return switch (err) {
+            error.ConnectionResetByPeer => error.EndOfStream,
+            error.Canceled => error.Canceled,
+            else => error.Unexpected,
+        };
+        assert(count == 1);
+        // On a stream socket, zero bytes with no deadline pressure is the
+        // orderly shutdown.
+        if (incoming.data.len == 0 and deadline == null) return error.EndOfStream;
+        if (incoming.data.len == 0) return error.EndOfStream;
+        return incoming.data.len;
+    }
+
+    fn flushOutput(connection: *Connection) !void {
+        const out = connection.session.output();
+        if (out.len == 0) return;
+        try connection.stream_writer.interface.writeAll(out);
+        try connection.stream_writer.interface.flush();
+        connection.session.consumeOutput(out.len);
+    }
+
+    fn acquireInbound(connection: *Connection, wanted: usize) Buffer.Error!Buffer {
+        const size = @max(wanted, connection.options.read_chunk);
+        if (connection.options.pool) |pool| {
+            var pooled = try pool.acquire(size);
+            errdefer pool.release(&pooled);
+            try pooled.ensureWritable(connection.gpa, size);
+            pooled.max_capacity = @max(
+                pooled.capacity(),
+                connection.options.max_inbound_capacity,
+            );
+            return pooled;
+        }
+        return Buffer.init(connection.gpa, .{
+            .capacity = size,
+            .max_capacity = connection.options.max_inbound_capacity,
+        });
+    }
+};
+
+/// The user-facing wrapper: connect, then serve on a spawned task — the same
+/// split `tls.Client` (the std-based one) offers.
+pub const Client = struct {
+    connection: *Connection,
+    future: Io.Future(void),
+
+    pub fn connect(options: Connection.Options) !Client {
+        const connection = try Connection.connect(options);
+        // Retained before the task starts, so the handle stays valid even if
+        // the task finishes immediately.
+        connection.retain();
+        errdefer {
+            connection.release();
+            connection.destroy();
+        }
+        const future = try options.io.concurrent(Connection.serve, .{connection});
+        return .{ .connection = connection, .future = future };
+    }
+
+    /// Ends the connection, waits for its task, then drops this reference.
+    pub fn deinit(client: *Client) void {
+        const io = client.connection.io;
+        client.connection.requestClose();
+        client.future.await(io);
+        client.connection.release();
+        client.* = undefined;
+    }
+
+    /// Graceful close: the peer sees close_notify, not a vanishing socket.
+    pub fn shutdown(client: *Client) void {
+        const io = client.connection.io;
+        client.connection.submitClose() catch {};
+        client.future.await(io);
+        client.connection.release();
+        client.* = undefined;
+    }
+
+    pub fn submitWrite(client: *Client, msg: Message) Error!void {
+        return client.connection.submitWrite(msg);
+    }
+
+    pub fn write(client: *Client, msg: Message) Error!void {
+        return client.connection.write(msg);
+    }
+
+    pub fn writeBytes(client: *Client, bytes: []const u8) Error!void {
+        return client.connection.writeBytes(bytes);
+    }
+
+    pub fn negotiatedAlpn(client: *const Client) []const u8 {
+        return client.connection.negotiatedAlpn();
+    }
+};

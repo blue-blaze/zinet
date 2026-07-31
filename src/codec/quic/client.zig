@@ -70,8 +70,13 @@ pub const Options = struct {
     /// RFC 9001 §8.1: mandatory, most preferred first. For HTTP/3 this is "h3".
     alpn: []const []const u8,
     /// RFC 9000 §18's encoded transport parameters. Opaque here; the transport
-    /// layer builds and interprets them.
-    transport_parameters: []const u8,
+    /// layer builds and interprets them. Null (TLS over TCP) omits the
+    /// extension from the ClientHello.
+    transport_parameters: ?[]const u8,
+    /// Which EncryptedExtensions contents to insist on. QUIC connections use
+    /// the default; the TCP record layer passes `.tcp`, where a declined ALPN
+    /// and absent transport parameters are both ordinary.
+    requirements: handshake.EncryptedExtensionsRequirements = .quic,
     /// How to authenticate the server.
     ///
     /// Null skips certificate validation entirely and has to be written down
@@ -223,6 +228,7 @@ pub const Client = struct {
                 const extensions = try handshake.parseEncryptedExtensions(
                     message.body,
                     self.options.alpn,
+                    self.options.requirements,
                 );
                 if (extensions.alpn.len > self.negotiated_alpn_buf.len) {
                     return error.UnexpectedMessage;
