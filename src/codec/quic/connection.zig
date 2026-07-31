@@ -105,6 +105,10 @@ pub const Event = union(enum) {
     peer_closed: struct { code: u64, application: bool, reason: []const u8 },
     /// §10.3: the peer has lost its state.
     stateless_reset,
+    /// §10.1: the idle timeout elapsed. The close is silent — nothing is sent,
+    /// because a peer idle that long may be gone, and a CONNECTION_CLOSE to a
+    /// vanished peer is a packet an attacker can observe and spoof around.
+    idle_timeout,
     /// A Retry was accepted and the handshake restarted. Surfaced because it
     /// changes the connection ID and invalidates any packet already in flight.
     retry_received,
@@ -270,6 +274,22 @@ const CryptoStream = struct {
     }
 };
 
+const Close = struct { code: u64, application: bool };
+
+pub const LifeState = enum {
+    active,
+    /// We sent CONNECTION_CLOSE and answer further packets with it (§10.2.1).
+    closing,
+    /// The peer terminated (CONNECTION_CLOSE or a stateless reset): nothing
+    /// more may be sent, not even a close (§10.2.2, §10.3.1) — a packet sent
+    /// now would make the peer answer, and two endpoints doing that to each
+    /// other close nothing.
+    draining,
+    /// The terminal period ended or the connection failed outright; the owner
+    /// may discard all state.
+    drained,
+};
+
 /// What one sent packet carried, for §13.3: when the packet is acknowledged
 /// its content is released, and when it is lost its *information* — not the
 /// packet — is queued to be sent again.
@@ -340,9 +360,29 @@ pub const Connection = struct {
     /// §4.1.2 of RFC 9001: the server's HANDSHAKE_DONE confirms the handshake,
     /// which is when Initial and Handshake keys may be discarded.
     handshake_confirmed: bool = false,
-    closed: bool = false,
+    /// §10's connection lifecycle. Everything before termination is `.active`;
+    /// the two shutdown states exist because §10.2 gives them *opposite* rules
+    /// about sending — closing answers packets with CONNECTION_CLOSE, draining
+    /// must send nothing at all — and a bool cannot hold opposite obligations.
+    state: LifeState = .active,
+    /// When the closing or draining period ends and the connection may be
+    /// discarded (§10.2: three times the PTO).
+    terminal_deadline: u64 = 0,
+    /// The close we sent (or will send), kept after sending because §10.2.1
+    /// requires answering packets received while closing with it again.
+    close_info: ?Close = null,
+    /// Packets received while closing, for §10.2.1's rate limit on responses.
+    closing_received: u64 = 0,
+    /// §10.1: when the last authenticated packet arrived or the idle timer was
+    /// otherwise restarted.
+    idle_restarted_at: u64 = 0,
+    /// §10.1's second restart rule: sending an ack-eliciting packet restarts
+    /// the timer, but only the first one since last receiving. Without this an
+    /// endpoint retransmitting into a void keeps its own connection alive
+    /// forever.
+    idle_sent_since_receive: bool = false,
     /// A CONNECTION_CLOSE we owe the peer.
-    pending_close: ?struct { code: u64, application: bool } = null,
+    pending_close: ?Close = null,
 
     // ── Loss detection and congestion control (RFC 9002) ────────────────────
     /// The caller's clock, advanced through `setTime`. Injected rather than
@@ -471,10 +511,57 @@ pub const Connection = struct {
         self.now_ns = @max(self.now_ns, now_ns);
     }
 
+    /// The connection has left `.active` and may (once `.drained`) be freed.
+    pub fn lifecycle(self: *const Connection) LifeState {
+        return self.state;
+    }
+
+    fn enterTerminal(self: *Connection, target: LifeState) void {
+        assert(target == .closing or target == .draining);
+        // Draining trumps closing (§10.2.2: once the peer has spoken, we send
+        // nothing), and neither goes backwards.
+        if (self.state == .drained) return;
+        if (self.state == .draining and target == .closing) return;
+        self.state = target;
+        // §10.2: the terminal period is three PTOs — long enough for our close
+        // (or the peer's) to be retransmitted through ordinary loss.
+        self.terminal_deadline = self.now_ns + 3 * self.rtt.probeTimeout(.application);
+    }
+
+    /// §10.1: the effective idle timeout, or null when idling is unlimited.
+    /// Enforced only once the peer's parameters are authenticated, because the
+    /// effective value is the minimum of the two advertisements and half of
+    /// that pair is unknown before then.
+    fn idleDeadline(self: *const Connection) ?u64 {
+        const peer = self.peer_parameters orelse return null;
+        const ours = self.parameters.max_idle_timeout_ms;
+        const theirs = peer.max_idle_timeout_ms;
+        const effective_ms = if (ours == 0)
+            theirs
+        else if (theirs == 0)
+            ours
+        else
+            @min(ours, theirs);
+        if (effective_ms == 0) return null;
+        // §10.1: never below three PTOs, or a slow path's ordinary
+        // retransmission delays get misread as absence.
+        const span = @max(effective_ms *| std.time.ns_per_ms, 3 * self.rtt.probeTimeout(.application));
+        return self.idle_restarted_at +| span;
+    }
+
     /// When the caller should next call `onTimeout`, as an absolute time on the
     /// injected clock, or null if no timer is armed.
     pub fn nextTimeout(self: *const Connection) ?u64 {
-        return self.loss.nextTimeout(&self.rtt, self.handshake_confirmed);
+        switch (self.state) {
+            .drained => return null,
+            .closing, .draining => return self.terminal_deadline,
+            .active => {},
+        }
+        var earliest = self.loss.nextTimeout(&self.rtt, self.handshake_confirmed);
+        if (self.idleDeadline()) |idle| {
+            if (earliest == null or idle < earliest.?) earliest = idle;
+        }
+        return earliest;
     }
 
     /// The loss/probe timer fired. Declares time-threshold losses if any are
@@ -485,6 +572,30 @@ pub const Connection = struct {
     /// handshake with both sides waiting for the other.
     pub fn onTimeout(self: *Connection, gpa: Allocator, now_ns: u64) !void {
         self.setTime(now_ns);
+
+        switch (self.state) {
+            .closing, .draining => {
+                // §10.2: the terminal period has run its course; everything may
+                // now be discarded, including the state that would have answered
+                // a straggling packet.
+                if (self.now_ns >= self.terminal_deadline) self.state = .drained;
+                return;
+            },
+            .drained => return,
+            .active => {},
+        }
+
+        if (self.idleDeadline()) |idle| {
+            if (self.now_ns >= idle) {
+                // §10.1: the close is *silent*. There is nobody demonstrably
+                // there to tell, and CONNECTION_CLOSE sent into a void is a
+                // template an observer can use.
+                self.state = .drained;
+                try self.events.append(gpa, .idle_timeout);
+                return;
+            }
+        }
+
         var any_lost = false;
         for ([_]Level{ .initial, .handshake, .one_rtt }) |level| {
             if (self.spaceFor(level).send == null) continue;
@@ -506,7 +617,12 @@ pub const Connection = struct {
         }
         if (any_lost) return;
 
-        // No loss was due, so this was a probe timeout.
+        // A probe timeout — but only if one was actually due. `onTimeout` is
+        // callable at any moment (a caller with several timers may be early or
+        // late), and fabricating a probe whenever it happens to be called would
+        // send PINGs no schedule asked for and double the backoff for free.
+        const pto = self.loss.nextTimeout(&self.rtt, self.handshake_confirmed) orelse return;
+        if (self.now_ns < pto) return;
         self.loss.onProbeTimeout();
         const level = self.highestSendLevel();
         self.probe_pending[@backingInt(level)] = true;
@@ -519,8 +635,9 @@ pub const Connection = struct {
 
     /// Ask to close, which will be sent by the next `send`.
     pub fn close(self: *Connection, code: u64, application: bool) void {
-        if (self.closed) return;
-        self.pending_close = .{ .code = code, .application = application };
+        if (self.state != .active) return;
+        self.close_info = .{ .code = code, .application = application };
+        self.pending_close = self.close_info;
     }
 
     // ── The application's view of streams ────────────────────────────────────
@@ -681,7 +798,22 @@ pub const Connection = struct {
     /// RFC 9001 §5.3 requires it, because an off-path attacker who could kill a
     /// connection with one forged packet would need no other capability.
     pub fn receive(self: *Connection, gpa: Allocator, datagram: []const u8) !void {
-        if (self.closed) return;
+        switch (self.state) {
+            .active => {},
+            .closing => {
+                // §10.2.1: answer with the CONNECTION_CLOSE again, but not once
+                // per packet — an attacker replaying captured packets would have
+                // a packet generator otherwise. Exponential spacing: the 1st,
+                // 2nd, 4th, 8th... packet each provoke one response.
+                self.closing_received += 1;
+                if (std.math.isPowerOfTwo(self.closing_received)) {
+                    self.pending_close = self.close_info;
+                }
+                return;
+            },
+            // §10.2.2 and §10.3.1: nothing is processed and nothing is sent.
+            .draining, .drained => return,
+        }
 
         // §10.3: a stateless reset is indistinguishable from a short-header
         // packet until the last 16 bytes are compared against a token we hold, so
@@ -689,7 +821,10 @@ pub const Connection = struct {
         if (datagram.len >= 21) {
             const candidate = datagram[datagram.len - cid_mod.stateless_reset_token_len ..];
             if (self.remote.matchesResetToken(candidate[0..cid_mod.stateless_reset_token_len])) {
-                self.closed = true;
+                // §10.3.1: enter draining, send nothing further. The reset means
+                // the peer has no state; a close sent at it would only provoke
+                // another reset.
+                self.enterTerminal(.draining);
                 try self.events.append(gpa, .stateless_reset);
                 return;
             }
@@ -717,8 +852,10 @@ pub const Connection = struct {
                     // server would have answered normally instead.
                     if (vn.offers(.v1)) return;
                     // We speak exactly one version, so there is nothing to fall
-                    // back to. This ends the attempt rather than being ignored.
-                    self.closed = true;
+                    // back to. This ends the attempt rather than being ignored —
+                    // and there is no one to tell, so the state is terminal at
+                    // once.
+                    self.state = .drained;
                     return error.VersionNegotiationFailed;
                 },
                 .retry => |retry| try self.handleRetry(gpa, retry, slice),
@@ -864,6 +1001,10 @@ pub const Connection = struct {
         // is the point: state changed by an unauthenticated packet is state an
         // attacker controls.
         self.server_packet_seen = true;
+        // §10.1: receiving and processing a packet restarts the idle timer, and
+        // re-arms the "first ack-eliciting send restarts it too" rule.
+        self.idle_restarted_at = self.now_ns;
+        self.idle_sent_since_receive = false;
 
         if (level == .initial) {
             // §7.2: the server's first Initial packet chooses the connection ID
@@ -959,7 +1100,10 @@ pub const Connection = struct {
                 .connection_close => |c| {
                     const len = @min(c.reason.len, max_reason_len);
                     @memcpy(self.reason_buf[0..len], c.reason[0..len]);
-                    self.closed = true;
+                    // §10.2.2: the peer's close puts us in draining, where
+                    // nothing more is sent. Answering a close with a close makes
+                    // two endpoints keep each other awake.
+                    self.enterTerminal(.draining);
                     try self.events.append(gpa, .{ .peer_closed = .{
                         .code = c.error_code,
                         .application = c.is_application,
@@ -1174,7 +1318,18 @@ pub const Connection = struct {
     /// Fill `dest` with the next datagram to send, returning its length, or zero
     /// if there is nothing to send.
     pub fn send(self: *Connection, gpa: Allocator, dest: []u8) !usize {
-        if (self.closed) return 0;
+        // §10's send-side rules have exactly two enforcement points, one per
+        // granularity, and this is the packet-level one: draining sends nothing
+        // at all, and closing sends only when a close is owed. The frame-level
+        // one is `terminal` in `writeFrames`, which decides what may share the
+        // packet with that close. `hasSomethingToSend` deliberately has no
+        // state check of its own — a third copy of the same rule is a third
+        // thing to keep correct.
+        switch (self.state) {
+            .active => {},
+            .closing => if (self.pending_close == null) return 0,
+            .draining, .drained => return 0,
+        }
         if (dest.len < min_initial_datagram) return error.BufferTooSmall;
 
         const limit = @min(dest.len, max_datagram);
@@ -1374,13 +1529,21 @@ pub const Connection = struct {
         };
         try self.loss.onSent(gpa, recoverySpace(level), record);
         self.congestion.onSent(record);
+        if (record.ack_eliciting and !self.idle_sent_since_receive) {
+            // §10.1's second restart rule, once per quiet period: the *first*
+            // ack-eliciting packet since last receiving restarts the timer, but
+            // retransmissions after it must not — an endpoint whose own probes
+            // keep resetting its own idle clock never times out at all.
+            self.idle_sent_since_receive = true;
+            self.idle_restarted_at = self.now_ns;
+        }
         if (meta.worthKeeping()) {
             try self.sent_meta[@backingInt(level)].append(gpa, meta);
         }
 
         if (self.pending_close != null and self.highestSendLevel() == level) {
-            self.closed = true;
             self.pending_close = null;
+            if (self.state == .active) self.enterTerminal(.closing);
         }
         return total;
     }
@@ -1394,12 +1557,16 @@ pub const Connection = struct {
     ) usize {
         const sp = self.spaceFor(level);
         var len: usize = 0;
+        // §10.2.1 again, at the frame level: the first close packet goes out
+        // while still `.active`, so it may carry whatever else was queued; the
+        // re-sends provoked by later packets carry the close alone.
+        const terminal = self.state != .active;
 
         // ACK first: it is the smallest useful thing in the packet, and putting
         // it ahead of CRYPTO means a packet that has to be truncated still
         // acknowledges. Every received range is reported, not just the largest —
         // reporting less makes the peer retransmit what arrived (§13.2.3).
-        if (sp.ack_pending) {
+        if (sp.ack_pending and !terminal) {
             if (sp.received.largest() != null) {
                 const ranges = sp.received.slice();
                 const first = ranges[0];
@@ -1441,7 +1608,7 @@ pub const Connection = struct {
         // A probe (§6.2.4). PING is the cheapest ack-eliciting frame; anything
         // else ack-eliciting in this packet would also do, but a guaranteed one
         // beats hoping.
-        if (self.probe_pending[@backingInt(level)]) {
+        if (self.probe_pending[@backingInt(level)] and !terminal) {
             const f: frame.Frame = .ping;
             if (len + frame.encodedLen(f) <= dest.len) {
                 len += frame.encode(dest[len..], f);
@@ -1465,7 +1632,7 @@ pub const Connection = struct {
 
         // CRYPTO: whatever the TLS engine has produced and we have not sent.
         const pending = self.engine.output(level);
-        if (pending.len > sp.crypto_sent) {
+        if (pending.len > sp.crypto_sent and !terminal) {
             const offset = sp.crypto_sent;
             const available = pending[@intCast(offset)..];
             // The frame's own header costs an offset varint, a length varint and
@@ -1486,11 +1653,11 @@ pub const Connection = struct {
             }
         }
 
-        if (level == .one_rtt and self.established) {
+        if (level == .one_rtt and self.established and !terminal) {
             len += self.writeStreamFrames(dest[len..], meta);
         }
 
-        if (level == .one_rtt) {
+        if (level == .one_rtt and !terminal) {
             const owed = self.remote.pendingRetire();
             var sent: usize = 0;
             for (owed) |sequence| {
@@ -2296,7 +2463,7 @@ test "connection: an undecryptable packet is dropped, never fatal" {
     @memset(junk[cursor..][0..100], 0x5a);
 
     try conn.receive(gpa, junk[0 .. cursor + 100]);
-    try testing.expect(!conn.closed);
+    try testing.expect(conn.state == .active);
     try testing.expect(!conn.isEstablished());
     // Nothing was learned from it, which is the part that matters: state changed
     // by an unauthenticated packet is state an attacker controls.
@@ -2327,7 +2494,7 @@ test "connection: a stateless reset ends the connection without a protocol error
     @memcpy(reset[reset.len - token.len ..], &token);
 
     try conn.receive(gpa, &reset);
-    try testing.expect(conn.closed);
+    try testing.expect(conn.state != .active);
     try testing.expectEqual(Event.stateless_reset, conn.nextEvent().?);
 }
 
@@ -2394,7 +2561,7 @@ test "connection: a peer's CONNECTION_CLOSE is reported with its code" {
     crypto.protectHeader(close_packet[0..total], pn_offset, 4, &keys.header);
 
     try conn.receive(gpa, close_packet[0..total]);
-    try testing.expect(conn.closed);
+    try testing.expect(conn.state != .active);
 
     const event = conn.nextEvent().?;
     try testing.expectEqual(@as(u64, 0x0a), event.peer_closed.code);
@@ -2679,7 +2846,7 @@ test "connection: a Version Negotiation packet is only acted on before anything 
     try fresh.start(gpa);
     std.mem.writeInt(u32, vn[cursor - 4 ..][0..4], @backingInt(packet.Version.v1), .big);
     try fresh.receive(gpa, vn[0..cursor]);
-    try testing.expect(!fresh.closed);
+    try testing.expect(fresh.state == .active);
 }
 
 /// Build a Retry packet with a valid integrity tag over `original_dcid`.
@@ -3438,18 +3605,21 @@ test "connection: a probe timeout sends a PING rather than going silent" {
     conn.handshake_confirmed = true;
     conn.discardHandshakeKeys(gpa);
 
-    // Nothing ack-eliciting outstanding in the application space: no timer.
-    // An idle connection that probes forever is traffic the application never
-    // asked for, and a NAT binding kept alive by accident.
-    try testing.expect(conn.nextTimeout() == null);
+    // Nothing ack-eliciting outstanding: no PTO. The only timer armed is the
+    // idle timeout, far away — an idle connection that probes forever is
+    // traffic the application never asked for, and a NAT binding kept alive by
+    // accident.
+    const idle_only = conn.nextTimeout().?;
 
     const id = try conn.openStream(gpa, true);
     _ = try conn.write(gpa, id, "hello");
     var out: [max_datagram]u8 = undefined;
     try testing.expect(try conn.send(gpa, &out) > 0);
 
+    // With data in flight, the PTO is the nearer of the two timers.
     const deadline = conn.nextTimeout().?;
     try testing.expect(deadline > 0);
+    try testing.expect(deadline < idle_only);
 
     // The timer fires with nothing acknowledged: a probe, not a loss.
     try conn.onTimeout(gpa, deadline);
@@ -3471,4 +3641,237 @@ test "connection: a probe timeout sends a PING rather than going silent" {
     // have been lost and probing at a fixed cadence floods a congested path.
     const next_deadline = conn.nextTimeout().?;
     try testing.expect(next_deadline > deadline);
+}
+
+test "connection: closing answers packets with the close again, rate limited, then drains" {
+    // §10.2.1 has three rules pulling in different directions: a peer that
+    // missed the CONNECTION_CLOSE must be able to provoke it again (its ACK was
+    // the only proof of delivery and there is none); an attacker replaying one
+    // captured packet must not get a packet generator; and nothing *else* may
+    // be sent, or the connection keeps living under a different name.
+    const gpa = testing.allocator;
+
+    const client_cid = cid(&.{ 0xc9, 0xca, 0xcb });
+    const server_cid = cid(&.{ 0x56, 0x57 });
+    const initial_dcid = cid(&.{ 0x14, 0x24, 0x34, 0x44, 0x54, 0x64, 0x74, 0x84 });
+
+    var conn = try Connection.initClient(testOptions(client_cid, initial_dcid), @splat(0x74));
+    defer conn.deinit(gpa);
+    try conn.start(gpa);
+
+    var server_params: transport.Parameters = .{
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 64 * 1024,
+        .initial_max_streams_bidi = 4,
+    };
+    var peer = try establish(gpa, &conn, client_cid, server_cid, initial_dcid, &server_params);
+    defer peer.deinit(gpa);
+
+    // Queue more stream data than one datagram holds, so that after the close
+    // goes out there is still data waiting — and "the replies carry only the
+    // close" below is a claim about suppression, not about an empty queue.
+    const id = try conn.openStream(gpa, true);
+    const big: [3000]u8 = @splat('x');
+    try testing.expectEqual(big.len, try conn.write(gpa, id, &big));
+
+    conn.close(0x42, true);
+    var out: [max_datagram]u8 = undefined;
+    const first_len = try conn.send(gpa, &out);
+    try testing.expect(first_len > 0);
+    try testing.expectEqual(LifeState.closing, conn.state);
+    try testing.expect(conn.pending_stream_data);
+
+    // Closed means closed: stream API refuses, and with nothing provoking a
+    // response there is nothing to send.
+    try testing.expectEqual(@as(usize, 0), try conn.send(gpa, &out));
+
+    // Each arriving packet may provoke the close again — 1st and 2nd do, the
+    // 3rd (not a power of two) does not, the 4th does. The replies carry the
+    // close and nothing else: no ACK, no stream data, however much was queued.
+    var ping_frame: [4]u8 = undefined;
+    const ping_len = frame.encode(&ping_frame, .ping);
+    var expectations = [_]bool{ true, true, false, true };
+    for (&expectations) |expect_reply| {
+        var in_buf: [256]u8 = undefined;
+        const in_len = try peer.seal(&in_buf, client_cid, ping_frame[0..ping_len]);
+        try conn.receive(gpa, in_buf[0..in_len]);
+
+        const reply_len = try conn.send(gpa, &out);
+        if (!expect_reply) {
+            try testing.expectEqual(@as(usize, 0), reply_len);
+            continue;
+        }
+        try testing.expect(reply_len > 0);
+        var plain: [max_datagram]u8 = undefined;
+        var rest = try peer.open(&plain, out[0..reply_len]);
+        var saw_close = false;
+        while (rest.len > 0) {
+            switch (try frame.parse(&rest)) {
+                .connection_close => |c| {
+                    saw_close = true;
+                    try testing.expectEqual(@as(u64, 0x42), c.error_code);
+                    try testing.expect(c.is_application);
+                },
+                .padding, .ping => {},
+                // Anything else violates §10.2.1's "no packets other than those
+                // containing CONNECTION_CLOSE".
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        try testing.expect(saw_close);
+    }
+
+    // §10.2: after three PTOs the closing period ends and everything may go.
+    const deadline = conn.nextTimeout().?;
+    try conn.onTimeout(gpa, deadline);
+    try testing.expectEqual(LifeState.drained, conn.state);
+    try testing.expect(conn.nextTimeout() == null);
+    try testing.expectEqual(@as(usize, 0), try conn.send(gpa, &out));
+}
+
+test "connection: the peer's close puts us in draining, where nothing is sent" {
+    // §10.2.2. The opposite obligation from closing — answering a close with a
+    // close (or an ACK of it) keeps two endpoints awake at each other over a
+    // connection both have declared dead.
+    const gpa = testing.allocator;
+
+    const client_cid = cid(&.{ 0xcc, 0xcd, 0xce });
+    const server_cid = cid(&.{ 0x58, 0x59 });
+    const initial_dcid = cid(&.{ 0x15, 0x25, 0x35, 0x45, 0x55, 0x65, 0x75, 0x85 });
+
+    var conn = try Connection.initClient(testOptions(client_cid, initial_dcid), @splat(0x75));
+    defer conn.deinit(gpa);
+    try conn.start(gpa);
+
+    var server_params: transport.Parameters = .{
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 64 * 1024,
+        .initial_max_streams_bidi = 4,
+    };
+    var peer = try establish(gpa, &conn, client_cid, server_cid, initial_dcid, &server_params);
+    defer peer.deinit(gpa);
+
+    // Queue stream data first, so "sends nothing" is a real claim about
+    // suppression rather than an empty queue.
+    const id = try conn.openStream(gpa, true);
+    _ = try conn.write(gpa, id, "queued but never sent");
+
+    // And close from our side *without sending yet*: the race where both ends
+    // close at once. The peer's close arriving first moves us to draining, and
+    // §10.2.2 says draining sends nothing — including the close we still owe.
+    // An implementation that lets the pending close through behaves like
+    // closing while claiming to drain, and the two states have opposite rules.
+    conn.close(0x7, true);
+
+    var frames: [64]u8 = undefined;
+    const frames_len = frame.encode(&frames, .{
+        .connection_close = .{
+            .error_code = 0x9,
+            .is_application = false,
+            // §19.19: the transport variant carries the offending frame type; only
+            // the application variant (0x1d) omits the field.
+            .frame_type = 0,
+            .reason = "bye",
+        },
+    });
+    var in_buf: [256]u8 = undefined;
+    const in_len = try peer.seal(&in_buf, client_cid, frames[0..frames_len]);
+    try conn.receive(gpa, in_buf[0..in_len]);
+
+    while (conn.nextEvent()) |event| {
+        switch (event) {
+            .peer_closed => |c| {
+                try testing.expectEqual(@as(u64, 0x9), c.code);
+                try testing.expectEqualStrings("bye", c.reason);
+            },
+            else => {},
+        }
+    }
+    try testing.expectEqual(LifeState.draining, conn.state);
+
+    // Nothing goes out — not the queued stream data, not an ACK of the close.
+    var out: [max_datagram]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try conn.send(gpa, &out));
+
+    // Later packets are ignored entirely, even a provocation that in the
+    // closing state would earn a reply.
+    var ping_frame: [4]u8 = undefined;
+    const ping_len = frame.encode(&ping_frame, .ping);
+    const ping_packet = try peer.seal(&in_buf, client_cid, ping_frame[0..ping_len]);
+    try conn.receive(gpa, in_buf[0..ping_packet]);
+    try testing.expectEqual(@as(usize, 0), try conn.send(gpa, &out));
+    try testing.expect(conn.nextEvent() == null);
+
+    // And our own close() is too late to change anything: draining sends
+    // nothing, so there is nothing for it to arm.
+    conn.close(0x1, true);
+    try testing.expectEqual(@as(usize, 0), try conn.send(gpa, &out));
+    try testing.expectEqual(LifeState.draining, conn.state);
+
+    const deadline = conn.nextTimeout().?;
+    try conn.onTimeout(gpa, deadline);
+    try testing.expectEqual(LifeState.drained, conn.state);
+}
+
+test "connection: the idle timeout closes silently, and traffic restarts it" {
+    // §10.1. Silent on purpose: a peer idle that long may be gone, and a
+    // CONNECTION_CLOSE sent into a void is a template an observer can replay.
+    // The effective value is the *minimum* of the two advertisements — a peer
+    // must not be able to keep us holding state longer than we offered.
+    const gpa = testing.allocator;
+
+    const client_cid = cid(&.{ 0xcf, 0xd0, 0xd1 });
+    const server_cid = cid(&.{ 0x5a, 0x5b });
+    const initial_dcid = cid(&.{ 0x16, 0x26, 0x36, 0x46, 0x56, 0x66, 0x76, 0x86 });
+
+    var conn = try Connection.initClient(testOptions(client_cid, initial_dcid), @splat(0x76));
+    defer conn.deinit(gpa);
+    try conn.start(gpa);
+
+    var server_params: transport.Parameters = .{
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 64 * 1024,
+        .initial_max_streams_bidi = 4,
+        // Below the client's 30 s, so this is the one that governs.
+        .max_idle_timeout_ms = 5_000,
+    };
+    var peer = try establish(gpa, &conn, client_cid, server_cid, initial_dcid, &server_params);
+    defer peer.deinit(gpa);
+
+    // Confirm the handshake: the fixture never acknowledges, and the PTO for
+    // the outstanding handshake packets would otherwise sit in front of the
+    // idle deadline in everything below.
+    conn.handshake_confirmed = true;
+    conn.discardHandshakeKeys(gpa);
+
+    const first_deadline = conn.nextTimeout().?;
+    try testing.expect(first_deadline >= 5 * std.time.ns_per_s);
+    try testing.expect(first_deadline < 30 * std.time.ns_per_s);
+
+    // A packet arriving restarts the clock. Without this, a chatty connection
+    // dies at exactly the same moment as an abandoned one.
+    conn.setTime(2 * std.time.ns_per_s);
+    var ping_frame: [4]u8 = undefined;
+    const ping_len = frame.encode(&ping_frame, .ping);
+    var in_buf: [256]u8 = undefined;
+    const in_len = try peer.seal(&in_buf, client_cid, ping_frame[0..ping_len]);
+    try conn.receive(gpa, in_buf[0..in_len]);
+    const restarted = conn.nextTimeout().?;
+    try testing.expect(restarted >= first_deadline + 2 * std.time.ns_per_s);
+
+    // Early wakeups do nothing — the deadline is a fact, not a suggestion.
+    try conn.onTimeout(gpa, restarted - 1);
+    try testing.expectEqual(LifeState.active, conn.state);
+
+    // At the deadline the connection ends without a packet: nothing to send,
+    // no CONNECTION_CLOSE, only the event telling the owner why.
+    try conn.onTimeout(gpa, restarted);
+    try testing.expectEqual(LifeState.drained, conn.state);
+    var saw_idle = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .idle_timeout) saw_idle = true;
+    }
+    try testing.expect(saw_idle);
+    var out: [max_datagram]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try conn.send(gpa, &out));
 }
