@@ -28,6 +28,7 @@ pub const frame = @import("codec/frame.zig");
 pub const http = @import("codec/http.zig");
 pub const http2 = @import("codec/http2.zig");
 pub const quic = @import("codec/quic.zig");
+pub const http3 = @import("codec/http3.zig");
 pub const json = @import("codec/json.zig");
 pub const websocket = @import("codec/websocket.zig");
 pub const event_loop = @import("event_loop.zig");
@@ -127,6 +128,7 @@ test {
     _ = http;
     _ = http2;
     _ = quic;
+    _ = http3;
     _ = json;
     _ = lock;
     _ = message;
