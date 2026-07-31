@@ -42,6 +42,8 @@ const pool_mod = @import("pool.zig");
 const permessage_deflate = @import("codec/permessage_deflate.zig");
 const redis = @import("codec/redis.zig");
 const websocket = @import("codec/websocket.zig");
+const quic = @import("codec/quic.zig");
+const http3 = @import("codec/http3.zig");
 
 const Buffer = buffer_mod.Buffer;
 const HandlerContext = pipeline_mod.HandlerContext;
@@ -1965,4 +1967,399 @@ test "stress: Redis RESP decoder over random inputs" {
 
 test "stress: WebSocket permessage-deflate over random inputs" {
     try runStress(fuzzDeflate, 0xDEF1A7E);
+}
+
+// -- QUIC varint -------------------------------------------------------------
+
+fn fuzzQuicVarintBody(_: *Harness, smith: *Smith, gpa: Allocator) anyerror!void {
+    _ = gpa;
+    const varint = quic.varint;
+
+    // Round trip at the minimal length, and at every longer legal length:
+    // §16 explicitly permits non-minimal encodings, so all of them must
+    // decode to the same value or two conforming peers disagree about the
+    // same bytes.
+    const value = smith.valueRangeAtMost(u64, 0, varint.max_value);
+    var buf: [8]u8 = undefined;
+    const min_len = varint.encode(&buf, value);
+    var rest: []const u8 = buf[0..min_len];
+    if (try varint.take(&rest) != value) return error.VarintRoundTrip;
+    if (rest.len != 0) return error.VarintRoundTrip;
+
+    for ([_]u4{ 1, 2, 4, 8 }) |len| {
+        if (len < min_len) continue;
+        _ = varint.encodeIn(&buf, value, len);
+        if (varint.peekLen(buf[0]) != len) return error.VarintPeek;
+        var wide: []const u8 = buf[0..len];
+        if (try varint.take(&wide) != value) return error.VarintNonMinimal;
+    }
+
+    // Arbitrary bytes decode or refuse; either way no crash, and `take` never
+    // consumes past what `peekLen` promised.
+    var junk: [16]u8 = undefined;
+    const junk_len = smith.slice(&junk);
+    var slice: []const u8 = junk[0..junk_len];
+    const before = slice.len;
+    if (varint.take(&slice)) |_| {
+        if (before - slice.len != varint.peekLen(junk[0])) return error.VarintConsumed;
+    } else |_| {}
+}
+
+fn fuzzQuicVarint(harness: *Harness, smith: *Smith) anyerror!void {
+    return withLeakCheck(harness, smith, fuzzQuicVarintBody);
+}
+
+test "fuzz: QUIC varint round trip and arbitrary bytes" {
+    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
+    defer harness.threaded.deinit();
+    try std.testing.fuzz(&harness, fuzzQuicVarint, .{ .corpus = &.{
+        "",
+        "\x00",
+        "\xc0\x00\x00\x00\x00\x00\x00\x01",
+    } });
+}
+
+// -- QUIC frames -------------------------------------------------------------
+
+fn fuzzQuicFrameBody(_: *Harness, smith: *Smith, gpa: Allocator) anyerror!void {
+    _ = gpa;
+
+    // Arbitrary bytes: parse until refusal or exhaustion. The parser must
+    // neither crash nor loop — every iteration consumes at least one byte.
+    var payload: [512]u8 = undefined;
+    const len = smith.slice(&payload);
+    var rest: []const u8 = payload[0..len];
+    while (rest.len > 0) {
+        const remaining = rest.len;
+        const parsed = quic.frame.parse(&rest) catch break;
+        if (rest.len >= remaining) return error.FrameNoProgress;
+
+        // Whatever parsed must re-encode into exactly `encodedLen` bytes and
+        // parse back equal in type. (Full structural equality is checked by
+        // the unit tests; the property here is that the encoder and parser
+        // agree about *lengths*, because a disagreement there desynchronizes
+        // every frame after this one in the packet.)
+        const need = quic.frame.encodedLen(parsed);
+        if (need > 600) continue; // ACK ranges borrow from input; skip giants
+        var out: [600]u8 = undefined;
+        const written = quic.frame.encode(&out, parsed);
+        if (written != need) return error.FrameLengthLied;
+        var back: []const u8 = out[0..written];
+        const again = quic.frame.parse(&back) catch return error.FrameReparse;
+        if (std.meta.activeTag(again) != std.meta.activeTag(parsed)) return error.FrameChanged;
+    }
+}
+
+fn fuzzQuicFrame(harness: *Harness, smith: *Smith) anyerror!void {
+    return withLeakCheck(harness, smith, fuzzQuicFrameBody);
+}
+
+test "fuzz: QUIC frame parser on arbitrary bytes" {
+    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
+    defer harness.threaded.deinit();
+    try std.testing.fuzz(&harness, fuzzQuicFrame, .{
+        .corpus = &.{
+            "\x01\x01\x01", // PING, PING, PING
+            "\x02\x05\x00\x00\x00", // a minimal ACK
+            "\x08\x00hello", // STREAM without length
+            "\x18", // truncated NEW_CONNECTION_ID
+        },
+    });
+}
+
+// -- QUIC packets ------------------------------------------------------------
+
+fn fuzzQuicPacketBody(_: *Harness, smith: *Smith, gpa: Allocator) anyerror!void {
+    _ = gpa;
+
+    // The parser sees attacker bytes before any key is applied, so this is the
+    // most exposed parser in the stack: arbitrary bytes at every legal local
+    // CID length, walking coalesced packets the way `Connection.receive` does.
+    var datagram: [1500]u8 = undefined;
+    const len = smith.slice(&datagram);
+    const local_cid_len = smith.valueRangeAtMost(u8, 0, 20);
+
+    var offset: usize = 0;
+    while (offset < len) {
+        const parsed = quic.packet.parse(datagram[offset..len], local_cid_len) catch break;
+        if (parsed.end == 0) return error.PacketNoProgress;
+        offset += parsed.end;
+        if (offset > len) return error.PacketOverran;
+    }
+}
+
+fn fuzzQuicPacket(harness: *Harness, smith: *Smith) anyerror!void {
+    return withLeakCheck(harness, smith, fuzzQuicPacketBody);
+}
+
+test "fuzz: QUIC packet parser on arbitrary bytes" {
+    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
+    defer harness.threaded.deinit();
+    try std.testing.fuzz(&harness, fuzzQuicPacket, .{
+        .corpus = &.{
+            "",
+            "\x40\x01\x02\x03", // short header
+            "\xc0\x00\x00\x00\x01\x00\x00", // long header, v1
+            "\x80\x00\x00\x00\x00", // version negotiation shape
+        },
+    });
+}
+
+// -- QUIC ACK ranges ---------------------------------------------------------
+
+fn fuzzAckRangesBody(_: *Harness, smith: *Smith, gpa: Allocator) anyerror!void {
+    _ = gpa;
+
+    // The range set against a plain bitmap model. The bound makes exact
+    // equality impossible by design — eviction loses information — so the
+    // properties are one-sided where they must be and exact where they can be:
+    //  * no false positives: contains(pn) implies the model saw pn;
+    //  * the largest is exact: §19.3 requires it never be evicted;
+    //  * the wire invariants hold: descending, disjoint, non-adjacent.
+    const universe = 512;
+    var model: [universe]bool = @splat(false);
+    var set: quic.recovery.AckRanges = .{};
+    var highest: ?u64 = null;
+
+    var steps = smith.valueRangeAtMost(u16, 1, 200);
+    while (steps > 0) : (steps -= 1) {
+        if (smith.boolWeighted(3, 1)) {
+            const pn = smith.valueRangeAtMost(u64, 0, universe - 1);
+            set.add(pn);
+            model[@intCast(pn)] = true;
+            if (highest == null or pn > highest.?) highest = pn;
+        } else {
+            const from = smith.valueRangeAtMost(u64, 0, universe - 1);
+            const span = smith.valueRangeAtMost(u64, 0, 40);
+            const to = @min(from + span, universe - 1);
+            _ = set.addRange(from, to);
+            var pn = from;
+            while (pn <= to) : (pn += 1) model[@intCast(pn)] = true;
+            if (highest == null or to > highest.?) highest = to;
+        }
+    }
+
+    if (highest) |top| {
+        if (set.largest() != top) return error.AckLostLargest;
+    }
+    var previous: ?quic.frame.Ack.Range = null;
+    for (set.slice()) |range| {
+        if (range.smallest > range.largest) return error.AckInverted;
+        if (previous) |before| {
+            // Strictly below, with a gap: adjacent ranges must have merged.
+            if (range.largest + 1 >= before.smallest) return error.AckNotDisjoint;
+        }
+        previous = range;
+        var pn = range.smallest;
+        while (pn <= range.largest) : (pn += 1) {
+            if (!model[@intCast(pn)]) return error.AckFalsePositive;
+        }
+    }
+}
+
+fn fuzzAckRanges(harness: *Harness, smith: *Smith) anyerror!void {
+    return withLeakCheck(harness, smith, fuzzAckRangesBody);
+}
+
+test "fuzz: QUIC ACK ranges against a bitmap model" {
+    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
+    defer harness.threaded.deinit();
+    try std.testing.fuzz(&harness, fuzzAckRanges, .{ .corpus = &.{
+        "",
+        "\x01\x02\x03\x04\x05\x06\x07\x08",
+    } });
+}
+
+// -- HTTP/3 frames -----------------------------------------------------------
+
+fn fuzzHttp3FrameBody(_: *Harness, smith: *Smith, gpa: Allocator) anyerror!void {
+    // Chunk independence, the repository's central fuzz property, for the one
+    // parser in the HTTP/3 stack that reassembles a stream: whatever items a
+    // whole-buffer parse yields, a parse over arbitrary fragments must yield
+    // identically — HTTP/3 frames arrive in whatever pieces QUIC's packetizer
+    // chose, so the fragmentation is the peer's choice, not ours.
+    var bytes: [768]u8 = undefined;
+    const len = smith.slice(&bytes);
+    const input = bytes[0..len];
+
+    var whole_transcript: std.ArrayList(u8) = .empty;
+    defer whole_transcript.deinit(gpa);
+    var whole_failed = false;
+    {
+        var parser: http3.frame.Parser = .{};
+        defer parser.deinit(gpa);
+        transcribeH3(gpa, &parser, input, &whole_transcript) catch {
+            whole_failed = true;
+        };
+    }
+
+    var split_transcript: std.ArrayList(u8) = .empty;
+    defer split_transcript.deinit(gpa);
+    var split_failed = false;
+    {
+        var parser: http3.frame.Parser = .{};
+        defer parser.deinit(gpa);
+        var offset: usize = 0;
+        outer: while (offset < input.len) {
+            const chunk_len: usize = smith.valueRangeAtMost(u16, 1, @intCast(@min(64, input.len - offset)));
+            const chunk = input[offset .. offset + chunk_len];
+            offset += chunk_len;
+            transcribeH3(gpa, &parser, chunk, &split_transcript) catch {
+                split_failed = true;
+                break :outer;
+            };
+        }
+    }
+
+    if (whole_failed != split_failed) return error.H3ErrorDisagrees;
+    if (!whole_failed) {
+        if (!std.mem.eql(u8, whole_transcript.items, split_transcript.items)) {
+            return error.H3ChunkDependent;
+        }
+    } else {
+        // Up to the failure point the transcripts must still agree: an error
+        // must not depend on where the chunk boundaries fell either.
+        const shorter = @min(whole_transcript.items.len, split_transcript.items.len);
+        if (!std.mem.eql(u8, whole_transcript.items[0..shorter], split_transcript.items[0..shorter])) {
+            return error.H3ChunkDependent;
+        }
+    }
+}
+
+/// Append a canonical record of every parsed item, so two parses can be
+/// compared byte for byte. Body chunks are folded together, because how DATA
+/// is split across deliveries is explicitly not part of the contract — only
+/// the bytes and the boundary are.
+fn transcribeH3(
+    gpa: Allocator,
+    parser: *http3.frame.Parser,
+    input: []const u8,
+    out: *std.ArrayList(u8),
+) !void {
+    var rest = input;
+    while (rest.len > 0) {
+        const result = (try parser.next(gpa, rest)) orelse break;
+        rest = rest[result.consumed..];
+        switch (result.item) {
+            .frame => |f| {
+                try out.append(gpa, 'F');
+                try out.append(gpa, @backingInt(std.meta.activeTag(f)));
+                switch (f) {
+                    .headers => |p| try out.appendSlice(gpa, p),
+                    .settings => |p| try out.appendSlice(gpa, p),
+                    .cancel_push, .goaway, .max_push_id => |v| {
+                        try out.appendSlice(gpa, &std.mem.toBytes(v));
+                    },
+                    .push_promise => |p| {
+                        try out.appendSlice(gpa, &std.mem.toBytes(p.push_id));
+                        try out.appendSlice(gpa, p.field_section);
+                    },
+                    .unknown => |u| {
+                        try out.appendSlice(gpa, &std.mem.toBytes(u.frame_type));
+                        try out.appendSlice(gpa, u.payload);
+                    },
+                    .data => unreachable,
+                }
+                try out.append(gpa, ';');
+            },
+            .body_chunk => |chunk| {
+                try out.appendSlice(gpa, chunk.bytes);
+                if (chunk.last) try out.appendSlice(gpa, "|END;");
+            },
+        }
+    }
+}
+
+fn fuzzHttp3Frame(harness: *Harness, smith: *Smith) anyerror!void {
+    return withLeakCheck(harness, smith, fuzzHttp3FrameBody);
+}
+
+test "fuzz: HTTP/3 frame parser chunk independence" {
+    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
+    defer harness.threaded.deinit();
+    try std.testing.fuzz(&harness, fuzzHttp3Frame, .{
+        .corpus = &.{
+            "\x04\x00", // empty SETTINGS
+            "\x00\x05hello\x01\x02hh", // DATA then HEADERS
+            "\x21\x03abc", // grease frame
+            "\x07\x01\x08", // GOAWAY
+        },
+    });
+}
+
+// -- QPACK -------------------------------------------------------------------
+
+fn fuzzQpackBody(_: *Harness, smith: *Smith, gpa: Allocator) anyerror!void {
+    const qpack = http3.qpack;
+
+    // Round trip: random fields (some binary, some marked never-index) encode
+    // and decode back to the same names, values and N bits.
+    var names: [4][24]u8 = undefined;
+    var values: [4][48]u8 = undefined;
+    var fields: [4]qpack.FieldLine = undefined;
+    const count: usize = smith.valueRangeAtMost(u8, 0, 4);
+    for (0..count) |i| {
+        var name_len: usize = smith.valueRangeAtMost(u8, 1, 24);
+        smith.bytes(names[i][0..name_len]);
+        // Names with ':' collide with pseudo-field parsing at higher layers but
+        // are legal for the codec itself; keep them, the codec must carry them.
+        const value_len: usize = smith.valueRangeAtMost(u8, 0, 48);
+        smith.bytes(values[i][0..value_len]);
+        _ = &name_len;
+        fields[i] = .{
+            .name = names[i][0..name_len],
+            .value = values[i][0..value_len],
+            .never_index = smith.boolWeighted(3, 1),
+        };
+    }
+
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(gpa);
+    try qpack.encodeSection(gpa, &encoded, fields[0..count]);
+
+    var section = try qpack.decodeSection(gpa, encoded.items, .{});
+    defer section.deinit(gpa);
+    if (section.fields.items.len != count) return error.QpackCount;
+    for (fields[0..count], section.fields.items) |sent, got| {
+        if (!std.mem.eql(u8, sent.name, got.name)) return error.QpackName;
+        if (!std.mem.eql(u8, sent.value, got.value)) return error.QpackValue;
+        if (sent.never_index != got.never_index) return error.QpackNeverIndex;
+    }
+
+    // Arbitrary bytes: decode refuses or succeeds, never crashes and never
+    // leaks (the leak check around this body is the second half of the claim).
+    var junk: [256]u8 = undefined;
+    const junk_len = smith.slice(&junk);
+    if (qpack.decodeSection(gpa, junk[0..junk_len], .{
+        .max_field_section_size = 1 << 20,
+    })) |*ok| {
+        var owned = ok.*;
+        owned.deinit(gpa);
+    } else |_| {}
+
+    // Decoder-stream instructions: arbitrary bytes parse incrementally without
+    // crashing, and whatever parses applies or refuses per the zero-capacity
+    // rules.
+    var stream: []const u8 = junk[0..junk_len];
+    while (true) {
+        const parsed = qpack.parseDecoderInstruction(&stream) catch break;
+        const instruction = parsed orelse break;
+        qpack.applyDecoderInstruction(instruction) catch break;
+    }
+}
+
+fn fuzzQpack(harness: *Harness, smith: *Smith) anyerror!void {
+    return withLeakCheck(harness, smith, fuzzQpackBody);
+}
+
+test "fuzz: QPACK sections round trip and survive arbitrary bytes" {
+    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
+    defer harness.threaded.deinit();
+    try std.testing.fuzz(&harness, fuzzQpack, .{
+        .corpus = &.{
+            "",
+            "\x00\x00\xd1", // prefix + :method GET
+            "\x00\x00\xff\xff\xff\xff", // huge index
+        },
+    });
 }
