@@ -19,6 +19,7 @@
 //! connection that never did anything wrong.
 
 const std = @import("std");
+const recovery = @import("recovery.zig");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
@@ -551,6 +552,16 @@ pub const Send = struct {
     /// Set when the application ends the stream.
     fin_written: bool = false,
     fin_sent: bool = false,
+    /// Which offsets the peer has acknowledged, as ranges. Needed because
+    /// acknowledgements arrive per packet and packets are acknowledged out of
+    /// order: an ACK for bytes [1000, 2000) says nothing about [0, 1000), and
+    /// `markAcked` — which is cumulative — must only ever be given the
+    /// *contiguous frontier*. Feeding it a later range directly would release
+    /// bytes the peer never confirmed, and lose them: the packets carrying them
+    /// were already resolved, so loss detection would never resend them.
+    acked_ranges: recovery.AckRanges = .{},
+    /// Whether any acknowledged frame carried the FIN.
+    fin_acked_seen: bool = false,
     /// §3.5: a STOP_SENDING arrived, so a RESET_STREAM is owed.
     stop_sending_code: ?u64 = null,
     reset_code: ?u64 = null,
@@ -619,6 +630,70 @@ pub const Send = struct {
             self.fin_sent = true;
             self.state = .data_sent;
         } else if (self.state == .ready and n > 0) {
+            self.state = .send;
+        }
+    }
+
+    /// One STREAM frame's worth of acknowledgement: `len` bytes at `offset`,
+    /// with `fin` if the frame carried it.
+    ///
+    /// This is the entry point for loss recovery. It folds the range into
+    /// `acked_ranges`, computes the contiguous frontier, and only that frontier
+    /// reaches `markAcked` — see the field's comment for why anything else loses
+    /// data.
+    pub fn markRangeAcked(self: *Send, offset: u64, len: u64, fin: bool) void {
+        if (fin) self.fin_acked_seen = true;
+        if (len > 0) {
+            if (self.acked_ranges.addRange(offset, offset + len - 1)) |forgotten| {
+                // The bound evicted a range. A forgotten acknowledgement never
+                // comes back — the packet that carried it was already resolved —
+                // so the only safe reading is "not acknowledged": rewind and
+                // resend. The waste is bounded; the alternative is bytes held in
+                // the queue forever and a stream that never completes.
+                self.rewind(forgotten.smallest, false);
+            }
+        }
+
+        // The contiguous frontier: walk the ranges from the lowest upward while
+        // each one touches what is already acknowledged.
+        var frontier = self.acked;
+        var i = self.acked_ranges.len;
+        while (i > 0) {
+            i -= 1;
+            const range = self.acked_ranges.ranges[i];
+            if (range.smallest > frontier) break;
+            frontier = @max(frontier, range.largest + 1);
+        }
+        // Ranges consumed by the frontier are done; dropping them is what keeps
+        // the bounded set holding only the out-of-order islands that still matter.
+        while (self.acked_ranges.len > 0 and
+            self.acked_ranges.ranges[self.acked_ranges.len - 1].largest < frontier)
+        {
+            self.acked_ranges.len -= 1;
+        }
+
+        const fin_acked = self.fin_acked_seen and self.fin_written and frontier == self.written;
+        self.markAcked(frontier, fin_acked);
+    }
+
+    /// A packet carrying bytes from `offset` (and possibly the FIN) was lost:
+    /// wind the sent watermark back so they go out again. §13.3: what is
+    /// retransmitted is the information, not the packet — the bytes are still in
+    /// `queue` precisely because they were never acknowledged.
+    pub fn rewind(self: *Send, offset: u64, fin: bool) void {
+        // A reset replaces the data; resending data after RESET_STREAM would
+        // contradict it. Terminal states have nothing left to say.
+        if (self.state != .send and self.state != .data_sent) return;
+
+        // Below `acked` there is nothing to resend — those bytes are confirmed
+        // and, below `queue_base`, already released.
+        const floor = @max(self.queue_base, self.acked);
+        const target = @max(offset, floor);
+        if (target < self.sent) self.sent = target;
+        if (fin) self.fin_sent = false;
+        // `data_sent` claimed everything including the FIN was out; if either is
+        // no longer true, we are back to having data to send.
+        if (self.state == .data_sent and (self.sent < self.written or !self.fin_sent)) {
             self.state = .send;
         }
     }
@@ -1140,4 +1215,74 @@ test "stream: a unidirectional stream has exactly one live half" {
     try testing.expectEqual(@as(u64, 200), both.send.?.max_data);
     try testing.expectEqual(@as(u64, 100), both.recv.?.max_data);
     try testing.expect(!both.isFinished());
+}
+
+test "stream: out-of-order acknowledgement only advances the contiguous frontier" {
+    const gpa = testing.allocator;
+    var send: Send = .init(10_000);
+    defer send.deinit(gpa);
+
+    const big: [3000]u8 = @splat('a');
+    try send.write(gpa, &big);
+    send.markSent(3000, false);
+
+    // The peer acknowledges [1000, 2000) first. Nothing below it is confirmed,
+    // so nothing may be released: releasing here would lose bytes forever,
+    // because the packets carrying [0, 1000) were already resolved by loss
+    // recovery and no one else would ever resend them.
+    send.markRangeAcked(1000, 1000, false);
+    try testing.expectEqual(@as(u64, 0), send.acked);
+    try testing.expectEqual(@as(usize, 3000), send.queue.items.len);
+
+    // The lower range arrives: the frontier jumps across both.
+    send.markRangeAcked(0, 1000, false);
+    try testing.expectEqual(@as(u64, 2000), send.acked);
+    try testing.expectEqual(@as(usize, 1000), send.queue.items.len);
+    // And the island was consumed by the frontier rather than remembered.
+    try testing.expectEqual(@as(usize, 0), send.acked_ranges.len);
+
+    // The final range plus FIN completes the stream.
+    try send.finish();
+    send.markSent(0, true);
+    send.markRangeAcked(2000, 1000, true);
+    try testing.expectEqual(SendState.data_recvd, send.state);
+}
+
+test "stream: rewind resends lost bytes but never acknowledged ones" {
+    const gpa = testing.allocator;
+    var send: Send = .init(10_000);
+    defer send.deinit(gpa);
+
+    try send.write(gpa, "0123456789");
+    send.markSent(10, false);
+    try testing.expectEqual(@as(usize, 0), send.unsent().len);
+
+    // Bytes [0, 4) are acknowledged; a packet carrying [2, 10) is then lost.
+    // The rewind must stop at the acknowledged frontier: resending confirmed
+    // bytes wastes the window, and below `queue_base` they are gone entirely —
+    // `bytesFrom` would walk off the buffer.
+    send.markRangeAcked(0, 4, false);
+    send.rewind(2, false);
+    try testing.expectEqual(@as(u64, 4), send.sent);
+    try testing.expectEqualStrings("456789", send.unsent());
+
+    // A lost FIN re-arms it.
+    send.markSent(6, false);
+    try send.finish();
+    send.markSent(0, true);
+    try testing.expectEqual(SendState.data_sent, send.state);
+    try testing.expect(send.fin_sent);
+    send.rewind(10, true);
+    try testing.expect(!send.fin_sent);
+    try testing.expectEqual(SendState.send, send.state);
+
+    // After a reset, lost data stays lost: the reset replaced it (§19.4), and
+    // resending data the reset disclaimed would contradict our own frame.
+    var quit: Send = .init(10_000);
+    defer quit.deinit(gpa);
+    try quit.write(gpa, "abc");
+    quit.markSent(3, false);
+    _ = try quit.abandon(7);
+    quit.rewind(0, false);
+    try testing.expectEqual(@as(u64, 3), quit.sent);
 }

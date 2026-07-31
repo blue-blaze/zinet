@@ -90,50 +90,65 @@ pub const AckRanges = struct {
         return false;
     }
 
-    /// Record that `pn` was received, merging with neighbours.
+    /// Record that `pn` was received, merging with neighbours. A range evicted
+    /// by the bound is dropped silently, which §13.2.3 permits for received
+    /// packet numbers: the cost is a retransmission the peer need not have made.
     pub fn add(self: *AckRanges, pn: u64) void {
-        if (self.contains(pn)) return;
+        _ = self.addRange(pn, pn);
+    }
 
-        // Find where this belongs: the first range whose largest is below `pn`.
-        var index: usize = 0;
-        while (index < self.len and self.ranges[index].largest > pn) index += 1;
+    /// Record the inclusive range `[smallest, largest]`, merging with anything it
+    /// touches or overlaps. Overlap is not an error: stream retransmission resends
+    /// suffixes, so their acknowledgements legitimately cover ground twice.
+    ///
+    /// Returns the range that did **not** survive the bound, if any — either the
+    /// evicted lowest range or, when the new range would itself be the lowest,
+    /// the new range. The caller decides what that means: for received packet
+    /// numbers it is safely ignored (§13.2.3), but for tracking acknowledged
+    /// stream offsets it must be treated as *not acknowledged* and the data
+    /// resent, because a forgotten acknowledgement never comes back.
+    pub fn addRange(self: *AckRanges, smallest: u64, largest_in: u64) ?frame.Ack.Range {
+        assert(smallest <= largest_in);
+        var s = smallest;
+        var l = largest_in;
 
-        // Extend the range above, if `pn` sits directly beneath it.
-        const extends_above = index > 0 and self.ranges[index - 1].smallest == pn + 1;
-        // Extend the range below, if `pn` sits directly above it.
-        const extends_below = index < self.len and self.ranges[index].largest + 1 == pn;
+        // Skip the ranges entirely above: those whose smallest is beyond l + 1.
+        var lo: usize = 0;
+        while (lo < self.len and self.ranges[lo].smallest > l +| 1) lo += 1;
 
-        if (extends_above and extends_below) {
-            // The gap closed: merge the two into one.
-            self.ranges[index - 1].smallest = self.ranges[index].smallest;
-            var i = index;
-            while (i + 1 < self.len) : (i += 1) self.ranges[i] = self.ranges[i + 1];
-            self.len -= 1;
-            return;
+        // Absorb every range that touches or overlaps [s, l].
+        var hi = lo;
+        while (hi < self.len and self.ranges[hi].largest +| 1 >= s) : (hi += 1) {
+            s = @min(s, self.ranges[hi].smallest);
+            l = @max(l, self.ranges[hi].largest);
         }
-        if (extends_above) {
-            self.ranges[index - 1].smallest = pn;
-            return;
-        }
-        if (extends_below) {
-            self.ranges[index].largest = pn;
-            return;
+
+        if (hi > lo) {
+            // Merge [lo, hi) into one.
+            self.ranges[lo] = .{ .largest = l, .smallest = s };
+            const removed = hi - lo - 1;
+            if (removed > 0) {
+                var i = lo + 1;
+                while (i + removed < self.len) : (i += 1) self.ranges[i] = self.ranges[i + removed];
+                self.len -= removed;
+            }
+            return null;
         }
 
-        // A new range of one.
+        // Nothing touched: a fresh range at `lo`.
+        var evicted: ?frame.Ack.Range = null;
         if (self.len == max_ack_ranges) {
-            // Drop the oldest — the lowest-numbered range — unless that is where
-            // this one goes, in which case there is nothing to gain by shuffling.
-            // §13.2.3 permits this: the cost is a retransmission the peer need not
-            // have made, and §19.3 only insists that the *largest* received number
-            // be kept, which is the one at index zero.
-            if (index == self.len) return;
+            // The bound. Drop the lowest range — unless that is where this one
+            // goes, in which case the new range is the one that does not fit.
+            if (lo == self.len) return .{ .largest = l, .smallest = s };
+            evicted = self.ranges[self.len - 1];
             self.len -= 1;
         }
         var i = self.len;
-        while (i > index) : (i -= 1) self.ranges[i] = self.ranges[i - 1];
-        self.ranges[index] = .{ .largest = pn, .smallest = pn };
+        while (i > lo) : (i -= 1) self.ranges[i] = self.ranges[i - 1];
+        self.ranges[lo] = .{ .largest = l, .smallest = s };
         self.len += 1;
+        return evicted;
     }
 };
 
@@ -1263,4 +1278,58 @@ test "recovery: each space is resolved independently" {
     // The application space is untouched.
     try testing.expectEqual(@as(usize, 5), spaces.sent[2].items.len);
     try testing.expect(spaces.largest_acked[2] == null);
+}
+
+test "recovery: addRange merges overlaps, because retransmission makes them ordinary" {
+    var set: AckRanges = .{};
+
+    _ = set.addRange(10, 20);
+    _ = set.addRange(30, 40);
+    try testing.expectEqual(@as(usize, 2), set.len);
+
+    // A range overlapping both absorbs both. This is the case stream
+    // retransmission produces: a resent suffix is acknowledged over ground an
+    // earlier acknowledgement already covered.
+    _ = set.addRange(15, 35);
+    try testing.expectEqual(@as(usize, 1), set.len);
+    try testing.expectEqual(@as(u64, 40), set.ranges[0].largest);
+    try testing.expectEqual(@as(u64, 10), set.ranges[0].smallest);
+
+    // Touching counts as merging: [41, 45] extends [10, 40] rather than
+    // standing next to it, since an ACK frame may not encode adjacent ranges.
+    _ = set.addRange(41, 45);
+    try testing.expectEqual(@as(usize, 1), set.len);
+    try testing.expectEqual(@as(u64, 45), set.ranges[0].largest);
+
+    // A wholly-contained range changes nothing.
+    _ = set.addRange(12, 13);
+    try testing.expectEqual(@as(usize, 1), set.len);
+}
+
+test "recovery: addRange reports the range the bound rejected" {
+    // For received packet numbers the report is ignored (§13.2.3 permits the
+    // spurious retransmission it causes). For acknowledged stream offsets it must
+    // not be: an acknowledgement forgotten is data never released and never
+    // resent, so the caller treats the reported range as unacknowledged and
+    // rewinds. The return value is what makes that caller possible.
+    var set: AckRanges = .{};
+    var base: u64 = 100;
+    while (set.len < max_ack_ranges) : (base += 10) _ = set.addRange(base, base + 1);
+
+    // A new lowest range does not fit: it is the one reported.
+    const refused = set.addRange(1, 2);
+    try testing.expect(refused != null);
+    try testing.expectEqual(@as(u64, 1), refused.?.smallest);
+    try testing.expectEqual(@as(usize, max_ack_ranges), set.len);
+
+    // A new highest range fits by evicting the lowest, which is reported.
+    const lowest_before = set.ranges[set.len - 1];
+    const evicted = set.addRange(10_000, 10_001);
+    try testing.expect(evicted != null);
+    try testing.expectEqual(lowest_before.smallest, evicted.?.smallest);
+    try testing.expectEqual(@as(?u64, 10_001), set.largest());
+
+    // A merge never evicts anything: the set does not grow.
+    const merged = set.addRange(10_000, 10_005);
+    try testing.expect(merged == null);
 }

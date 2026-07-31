@@ -217,6 +217,20 @@ pub const Remote = struct {
         return self.pending_retire[0..self.pending_retire_len];
     }
 
+    /// A packet carrying this RETIRE_CONNECTION_ID was lost: put the sequence
+    /// back so the frame is sent again. §13.3 — the peer is waiting to reuse
+    /// the slot, and an unacknowledged retirement holds it forever. A duplicate
+    /// retirement at the peer is harmless (it retires nothing the second time),
+    /// so requeueing is safe even if the original was in fact delivered.
+    pub fn requeueRetire(self: *Remote, sequence: u64) void {
+        for (self.pending_retire[0..self.pending_retire_len]) |existing| {
+            if (existing == sequence) return;
+        }
+        if (self.pending_retire_len == self.pending_retire.len) return;
+        self.pending_retire[self.pending_retire_len] = sequence;
+        self.pending_retire_len += 1;
+    }
+
     /// Called once a RETIRE_CONNECTION_ID has been acknowledged as sent.
     pub fn clearPendingRetire(self: *Remote, sent: usize) void {
         assert(sent <= self.pending_retire_len);

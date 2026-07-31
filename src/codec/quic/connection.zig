@@ -28,6 +28,7 @@ const crypto = @import("crypto.zig");
 const frame = @import("frame.zig");
 const packet = @import("packet.zig");
 const transport = @import("transport.zig");
+const recovery = @import("recovery.zig");
 const varint = @import("varint.zig");
 const cid_mod = @import("cid.zig");
 const stream_mod = @import("stream.zig");
@@ -158,8 +159,15 @@ const Space = struct {
     /// Largest we have had acknowledged, which decides how many bytes of packet
     /// number to send (§17.1).
     largest_acked: ?u64 = null,
-    /// Largest we have received, which is what we acknowledge.
-    largest_received: ?u64 = null,
+    /// Every packet number received, as ranges. This is both what we
+    /// acknowledge — all of it, not just the largest — and §12.3's duplicate
+    /// detection, which can only happen after packet protection is removed.
+    /// One structure for both on purpose: a duplicate check against anything
+    /// other than what we acknowledge would be a second source of truth.
+    received: recovery.AckRanges = .{},
+    /// When the packet that is currently `received.largest()` arrived, for the
+    /// ACK frame's delay field.
+    largest_received_at: u64 = 0,
     /// Whether something ack-eliciting has arrived since we last acknowledged.
     ack_pending: bool = false,
     /// How far our own CRYPTO stream has been put into packets. Not consumed
@@ -262,6 +270,45 @@ const CryptoStream = struct {
     }
 };
 
+/// What one sent packet carried, for §13.3: when the packet is acknowledged
+/// its content is released, and when it is lost its *information* — not the
+/// packet — is queued to be sent again.
+const SentMeta = struct {
+    number: u64,
+    ack_eliciting: bool = false,
+    /// The CRYPTO range this packet carried, `len == 0` if none.
+    crypto_offset: u64 = 0,
+    crypto_len: u64 = 0,
+    /// The STREAM frames it carried. Bounded, and the writer respects the bound
+    /// by simply starting a new packet: a limit the writer can exceed is not a
+    /// limit.
+    streams: [max_stream_frames_per_packet]StreamRange = undefined,
+    stream_count: u8 = 0,
+    /// Stream IDs whose MAX_STREAM_DATA rode in this packet.
+    credits: [max_credit_frames_per_packet]u64 = undefined,
+    credit_count: u8 = 0,
+    /// Stream IDs whose RESET_STREAM rode in this packet.
+    resets: [max_credit_frames_per_packet]u64 = undefined,
+    reset_count: u8 = 0,
+    /// RETIRE_CONNECTION_ID sequence numbers carried.
+    retires: [cid_mod.max_stored]u64 = undefined,
+    retire_count: u8 = 0,
+    carried_max_data: bool = false,
+    carried_max_streams: [2]bool = .{ false, false },
+
+    const StreamRange = struct { id: u64, offset: u64, len: u64, fin: bool };
+
+    fn worthKeeping(self: *const SentMeta) bool {
+        return self.ack_eliciting;
+    }
+};
+
+/// STREAM frames per packet. The packet writer starts refusing stream frames at
+/// this point; the data simply waits for the next packet, which costs nothing.
+const max_stream_frames_per_packet = 8;
+/// MAX_STREAM_DATA and RESET_STREAM frames per packet, same mechanism.
+const max_credit_frames_per_packet = 8;
+
 pub const Connection = struct {
     engine: client.Client,
     spaces: [Level.count]Space = .{ .{}, .{}, .{} },
@@ -296,6 +343,32 @@ pub const Connection = struct {
     closed: bool = false,
     /// A CONNECTION_CLOSE we owe the peer.
     pending_close: ?struct { code: u64, application: bool } = null,
+
+    // ── Loss detection and congestion control (RFC 9002) ────────────────────
+    /// The caller's clock, advanced through `setTime`. Injected rather than
+    /// read, like every other clock in this repository: recovery is nothing
+    /// *but* time arithmetic, and a wall clock would make every timing rule
+    /// untestable.
+    now_ns: u64 = 0,
+    loss: recovery.Spaces = .{},
+    rtt: recovery.Rtt = .{},
+    congestion: recovery.Congestion = .init(max_datagram),
+    /// What each in-flight packet carried, per space, so that an acknowledgement
+    /// can release it and a loss can requeue it. Parallel to `loss`'s own
+    /// bookkeeping and correlated by packet number — recovery deliberately does
+    /// not know what a packet contains.
+    sent_meta: [3]std.ArrayList(SentMeta) = .{ .empty, .empty, .empty },
+    /// A PTO fired and the next packet at this level must elicit an
+    /// acknowledgement (§6.2.4). For a client this is also §8.1's obligation:
+    /// not sending here can deadlock the handshake against the server's
+    /// anti-amplification limit.
+    probe_pending: [Level.count]bool = @splat(false),
+    /// Credit frames whose packet was lost, re-armed for regeneration. These
+    /// resend the *current* value rather than the lost one (§13.3: retransmit
+    /// the information, not the frame).
+    rearm_max_data: bool = false,
+    rearm_max_streams: [2]bool = .{ false, false },
+    credit_rearm: std.ArrayList(u64) = .empty,
 
     streams: streams_mod.Streams,
     /// Whether a stream has something to put in a packet. A flag rather than a
@@ -366,6 +439,9 @@ pub const Connection = struct {
         for (&self.spaces) |*space| space.deinit(gpa);
         self.engine.deinit(gpa);
         self.events.deinit(gpa);
+        self.loss.deinit(gpa);
+        for (&self.sent_meta) |*list| list.deinit(gpa);
+        self.credit_rearm.deinit(gpa);
         self.* = undefined;
     }
 
@@ -385,6 +461,55 @@ pub const Connection = struct {
     /// The token to keep for a future connection, if the server gave one.
     pub fn addressToken(self: *const Connection) []const u8 {
         return self.token_buf[0..self.token_len];
+    }
+
+    /// Advance the connection's clock. Call before `receive` and `send` with a
+    /// monotonic reading; the connection never reads a clock itself. Injection
+    /// is what lets every RTT, loss and PTO rule below be tested against a
+    /// schedule the test writes.
+    pub fn setTime(self: *Connection, now_ns: u64) void {
+        self.now_ns = @max(self.now_ns, now_ns);
+    }
+
+    /// When the caller should next call `onTimeout`, as an absolute time on the
+    /// injected clock, or null if no timer is armed.
+    pub fn nextTimeout(self: *const Connection) ?u64 {
+        return self.loss.nextTimeout(&self.rtt, self.handshake_confirmed);
+    }
+
+    /// The loss/probe timer fired. Declares time-threshold losses if any are
+    /// due; otherwise this is a PTO (§6.2), and the next packet sent will probe.
+    /// §8.1 makes the probe an obligation for a client, not an optimisation: a
+    /// server that has not validated the address may not send more than three
+    /// times what it received, so a client that goes silent can deadlock the
+    /// handshake with both sides waiting for the other.
+    pub fn onTimeout(self: *Connection, gpa: Allocator, now_ns: u64) !void {
+        self.setTime(now_ns);
+        var any_lost = false;
+        for ([_]Level{ .initial, .handshake, .one_rtt }) |level| {
+            if (self.spaceFor(level).send == null) continue;
+            const lost = try self.loss.detectLostOnTimer(
+                gpa,
+                recoverySpace(level),
+                self.now_ns,
+                &self.rtt,
+            );
+            if (lost.len == 0) continue;
+            any_lost = true;
+            var latest: ?recovery.Sent = null;
+            for (lost) |p| {
+                self.congestion.onLost(p);
+                if (latest == null or p.time_sent > latest.?.time_sent) latest = p;
+                if (self.takeMeta(level, p.number)) |meta| try self.onPacketLost(gpa, level, &meta);
+            }
+            if (latest.?.in_flight) self.congestion.onCongestion(latest.?.time_sent, self.now_ns);
+        }
+        if (any_lost) return;
+
+        // No loss was due, so this was a probe timeout.
+        self.loss.onProbeTimeout();
+        const level = self.highestSendLevel();
+        self.probe_pending[@backingInt(level)] = true;
     }
 
     pub fn nextEvent(self: *Connection) ?Event {
@@ -461,6 +586,87 @@ pub const Connection = struct {
     /// Take a stream's reset code, which is what lets the stream be forgotten.
     pub fn takeStreamReset(self: *Connection, gpa: Allocator, id: u64) ?u64 {
         return self.streams.takeReset(gpa, .init(id));
+    }
+
+    fn recoverySpace(level: Level) recovery.Space {
+        return switch (level) {
+            .initial => .initial,
+            .handshake => .handshake,
+            .one_rtt => .application,
+        };
+    }
+
+    /// Find and remove the record of what packet `number` carried. Null for
+    /// packets that carried nothing retransmittable — those were tracked for
+    /// congestion but have nothing to release or requeue.
+    fn takeMeta(self: *Connection, level: Level, number: u64) ?SentMeta {
+        const list = &self.sent_meta[@backingInt(level)];
+        for (list.items, 0..) |meta, i| {
+            if (meta.number == number) return list.orderedRemove(i);
+        }
+        return null;
+    }
+
+    /// The packet was acknowledged: release what it carried.
+    fn onPacketAcked(self: *Connection, level: Level, meta: *const SentMeta) void {
+        _ = level;
+        for (meta.streams[0..meta.stream_count]) |range| {
+            const s = self.streams.get(.init(range.id)) orelse continue;
+            const sender = &(s.send orelse continue);
+            sender.markRangeAcked(range.offset, range.len, range.fin);
+        }
+        for (meta.resets[0..meta.reset_count]) |id| {
+            const s = self.streams.get(.init(id)) orelse continue;
+            const sender = &(s.send orelse continue);
+            // §3.1: RESET_STREAM acknowledged moves reset_sent to reset_recvd,
+            // which is `markAcked`'s fin_acked path for a reset stream.
+            sender.markAcked(sender.acked, true);
+        }
+        // CRYPTO, credit and retirement frames need nothing on acknowledgement:
+        // their effect was already applied when they were written.
+    }
+
+    /// The packet was declared lost: queue its *information* to be resent
+    /// (§13.3 — the information, never the packet).
+    fn onPacketLost(self: *Connection, gpa: Allocator, level: Level, meta: *const SentMeta) !void {
+        if (meta.crypto_len > 0) {
+            // The engine's output buffer still holds these bytes — it is not
+            // consumed until the handshake completes, for exactly this reason
+            // (and for Retry). Rewinding the watermark *is* the retransmission.
+            const sp = self.spaceFor(level);
+            sp.crypto_sent = @min(sp.crypto_sent, meta.crypto_offset);
+        }
+        for (meta.streams[0..meta.stream_count]) |range| {
+            const s = self.streams.get(.init(range.id)) orelse continue;
+            const sender = &(s.send orelse continue);
+            sender.rewind(range.offset, range.fin);
+            self.pending_stream_data = true;
+        }
+        for (meta.resets[0..meta.reset_count]) |id| {
+            const s = self.streams.get(.init(id)) orelse continue;
+            const sender = &(s.send orelse continue);
+            // The reset writer uses `fin_sent` as its "already sent" marker;
+            // clearing it is the re-arm.
+            if (sender.state == .reset_sent) {
+                sender.fin_sent = false;
+                self.pending_stream_data = true;
+            }
+        }
+        for (meta.credits[0..meta.credit_count]) |id| {
+            // Re-armed by ID, and the frame regenerated from *current* state:
+            // §13.3 says the most recent value, and the lost one may be stale.
+            var known = false;
+            for (self.credit_rearm.items) |existing| {
+                if (existing == id) known = true;
+            }
+            if (!known) try self.credit_rearm.append(gpa, id);
+        }
+        for (meta.retires[0..meta.retire_count]) |sequence| {
+            self.remote.requeueRetire(sequence);
+        }
+        if (meta.carried_max_data) self.rearm_max_data = true;
+        if (meta.carried_max_streams[0]) self.rearm_max_streams[0] = true;
+        if (meta.carried_max_streams[1]) self.rearm_max_streams[1] = true;
     }
 
     fn spaceFor(self: *Connection, level: Level) *Space {
@@ -631,7 +837,7 @@ pub const Connection = struct {
 
         const pn_len = crypto.unprotectHeader(buf, protected.pn_offset, &recv_keys.header);
         const truncated = readPacketNumber(buf[protected.pn_offset..][0..pn_len]);
-        const pn = packet.decodePacketNumber(sp.largest_received, truncated, pn_len);
+        const pn = packet.decodePacketNumber(sp.received.largest(), truncated, pn_len);
 
         const header = buf[0 .. protected.pn_offset + pn_len];
         const body_start = protected.pn_offset + pn_len;
@@ -672,9 +878,16 @@ pub const Connection = struct {
                 self.server_initial_seen = true;
             }
         }
-        if (sp.largest_received == null or pn > sp.largest_received.?) {
-            sp.largest_received = pn;
+        // §12.3: a packet number already processed is discarded, and the check
+        // can only happen here — after protection is removed — because the
+        // number was encrypted. The set consulted is the same one the ACK frame
+        // is built from: one structure, so the two can never disagree.
+        if (sp.received.contains(pn)) return;
+        const previous_largest = sp.received.largest();
+        if (previous_largest == null or pn > previous_largest.?) {
+            sp.largest_received_at = self.now_ns;
         }
+        sp.received.add(pn);
 
         try self.handleFrames(gpa, level, plain[0..plain_len]);
     }
@@ -704,18 +917,11 @@ pub const Connection = struct {
             switch (f) {
                 .padding, .ping => {},
                 .ack => |ack| {
-                    // `allRanges` rather than `iterator`: the latter omits the
-                    // range containing `largest`, so a single-range ACK — the
-                    // common case — updated nothing at all. The symptom was
-                    // invisible, since `largest_acked` staying null only costs
-                    // three bytes of packet number per packet.
-                    var it = ack.allRanges();
                     const sp = self.spaceFor(level);
-                    while (it.next()) |range| {
-                        if (sp.largest_acked == null or range.largest > sp.largest_acked.?) {
-                            sp.largest_acked = range.largest;
-                        }
+                    if (sp.largest_acked == null or ack.largest > sp.largest_acked.?) {
+                        sp.largest_acked = ack.largest;
                     }
+                    try self.handleAck(gpa, level, ack);
                 },
                 .crypto => |c| {
                     const sp = self.spaceFor(level);
@@ -748,7 +954,7 @@ pub const Connection = struct {
                     // §4.1.2 of RFC 9001: only the server sends this, and it is
                     // what confirms the handshake for a client.
                     self.handshake_confirmed = true;
-                    self.discardHandshakeKeys();
+                    self.discardHandshakeKeys(gpa);
                 },
                 .connection_close => |c| {
                     const len = @min(c.reason.len, max_reason_len);
@@ -835,6 +1041,52 @@ pub const Connection = struct {
     /// Translate a stream-layer error into this layer's, which is where the QUIC
     /// error code is decided. Kept in one place so that a new call site cannot
     /// quietly map FLOW_CONTROL_ERROR onto something more convenient.
+    /// Resolve an ACK frame against loss recovery: sample the RTT, release what
+    /// was acknowledged, requeue what was lost, and tell the congestion
+    /// controller both.
+    fn handleAck(self: *Connection, gpa: Allocator, level: Level, ack: frame.Ack) !void {
+        const resolution = try self.loss.resolve(
+            gpa,
+            recoverySpace(level),
+            ack,
+            self.now_ns,
+            &self.rtt,
+        );
+
+        if (resolution.rtt_sample) |sample| {
+            // §18.2: the peer's ack_delay is in microseconds, scaled by its own
+            // ack_delay_exponent. Saturating arithmetic on purpose: the field is
+            // attacker-chosen, and §5.3's floor inside `sample` is what defuses
+            // it — but only if the scaling does not trap first.
+            const exponent: u6 = @intCast(@min(
+                if (self.peer_parameters) |peer| peer.ack_delay_exponent else 3,
+                20,
+            ));
+            const delay_us = std.math.shl(u64, ack.delay, exponent);
+            const delay_ns = delay_us *| std.time.ns_per_us;
+            self.rtt.sample(sample, delay_ns, self.handshake_confirmed);
+        }
+
+        for (resolution.acked) |p| {
+            self.congestion.onAck(p, self.now_ns);
+            if (self.takeMeta(level, p.number)) |meta| self.onPacketAcked(level, &meta);
+        }
+
+        var latest_lost: ?recovery.Sent = null;
+        for (resolution.lost) |p| {
+            self.congestion.onLost(p);
+            if (latest_lost == null or p.time_sent > latest_lost.?.time_sent) latest_lost = p;
+            if (self.takeMeta(level, p.number)) |meta| try self.onPacketLost(gpa, level, &meta);
+        }
+        if (latest_lost) |p| {
+            if (p.in_flight) self.congestion.onCongestion(p.time_sent, self.now_ns);
+            const duration = recovery.Spaces.persistentCongestionDuration(&self.rtt);
+            if (recovery.Spaces.isPersistentCongestion(resolution.lost, resolution.acked, duration)) {
+                self.congestion.onPersistentCongestion();
+            }
+        }
+    }
+
     fn mapStreamError(self: *Connection, result: streams_mod.Error!void) Error!void {
         _ = self;
         result catch |err| return switch (err) {
@@ -890,6 +1142,9 @@ pub const Connection = struct {
         };
 
         self.peer_parameters = peer;
+        // §5.3 caps the peer's claimed ack_delay at this once the handshake is
+        // confirmed; taking it from the *authenticated* parameters is the point.
+        self.rtt.max_ack_delay = peer.max_ack_delay_ms *| std.time.ns_per_ms;
         self.local.setPeerLimit(peer.active_connection_id_limit);
         // §7.4: the peer's limits only exist once the handshake authenticated
         // them. Applying them earlier would mean trusting unauthenticated numbers
@@ -899,13 +1154,18 @@ pub const Connection = struct {
         try self.events.append(gpa, .{ .established = .{ .alpn = self.engine.alpn() } });
     }
 
-    fn discardHandshakeKeys(self: *Connection) void {
+    fn discardHandshakeKeys(self: *Connection, gpa: Allocator) void {
         // §4.9 of RFC 9001: once the handshake is confirmed these keys must go,
         // so that a packet protected with them can no longer be processed.
         for ([_]Level{ .initial, .handshake }) |level| {
             const sp = self.spaceFor(level);
             sp.send = null;
             sp.recv = null;
+            // RFC 9001 §4.9: the space's recovery state goes with its keys.
+            // Keeping it would arm a PTO for packets that can never be
+            // acknowledged now, and the probe it sent could not be protected.
+            self.loss.discard(gpa, recoverySpace(level));
+            self.sent_meta[@backingInt(level)].clearAndFree(gpa);
         }
     }
 
@@ -914,7 +1174,6 @@ pub const Connection = struct {
     /// Fill `dest` with the next datagram to send, returning its length, or zero
     /// if there is nothing to send.
     pub fn send(self: *Connection, gpa: Allocator, dest: []u8) !usize {
-        _ = gpa;
         if (self.closed) return 0;
         if (dest.len < min_initial_datagram) return error.BufferTooSmall;
 
@@ -940,7 +1199,7 @@ pub const Connection = struct {
         for ([_]Level{ .initial, .handshake, .one_rtt }) |level| {
             if (!wants[@backingInt(level)]) continue;
             const pad_to: usize = if (level == final and needs_padding) min_initial_datagram else 0;
-            len += try self.writePacket(dest[len..limit], level, pad_to -| len);
+            len += try self.writePacket(gpa, dest[len..limit], level, pad_to -| len);
         }
 
         assert(len <= limit);
@@ -957,6 +1216,7 @@ pub const Connection = struct {
         if (pending.len > sp.crypto_sent) return true;
 
         if (sp.ack_pending) return true;
+        if (self.probe_pending[@backingInt(level)]) return true;
 
         // A CONNECTION_CLOSE goes at the highest level we have keys for, since
         // that is the one the peer is most likely able to read.
@@ -966,7 +1226,13 @@ pub const Connection = struct {
         if (level == .one_rtt and self.remote.pendingRetire().len > 0) return true;
 
         if (level == .one_rtt and self.established) {
-            if (self.pending_stream_data) return true;
+            // Stream data is the one thing the congestion window gates (§7):
+            // acknowledgements, credit and probes must still flow when the
+            // window is full, or the very acknowledgements that would reopen it
+            // are blocked behind it.
+            if (self.pending_stream_data and self.congestion.available() > 0) return true;
+            if (self.rearm_max_data or self.rearm_max_streams[0] or
+                self.rearm_max_streams[1] or self.credit_rearm.items.len > 0) return true;
             if (self.streams.maxDataUpdate() != null) return true;
             if (self.streams.maxStreamsUpdate(true) != null) return true;
             if (self.streams.maxStreamsUpdate(false) != null) return true;
@@ -1005,6 +1271,7 @@ pub const Connection = struct {
 
     fn writePacket(
         self: *Connection,
+        gpa: Allocator,
         dest: []u8,
         level: Level,
         pad_to: usize,
@@ -1063,12 +1330,14 @@ pub const Connection = struct {
         if (cursor + crypto.tag_len >= dest.len) return error.BufferTooSmall;
         const payload_room = dest.len - cursor - crypto.tag_len;
         var payload: [max_datagram]u8 = undefined;
+        var meta: SentMeta = .{ .number = pn };
         const payload_len = self.writeFrames(
             payload[0..@min(payload_room, payload.len)],
             level,
             // Padding is expressed in terms of the finished datagram, so work
             // back through this packet's own overhead.
             if (pad_to > cursor + crypto.tag_len) pad_to - cursor - crypto.tag_len else 0,
+            &meta,
         );
         if (payload_len == 0) return 0;
 
@@ -1092,6 +1361,23 @@ pub const Connection = struct {
 
         sp.next_pn += 1;
         sp.ack_pending = false;
+
+        // Hand the packet to loss recovery and the congestion controller.
+        // §2: in-flight means ack-eliciting or padded — a pure-ACK packet is
+        // neither counted against the window nor ever probed for.
+        const record: recovery.Sent = .{
+            .number = pn,
+            .time_sent = self.now_ns,
+            .size = total,
+            .ack_eliciting = meta.ack_eliciting,
+            .in_flight = meta.ack_eliciting or pad_to > 0,
+        };
+        try self.loss.onSent(gpa, recoverySpace(level), record);
+        self.congestion.onSent(record);
+        if (meta.worthKeeping()) {
+            try self.sent_meta[@backingInt(level)].append(gpa, meta);
+        }
+
         if (self.pending_close != null and self.highestSendLevel() == level) {
             self.closed = true;
             self.pending_close = null;
@@ -1104,31 +1390,63 @@ pub const Connection = struct {
         dest: []u8,
         level: Level,
         pad_to: usize,
+        meta: *SentMeta,
     ) usize {
         const sp = self.spaceFor(level);
         var len: usize = 0;
 
         // ACK first: it is the smallest useful thing in the packet, and putting
         // it ahead of CRYPTO means a packet that has to be truncated still
-        // acknowledges. Only a single range is produced — the full range set
-        // belongs with loss recovery, and reporting one range is correct but
-        // pessimistic rather than wrong.
+        // acknowledges. Every received range is reported, not just the largest —
+        // reporting less makes the peer retransmit what arrived (§13.2.3).
         if (sp.ack_pending) {
-            if (sp.largest_received) |largest| {
-                // A single range. The full range set belongs with loss recovery;
-                // acknowledging only the largest is pessimistic — it makes the
-                // peer retransmit what it need not have — but never wrong, and
-                // being explicit about that beats a half-built range tracker.
+            if (sp.received.largest() != null) {
+                const ranges = sp.received.slice();
+                const first = ranges[0];
+
+                // The additional ranges, encoded through `gapTo` — `descend`'s
+                // inverse, so the arithmetic that built the set is the same
+                // arithmetic that serializes it.
+                var extra: [recovery.max_ack_ranges * 16]u8 = undefined;
+                var extra_len: usize = 0;
+                var previous_smallest = first.smallest;
+                for (ranges[1..]) |range| {
+                    extra_len += varint.encode(
+                        extra[extra_len..],
+                        frame.Ack.gapTo(previous_smallest, range.largest),
+                    );
+                    extra_len += varint.encode(extra[extra_len..], range.largest - range.smallest);
+                    previous_smallest = range.smallest;
+                }
+
+                // §13.2.5: how long the largest packet sat here unacknowledged,
+                // in microseconds scaled down by our own ack_delay_exponent.
+                const held_ns = self.now_ns - @min(sp.largest_received_at, self.now_ns);
+                const delay = (held_ns / std.time.ns_per_us) >>
+                    @intCast(@min(self.parameters.ack_delay_exponent, 20));
+
                 const f: frame.Frame = .{ .ack = .{
-                    .largest = largest,
-                    .delay = 0,
-                    .first_range = 0,
-                    .range_count = 0,
-                    .ranges = &.{},
+                    .largest = first.largest,
+                    .delay = delay,
+                    .first_range = first.largest - first.smallest,
+                    .range_count = ranges.len - 1,
+                    .ranges = extra[0..extra_len],
                     .ecn = null,
                 } };
                 const need = frame.encodedLen(f);
                 if (len + need <= dest.len) len += frame.encode(dest[len..], f);
+            }
+        }
+
+        // A probe (§6.2.4). PING is the cheapest ack-eliciting frame; anything
+        // else ack-eliciting in this packet would also do, but a guaranteed one
+        // beats hoping.
+        if (self.probe_pending[@backingInt(level)]) {
+            const f: frame.Frame = .ping;
+            if (len + frame.encodedLen(f) <= dest.len) {
+                len += frame.encode(dest[len..], f);
+                self.probe_pending[@backingInt(level)] = false;
+                meta.ack_eliciting = true;
             }
         }
 
@@ -1161,25 +1479,43 @@ pub const Connection = struct {
                     .data = available[0..take],
                 } };
                 len += frame.encode(dest[len..], f);
+                meta.crypto_offset = offset;
+                meta.crypto_len = take;
+                meta.ack_eliciting = true;
                 sp.crypto_sent += take;
             }
         }
 
         if (level == .one_rtt and self.established) {
-            len += self.writeStreamFrames(dest[len..]);
+            len += self.writeStreamFrames(dest[len..], meta);
         }
 
         if (level == .one_rtt) {
             const owed = self.remote.pendingRetire();
             var sent: usize = 0;
             for (owed) |sequence| {
+                if (meta.retire_count == meta.retires.len) break;
                 const f: frame.Frame = .{ .retire_connection_id = sequence };
                 const need = frame.encodedLen(f);
                 if (len + need > dest.len) break;
                 len += frame.encode(dest[len..], f);
+                meta.retires[meta.retire_count] = sequence;
+                meta.retire_count += 1;
+                meta.ack_eliciting = true;
                 sent += 1;
             }
             if (sent > 0) self.remote.clearPendingRetire(sent);
+        }
+
+        // RFC 9001 §5.4.2: header protection samples 16 bytes starting four
+        // bytes past the start of the packet number, so everything from there —
+        // packet number, payload, tag — must reach 20 bytes. The tag gives 16
+        // and the number at least one; a payload under four (a lone PING probe)
+        // leaves the sampler reading past the packet, which `sampleFor` asserts
+        // against rather than silently protecting with someone else's bytes.
+        if (len > 0 and len < 4) {
+            const want = 4 - len;
+            len += frame.encode(dest[len..], .{ .padding = want });
         }
 
         // §14.1's padding, and §19.1's frame for it.
@@ -1202,14 +1538,65 @@ pub const Connection = struct {
     /// loses its place to stream data is a window that does not open, and the sender
     /// it was meant to unblock waits a round trip for the next chance. Stream data,
     /// by contrast, is never lost by being deferred — there is always another packet.
-    fn writeStreamFrames(self: *Connection, dest: []u8) usize {
+    fn writeStreamFrames(self: *Connection, dest: []u8, meta: *SentMeta) usize {
         var len: usize = 0;
+
+        // Re-armed credit: a packet carrying these frames was lost, and §13.3
+        // says resend the information — the *current* value, not the lost one,
+        // which may be stale by now.
+        if (self.rearm_max_data) {
+            const f: frame.Frame = .{ .max_data = self.streams.recv_max_data };
+            if (len + frame.encodedLen(f) <= dest.len) {
+                len += frame.encode(dest[len..], f);
+                self.rearm_max_data = false;
+                meta.carried_max_data = true;
+                meta.ack_eliciting = true;
+            }
+        }
+        for (0..2) |i| {
+            if (!self.rearm_max_streams[i]) continue;
+            const bidirectional = i == 0;
+            const limit = self.streams.local_max_streams[i];
+            const f: frame.Frame = if (bidirectional)
+                .{ .max_streams_bidi = limit }
+            else
+                .{ .max_streams_uni = limit };
+            if (len + frame.encodedLen(f) <= dest.len) {
+                len += frame.encode(dest[len..], f);
+                self.rearm_max_streams[i] = false;
+                meta.carried_max_streams[i] = true;
+                meta.ack_eliciting = true;
+            }
+        }
+        while (self.credit_rearm.items.len > 0 and meta.credit_count < meta.credits.len) {
+            const id = self.credit_rearm.items[self.credit_rearm.items.len - 1];
+            const current: ?u64 = blk: {
+                const stream = self.streams.get(.init(id)) orelse break :blk null;
+                const recv = &(stream.recv orelse break :blk null);
+                if (recv.state != .recv) break :blk null;
+                break :blk recv.max_data;
+            };
+            const limit = current orelse {
+                // The stream is gone or past needing credit; the frame with it.
+                _ = self.credit_rearm.pop();
+                continue;
+            };
+            const f: frame.Frame = .{ .max_stream_data = .{ .id = id, .limit = limit } };
+            if (len + frame.encodedLen(f) > dest.len) break;
+            len += frame.encode(dest[len..], f);
+            _ = self.credit_rearm.pop();
+            meta.credits[meta.credit_count] = id;
+            meta.credit_count += 1;
+            meta.ack_eliciting = true;
+        }
 
         if (self.streams.maxDataUpdate()) |limit| {
             const f: frame.Frame = .{ .max_data = limit };
             if (len + frame.encodedLen(f) <= dest.len) {
                 len += frame.encode(dest[len..], f);
                 self.streams.applyMaxDataSent(limit);
+                meta.carried_max_data = true;
+                meta.ack_eliciting = true;
             }
         }
 
@@ -1222,15 +1609,21 @@ pub const Connection = struct {
                 if (len + frame.encodedLen(f) <= dest.len) {
                     len += frame.encode(dest[len..], f);
                     self.streams.applyMaxStreamsSent(bidirectional, limit);
+                    meta.carried_max_streams[if (bidirectional) 0 else 1] = true;
+                    meta.ack_eliciting = true;
                 }
             }
         }
 
         while (self.creditOwed()) |owed| {
+            if (meta.credit_count == meta.credits.len) break;
             const f: frame.Frame = .{ .max_stream_data = .{ .id = owed.id, .limit = owed.limit } };
             if (len + frame.encodedLen(f) > dest.len) break;
             len += frame.encode(dest[len..], f);
             self.streams.get(.init(owed.id)).?.recv.?.applyCredit(owed.limit);
+            meta.credits[meta.credit_count] = owed.id;
+            meta.credit_count += 1;
+            meta.ack_eliciting = true;
         }
 
         // §19.4: a reset replaces any data still queued, so it goes out before we
@@ -1246,9 +1639,13 @@ pub const Connection = struct {
                 .error_code = sender.reset_code.?,
                 .final_size = sender.written,
             } };
+            if (meta.reset_count == meta.resets.len) break;
             if (len + frame.encodedLen(f) > dest.len) break;
             len += frame.encode(dest[len..], f);
             sender.fin_sent = true;
+            meta.resets[meta.reset_count] = entry.key_ptr.*;
+            meta.reset_count += 1;
+            meta.ack_eliciting = true;
         }
 
         // Stream data, round robin: one frame per stream per pass, which is the rule
@@ -1268,7 +1665,12 @@ pub const Connection = struct {
         }
         var visited: usize = 0;
         const total = self.streams.map.count();
+        // §7: stream data is what the congestion window gates. The budget is
+        // consulted as the packet fills so a partial window still sends a
+        // partial packet.
+        var budget: usize = @intCast(@min(self.congestion.available(), @as(u64, dest.len)));
         while (visited < total) : (visited += 1) {
+            if (meta.stream_count == meta.streams.len) break;
             const id_value = self.nextSendable() orelse break;
             const s = self.streams.get(.init(id_value)).?;
             const sender = &s.send.?;
@@ -1287,12 +1689,13 @@ pub const Connection = struct {
             // stream wanting less than its share leaves the rest to the others,
             // because the divisor is recomputed as the packet fills.
             const share = @max(room / @max(self.countSendable(), 1), 1);
-            const take: usize = @intCast(@min(@min(room, share), outstanding));
-            if (take == 0 and !fin_pending) break;
+            const take: usize = @intCast(@min(@min(@min(room, share), outstanding), @as(u64, budget)));
+            if (take == 0 and !(fin_pending and outstanding == 0)) break;
 
+            const offset = sender.sent;
             const f: frame.Frame = .{ .stream = .{
                 .id = id_value,
-                .offset = sender.sent,
+                .offset = offset,
                 .data = sender.unsent()[0..take],
                 .fin = fin_pending and take == outstanding,
                 .had_length = true,
@@ -1300,6 +1703,15 @@ pub const Connection = struct {
             if (len + frame.encodedLen(f) > dest.len) break;
             len += frame.encode(dest[len..], f);
             sender.markSent(take, f.stream.fin);
+            budget -= take;
+            meta.streams[meta.stream_count] = .{
+                .id = id_value,
+                .offset = offset,
+                .len = take,
+                .fin = f.stream.fin,
+            };
+            meta.stream_count += 1;
+            meta.ack_eliciting = true;
             progressed = true;
         }
 
@@ -1888,7 +2300,7 @@ test "connection: an undecryptable packet is dropped, never fatal" {
     try testing.expect(!conn.isEstablished());
     // Nothing was learned from it, which is the part that matters: state changed
     // by an unauthenticated packet is state an attacker controls.
-    try testing.expect(conn.spaceFor(.initial).largest_received == null);
+    try testing.expect(conn.spaceFor(.initial).received.largest() == null);
 }
 
 test "connection: a stateless reset ends the connection without a protocol error" {
@@ -2039,9 +2451,9 @@ test "connection: §14.1 pads a datagram containing an Initial, and nothing else
     // §14.1 that an implementation padding unconditionally would get wrong, and
     // it would only ever show up as wasted bandwidth — never as a failure.
     conn.handshake_confirmed = true;
-    conn.discardHandshakeKeys();
+    conn.discardHandshakeKeys(gpa);
     conn.spaceFor(.one_rtt).ack_pending = true;
-    conn.spaceFor(.one_rtt).largest_received = 0;
+    conn.spaceFor(.one_rtt).received.add(0);
     const third = try conn.send(gpa, &out);
     try testing.expect(third > 0);
     try testing.expect(third < min_initial_datagram);
@@ -2149,7 +2561,7 @@ test "connection: §7.2 discards a later Initial that changes the source connect
     // sent them. The packet is genuinely encrypted with the right Initial keys,
     // because those are derivable by anyone who saw the handshake, which is
     // exactly why this check cannot rely on decryption failing.
-    const before = conn.spaceFor(.initial).largest_received;
+    const before = conn.spaceFor(.initial).received.largest();
     var impostor: PacketServer = .init(0x5d, initial_dcid, cid(&.{ 0xff, 0xfe }));
     defer impostor.deinit(gpa);
     impostor.next_pn[0] = 99;
@@ -2157,7 +2569,7 @@ test "connection: §7.2 discards a later Initial that changes the source connect
     const second_len = try impostor.writeLongPacket(&second_buf, .initial, client_cid, "junk");
     try conn.receive(gpa, second_buf[0..second_len]);
 
-    try testing.expectEqual(before, conn.spaceFor(.initial).largest_received);
+    try testing.expectEqual(before, conn.spaceFor(.initial).received.largest());
     try testing.expect(conn.remote.active().eql(&server_cid));
 
     // The same packet with the *right* source connection ID is processed, which
@@ -2168,7 +2580,7 @@ test "connection: §7.2 discards a later Initial that changes the source connect
     honest.next_pn[0] = 99;
     const third_len = try honest.writeLongPacket(&second_buf, .initial, client_cid, "junk");
     try conn.receive(gpa, second_buf[0..third_len]);
-    try testing.expectEqual(@as(?u64, 99), conn.spaceFor(.initial).largest_received);
+    try testing.expectEqual(@as(?u64, 99), conn.spaceFor(.initial).received.largest());
 }
 
 test "connection: a server's Initial carrying a token is discarded" {
@@ -2198,7 +2610,7 @@ test "connection: a server's Initial carrying a token is discarded" {
     try conn.receive(gpa, buf[0..len]);
 
     // Dropped before it could teach us anything.
-    try testing.expect(conn.spaceFor(.initial).largest_received == null);
+    try testing.expect(conn.spaceFor(.initial).received.largest() == null);
     try testing.expect(!conn.server_initial_seen);
 }
 
@@ -2846,4 +3258,217 @@ test "connection: credit frames keep their place when the packet is full" {
     try testing.expect(stream_bytes > 1000);
     // The packet really was full: there is more to send.
     try testing.expect(conn.pending_stream_data);
+}
+
+test "connection: the ACK reports every received range, and a duplicate packet is discarded" {
+    // Two properties of one structure. The packet numbers received are kept as
+    // ranges, and the ACK frame reports all of them — reporting only the largest
+    // makes the peer retransmit everything in the gap, which after loss recovery
+    // exists is no longer merely pessimistic but wrong. And §12.3's duplicate
+    // discard consults the same set, so the two can never disagree about what
+    // has been processed.
+    const gpa = testing.allocator;
+
+    const client_cid = cid(&.{ 0xc0, 0xc1, 0xc2 });
+    const server_cid = cid(&.{ 0x50, 0x51 });
+    const initial_dcid = cid(&.{ 0x11, 0x21, 0x31, 0x41, 0x51, 0x61, 0x71, 0x81 });
+
+    var conn = try Connection.initClient(testOptions(client_cid, initial_dcid), @splat(0x71));
+    defer conn.deinit(gpa);
+    try conn.start(gpa);
+
+    var server_params: transport.Parameters = .{
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 64 * 1024,
+        .initial_max_streams_bidi = 4,
+    };
+    var peer = try establish(gpa, &conn, client_cid, server_cid, initial_dcid, &server_params);
+    defer peer.deinit(gpa);
+
+    // Two PINGs with a packet number missing between them.
+    var ping_frame: [4]u8 = undefined;
+    const ping_len = frame.encode(&ping_frame, .ping);
+    var first_buf: [256]u8 = undefined;
+    const first_len = try peer.seal(&first_buf, client_cid, ping_frame[0..ping_len]);
+    try conn.receive(gpa, first_buf[0..first_len]);
+
+    peer.next_pn += 1; // the hole
+    var second_buf: [256]u8 = undefined;
+    const second_len = try peer.seal(&second_buf, client_cid, ping_frame[0..ping_len]);
+    try conn.receive(gpa, second_buf[0..second_len]);
+
+    const sp = conn.spaceFor(.one_rtt);
+    try testing.expectEqual(@as(usize, 2), sp.received.slice().len);
+
+    // The client's ACK carries both ranges.
+    var out: [max_datagram]u8 = undefined;
+    const len = try conn.send(gpa, &out);
+    try testing.expect(len > 0);
+    var plain: [max_datagram]u8 = undefined;
+    var rest = try peer.open(&plain, out[0..len]);
+    var saw_ack: ?frame.Ack = null;
+    while (rest.len > 0) {
+        switch (try frame.parse(&rest)) {
+            .ack => |ack| saw_ack = ack,
+            else => {},
+        }
+    }
+    const ack = saw_ack.?;
+    try testing.expectEqual(@as(u64, 1), ack.range_count);
+    const high = ack.first();
+    try testing.expectEqual(sp.received.slice()[0].largest, high.largest);
+    var it = ack.iterator();
+    const low = it.next().?;
+    try testing.expectEqual(sp.received.slice()[1].largest, low.largest);
+    // And the hole is not covered: acknowledging a packet never received is how
+    // a sender is convinced its loss never happened.
+    try testing.expect(!ack.covers(high.largest - 1));
+
+    // §12.3: the same datagram again — same packet number — is discarded
+    // before its frames are seen. The observable consequence is what matters:
+    // an undiscarded duplicate re-arms `ack_pending`, so a replayed packet
+    // provokes a fresh ACK — and an attacker replaying one captured packet
+    // turns the connection into a packet generator. Discarded, there is
+    // nothing to say.
+    try conn.receive(gpa, second_buf[0..second_len]);
+    try testing.expectEqual(@as(usize, 2), sp.received.slice().len);
+    try testing.expectEqual(@as(usize, 0), try conn.send(gpa, &out));
+}
+
+test "connection: lost stream data is retransmitted at its original offset" {
+    // §6.1.1 end to end: four packets of stream data, an ACK that covers only
+    // the newest, and the oldest — three below it — is declared lost. What goes
+    // out again is the *information* (§13.3): a STREAM frame at the original
+    // offset, rebuilt from the send queue, not a copy of the lost packet.
+    const gpa = testing.allocator;
+
+    const client_cid = cid(&.{ 0xc3, 0xc4, 0xc5 });
+    const server_cid = cid(&.{ 0x52, 0x53 });
+    const initial_dcid = cid(&.{ 0x12, 0x22, 0x32, 0x42, 0x52, 0x62, 0x72, 0x82 });
+
+    var conn = try Connection.initClient(testOptions(client_cid, initial_dcid), @splat(0x72));
+    defer conn.deinit(gpa);
+    try conn.start(gpa);
+
+    var server_params: transport.Parameters = .{
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 64 * 1024,
+        .initial_max_streams_bidi = 4,
+    };
+    var peer = try establish(gpa, &conn, client_cid, server_cid, initial_dcid, &server_params);
+    defer peer.deinit(gpa);
+
+    const id = try conn.openStream(gpa, true);
+    const first_pn = conn.spaceFor(.one_rtt).next_pn;
+
+    // Four packets, four bytes of stream data each.
+    var out: [max_datagram]u8 = undefined;
+    for ([_][]const u8{ "aaaa", "bbbb", "cccc", "dddd" }) |chunk| {
+        try testing.expectEqual(chunk.len, try conn.write(gpa, id, chunk));
+        try testing.expect(try conn.send(gpa, &out) > 0);
+    }
+    try testing.expectEqual(first_pn + 4, conn.spaceFor(.one_rtt).next_pn);
+
+    // The server acknowledges only the newest. first_pn is exactly
+    // packet_threshold below it, so it alone crosses §6.1.1's line; the two
+    // between stay outstanding.
+    var frames: [64]u8 = undefined;
+    const frames_len = frame.encode(&frames, .{ .ack = .{
+        .largest = first_pn + 3,
+        .delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges = &.{},
+        .ecn = null,
+    } });
+    var packet_buf: [256]u8 = undefined;
+    const packet_len = try peer.seal(&packet_buf, client_cid, frames[0..frames_len]);
+    try conn.receive(gpa, packet_buf[0..packet_len]);
+
+    // The acknowledgement produced an RTT sample...
+    try testing.expect(conn.rtt.smoothed != null);
+
+    // ...and the loss produced a retransmission, from the very start of what
+    // the peer never confirmed.
+    const resend_len = try conn.send(gpa, &out);
+    try testing.expect(resend_len > 0);
+    var plain: [max_datagram]u8 = undefined;
+    var rest = try peer.open(&plain, out[0..resend_len]);
+    var saw: ?frame.Stream = null;
+    while (rest.len > 0) {
+        switch (try frame.parse(&rest)) {
+            .stream => |sf| saw = sf,
+            else => {},
+        }
+    }
+    const sf = saw.?;
+    try testing.expectEqual(@as(u64, 0), sf.offset);
+    try testing.expectEqualStrings("aaaa", sf.data[0..4]);
+}
+
+test "connection: a probe timeout sends a PING rather than going silent" {
+    // §6.2 and §8.1 together. With something ack-eliciting outstanding a timer
+    // is armed; when it fires with no loss to declare, the next packet carries
+    // a PING. For a client this is an obligation, not an optimisation: a server
+    // that has not validated the address may send at most three times what it
+    // received (§8.1), so a client that goes silent after loss leaves both
+    // sides waiting for the other — a deadlock that presents as a hung
+    // connection on exactly the networks that lose packets.
+    const gpa = testing.allocator;
+
+    const client_cid = cid(&.{ 0xc6, 0xc7, 0xc8 });
+    const server_cid = cid(&.{ 0x54, 0x55 });
+    const initial_dcid = cid(&.{ 0x13, 0x23, 0x33, 0x43, 0x53, 0x63, 0x73, 0x83 });
+
+    var conn = try Connection.initClient(testOptions(client_cid, initial_dcid), @splat(0x73));
+    defer conn.deinit(gpa);
+    try conn.start(gpa);
+
+    var server_params: transport.Parameters = .{
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 64 * 1024,
+        .initial_max_streams_bidi = 4,
+    };
+    var peer = try establish(gpa, &conn, client_cid, server_cid, initial_dcid, &server_params);
+    defer peer.deinit(gpa);
+
+    // Confirm the handshake so only the application space is in play; the
+    // fixture never acknowledges, and handshake packets left outstanding would
+    // arm their own timers.
+    conn.handshake_confirmed = true;
+    conn.discardHandshakeKeys(gpa);
+
+    // Nothing ack-eliciting outstanding in the application space: no timer.
+    // An idle connection that probes forever is traffic the application never
+    // asked for, and a NAT binding kept alive by accident.
+    try testing.expect(conn.nextTimeout() == null);
+
+    const id = try conn.openStream(gpa, true);
+    _ = try conn.write(gpa, id, "hello");
+    var out: [max_datagram]u8 = undefined;
+    try testing.expect(try conn.send(gpa, &out) > 0);
+
+    const deadline = conn.nextTimeout().?;
+    try testing.expect(deadline > 0);
+
+    // The timer fires with nothing acknowledged: a probe, not a loss.
+    try conn.onTimeout(gpa, deadline);
+    const probe_len = try conn.send(gpa, &out);
+    try testing.expect(probe_len > 0);
+
+    var plain: [max_datagram]u8 = undefined;
+    var rest = try peer.open(&plain, out[0..probe_len]);
+    var saw_ping = false;
+    while (rest.len > 0) {
+        switch (try frame.parse(&rest)) {
+            .ping => saw_ping = true,
+            else => {},
+        }
+    }
+    try testing.expect(saw_ping);
+
+    // §6.2: the next deadline backs off, because the first probe may itself
+    // have been lost and probing at a fixed cadence floods a congested path.
+    const next_deadline = conn.nextTimeout().?;
+    try testing.expect(next_deadline > deadline);
 }
