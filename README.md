@@ -32,23 +32,30 @@ try server.serve();
 ## Status
 
 Working and tested: the core framework, framing codecs, HTTP/1.1 and WebSocket in
-both directions with `permessage-deflate`, **HTTP/2** over cleartext, **HTTP/3 over
-QUIC** on the client side — with the QUIC transport written here, because Netty binds
-Quiche and the zero-dependency rule forbids that; see [HTTP3.md](HTTP3.md) — Redis
-RESP2/RESP3, datagram (UDP) endpoints, and TLS 1.3 client connections. 609 tests
-pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast, all under a
-leak-checking allocator, plus twenty-one fuzz targets. The same suite also runs **on fibers** rather than threads —
-see [Choosing an `Io`](#choosing-an-io). Every protocol is checked against
-other people's code, not only its own counterpart: the HTTP server against
-`curl`, the HTTP client against Python's `http.server`, the WebSocket client *and*
-server against the third-party `websockets` library, the RESP server against
-`redis-py`, the UDP endpoint against Python's `socket` and `nc -u`, the TLS client
-against OpenSSL's `s_server`, the HTTP/2 server against `curl` with `nghttp2`
-underneath it — multiplexed, and with 300 KiB crossing the flow-control window in
-both directions — and the HTTP/3 client against `aioquic`, which also means the QUIC
-transport, the self-written TLS 1.3 handshake and QPACK all interoperate with an
-implementation sharing none of their code. The QUIC packet protection and key
-schedule are additionally verified byte for byte against the published vectors of
+both directions with `permessage-deflate`, **HTTP/2** over cleartext *and over TLS*,
+**HTTP/3 over QUIC** in both directions — with the QUIC transport and the TLS 1.3
+handshake written here, because Netty binds Quiche and the standard library has no
+TLS server; see [HTTP3.md](HTTP3.md) and [TLS.md](TLS.md) — Redis RESP2/RESP3,
+datagram (UDP) endpoints, a DNS resolver, TLS 1.3 on both sides of a connection, a
+bounded client connection pool, and `EmbeddedChannel` for testing pipelines without
+sockets. 712 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
+all under a leak-checking allocator, plus twenty-one fuzz targets. The same suite
+also runs **on fibers** rather than threads — see [Choosing an `Io`](#choosing-an-io).
+
+Every protocol is checked against other people's code, not only its own
+counterpart: the HTTP server against `curl`, the HTTP client against Python's
+`http.server`, the WebSocket client *and* server against the third-party
+`websockets` library, the RESP server against `redis-py`, the UDP endpoint against
+Python's `socket` and `nc -u`, the DNS resolver against `dig` — address for
+address — the TLS client against OpenSSL's `s_server` and the TLS *server* against
+`openssl s_client` and `curl`, the HTTP/2 server against `curl` with `nghttp2`
+underneath it (multiplexed, with 300 KiB crossing the flow-control window in both
+directions, over cleartext and over TLS with `h2` negotiated by ALPN), and HTTP/3
+against `aioquic` in **both** directions — our client against its server and its
+client against our server, which also means the QUIC transport, the self-written
+TLS 1.3 handshake and QPACK all interoperate with an implementation sharing none of
+their code. The QUIC packet protection, the TLS 1.3 key schedule and the record
+layer are additionally verified byte for byte against the published vectors of
 RFC 9001 Appendix A and RFC 8448.
 
 Those cross-implementation checks run in CI, not only by hand, and they keep
@@ -57,28 +64,33 @@ and later four HTTP/2 defects that had each passed the entire test suite first. 
 review's findings and every defect it, the fuzzer and cross-implementation testing
 turned up are written down in [REVIEW.md](REVIEW.md).
 
-Not done: TLS on the server side, which needs a `std.crypto.tls.Server` that does
-not exist. And `h2` **over TLS** — not the protocol, which works, but the one way
-of announcing it: RFC 9113 §3.1 identifies `h2` by ALPN, and
-`std.crypto.tls.Client` cannot send it. Cleartext HTTP/2 with prior knowledge is
-what gRPC between services and a reverse proxy to a backend use, and that works
-today. [HTTP2.md](HTTP2.md) is the implementation record, including the one
-framework decision it forced.
+Not done: TLS 1.2 (a peer that cannot do 1.3 is refused), session resumption and
+0-RTT, client certificates, QUIC connection migration and stateless reset. Each is
+listed with its reason in [TLS.md](TLS.md) and [HTTP3.md](HTTP3.md) rather than
+left to be discovered. [HTTP2.md](HTTP2.md) is the HTTP/2 implementation record,
+including the one framework decision it forced.
 
 ### Blocked upstream
 
-Four things are absent or reduced because the standard library does not yet
-provide what they need. They are listed separately from the design choices below on purpose:
-these would be built tomorrow if the pieces existed, and each is stated with the
-specific thing that is missing so the claim can be checked rather than taken on
-trust.
+Two things remain absent or reduced because the standard library does not yet
+provide what they need. They are listed separately from the design choices below on
+purpose: these would be built tomorrow if the pieces existed, and each is stated
+with the specific thing that is missing so the claim can be checked rather than
+taken on trust.
+
+Three rows used to be here and are gone, because the missing pieces were written
+rather than waited for: TLS on the server side, a QUIC and HTTP/3 server, and
+announcing `h2` by ALPN. All three needed the TLS 1.3 handshake, which QUIC needed
+first — so implementing it stopped being a choice and became a prerequisite. The
+record is in [TLS.md](TLS.md). One reduction survives from that row and is worth
+keeping in view: **a TLS server here can present ECDSA P-256 or Ed25519
+certificates but not RSA ones**, because `std.crypto.Certificate.rsa` can verify
+RSA signatures but not produce them, and a TLS 1.3 server signs on every
+handshake.
 
 | Wanted | What is missing | Where that is visible |
 |---|---|---|
 | `remoteAddress()` on a stream | `getpeername` | `std.Io` 0.17 exposes no such operation. Datagrams have the address anyway, because `recvmsg` reports it per message. |
-| TLS on the server side | `std.crypto.tls.Server` | `std/crypto/tls/` contains `Client.zig` and nothing else. Accepting a connection would mean hand-rolling certificate loading, `CertificateVerify` signing and session tickets. |
-| A QUIC (and HTTP/3) server | RSA signing, or settling for ECDSA/Ed25519 certificates | `std.crypto.Certificate.rsa` can verify signatures but not produce them, and a TLS 1.3 server signs a `CertificateVerify` on every handshake. Ed25519 and ECDSA can sign, so a server limited to those certificate types is buildable; one serving the RSA certificates most CAs still issue is not. The client half is done — see [HTTP3.md](HTTP3.md). |
-| Announcing `h2` over TLS | ALPN in the TLS client | `tls.Client.Options` has no ALPN field, and the `ClientHello` is built from five extensions of which ALPN is not one. RFC 9113 §3.1 identifies `h2` by ALPN, so every conforming server answers HTTP/1.1. The protocol itself is implemented and reachable over cleartext; only this negotiation is missing. See [HTTP2.md](HTTP2.md). |
 | An evented `Io` *in the standard library* | a backend that can listen, accept and connect | the table below. In 0.17-dev those three are stubs on every platform. A third-party one works today; see [Choosing an `Io`](#choosing-an-io) |
 
 The evented case deserves its own detail, because Zinet takes its `Io` as a
@@ -239,13 +251,21 @@ graph TB
 | `WebSocketServerProtocolHandler` | `websocket.Handshaker` | |
 | `WebSocketClientProtocolHandler` | `websocket.ClientHandshaker` | Sends the upgrade, verifies `Sec-WebSocket-Accept` |
 | `PerMessageDeflateHandler` | `permessage_deflate` | Negotiated by the handshakers; off by default |
-| `SslHandler` (client) | `tls.Connection` | Sits *under* the pipeline, not in it |
+| `SslHandler` (client) | `tls.Connection` | Sits *under* the pipeline, not in it; wraps `std.crypto.tls.Client` |
 | `SslContext` | `tls.CaBundle` | Load once, share across connections |
+| `SslHandler` (server) | `tls13.server.Server` | There is no `std.crypto.tls.Server`, so the handshake is implemented here; see [TLS.md](TLS.md) |
+| — | `tls13.client.Client` | The self-written engine on the client side, which is what can send ALPN |
+| — | `tls13.identity.Identity` | A server's certificate chain and signing key, from PEM |
 | `RedisDecoder` / `RedisEncoder` | `redis.Decoder` / `redis.Encoder` | RESP2 and RESP3, both directions |
 | `RedisArrayAggregator` | — | `redis.Decoder` delivers whole nested values, so there is nothing left to aggregate |
 | `DatagramChannel` | `datagram.DatagramChannel` | One socket, one pipeline, every message addressed |
 | `DatagramPacket` | `datagram.Datagram` | Owns its payload, because it crosses a queue rather than being serialized in place |
 | `Bootstrap` for UDP | `datagram.Endpoint.open` | No acceptor and no loop group: a datagram endpoint is one socket |
+| `FixedChannelPool` | `ChannelPool` | Bounded, health-checked; the pool holds the references so callers never touch `retain` |
+| `EmbeddedChannel` | `EmbeddedChannel` | Drives a pipeline with no socket; keeps outbound *messages*, not only bytes |
+| `DnsNameResolver` | `dns.resolver.Resolver` | RFC 1035 over a datagram socket, since `std.Io` has no resolver |
+| `DnsQuery` / `DnsResponse` | `dns.Message` | Names decompressed into owned storage, pointers bounded and backwards-only |
+| `QuicServerCodecBuilder` (incubator) | `quic.acceptor` + `http3.server.Server` | Retry, address-validation tokens and Version Negotiation, then many connections on one socket |
 
 ### Time
 
@@ -589,6 +609,18 @@ zig build run-redis-server -- 6380      # redis-cli -p 6380 set k v
 zig build run-udp-echo     -- 9000      # echo hi | nc -u localhost 9000
 zig build run-https-client -- 127.0.0.1 8443 localhost / insecure
 zig build run-http3-client -- 127.0.0.1 4433 localhost /   # against e.g. aioquic
+zig build run-tls13-server -- 8443 cert.pem key.pem h2,http/1.1   # curl --http2 -k
+zig build run-tls13-client -- 127.0.0.1 8443 localhost / h2
+zig build run-http3-server -- 4433 cert.pem key.pem       # ECDSA or Ed25519 certs
+zig build run-dns-lookup   -- 1.1.1.1 example.com         # compare with dig
+```
+
+The two TLS servers need a certificate the standard library can *sign* with, which
+means ECDSA or Ed25519:
+
+```
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout key.pem -out cert.pem -days 30 -subj "/CN=localhost"
 ```
 
 Each installs a `SIGINT` handler and shuts down gracefully: it stops accepting,

@@ -6,12 +6,16 @@ round of work on the client sides turned up.
 
 ## Summary
 
-Eighteen defects, seven of them serious. Eleven came out of the review and the
-fuzzer; three surfaced while implementing the client side of each protocol, and
-four more while adding compression and TLS. Of those seven later ones, five were
-found only because the code was run against other people's implementations or
-under the fuzzer rather than by reading — and one of those only because the check
-was run repeatedly.
+Twenty-seven defects, twelve of them serious. Eleven came out of the review and
+the fuzzer; three surfaced while implementing the client side of each protocol,
+four more while adding compression and TLS, and **nine while adding the server
+sides** — TLS, QUIC and HTTP/3 — which is where the list stops being a list of
+mistakes and starts having a shape. See
+[Found while adding the server sides](#found-while-adding-the-server-sides).
+
+Of the later sixteen, most were found only because the code was run against other
+people's implementations, under the fuzzer, or through a deliberate mutation of a
+rule to see whether any test noticed. Reading did not find them.
 
 From the review and the fuzzer:
 
@@ -191,6 +195,119 @@ something malformed, so every one is reachable from the network.
 Each fix is pinned by a regression test asserting "reported once, not once per
 read", and the framing tests now assert that a rejected frame does not take its
 neighbours with it.
+
+## Found while adding the server sides
+
+Nine defects, all mine, all introduced by the work that found them. This is the
+most interesting batch, because they are not nine unrelated mistakes — they are
+four shapes, each appearing more than once, and knowing the shapes is worth more
+than knowing the fixes.
+
+| # | Severity | Shape | What | Where |
+|---|---|---|---|---|
+| S1 | **major** | dangling pointer | Transport parameters encoded into a local buffer, handed to the engine as a slice, and the connection returned by value | `codec/quic/connection.zig` |
+| S2 | **major** | dangling pointer | The pipeline initializer built as a local and given to an endpoint that uses it after `listen` returns | `codec/http3/server.zig` |
+| S3 | **major** | one name, two jobs | A server needs the connection ID the client uses *now* for keys and the one from *before* a Retry for §7.3; one field held both | `codec/quic/connection.zig` |
+| S4 | **major** | one name, two jobs | `key_phase` served both the write generation and the read generation, which differ for a round trip after a rotation | `codec/quic/connection.zig` |
+| S5 | major | one rule, two places | `writeFrames` would emit HANDSHAKE_DONE but `hasSomethingToSend` did not know the frame existed | `codec/quic/connection.zig` |
+| S6 | **major** | deliver before blocking | A request coalesced with the client Finished sat decrypted while the read loop blocked for a second one | `codec/tls13/driver.zig` |
+| S7 | major | off-by-one at a boundary | `sealRecords` emitted one extra zero-length record, consuming a sequence number and breaking everything after it | `codec/tls13/session.zig` |
+| S8 | major | wrong length prefix | §4.4.2's `certificate_list` is a *three*-byte vector, unlike most of TLS | `codec/quic/server.zig` |
+| S9 | major | tail in the wrong place | `EmbeddedChannel` added its tail handler upstream of the codec, so raw bytes reached it and the codec saw nothing | `embedded.zig` |
+
+All FIXED, each with a regression test, and each mutation checked to confirm the
+test fails when the rule is removed.
+
+### The two dangling pointers are the same mistake
+
+S1 and S2 are both "a pointer into a frame that is about to end", and both were
+invisible until a socket was involved.
+
+S1 is the more instructive. `initClient` encoded its transport parameters into a
+512-byte local, handed the engine a slice of it, and returned the connection by
+value — so the slice pointed into a dead frame by the time `start` read it. **It
+had been that way through the entire aioquic interop check, passing, because the
+bytes happened to still be intact.** What exposed it was adding `initServer`:
+that function's own 512-byte local reuses the same stack, so the ClientHello went
+out carrying the *server's* parameters and the server rejected them.
+
+The fix is not "be careful" but "make it impossible": the engines keep an inline
+array, which moves with the struct and cannot dangle.
+
+S2 is the same shape one layer up — `Server.listen` gave a datagram endpoint the
+address of a local initializer, and the endpoint's reader task builds the pipeline
+*after* `listen` returns. Every sans-io test passed; the first real socket
+segfaulted in `Io.now`. Fixed by making the handler its own initializer, which the
+server owns.
+
+The lesson both times: **returning a struct by value is a decision.** If anything
+inside it points at anything constructed alongside it, the value cannot be
+returned. The `EventLoopGroup` in this repository says so in its own doc comment,
+and the pool's tests still segfaulted for exactly that reason before it was read.
+
+### One name doing two jobs
+
+S3 and S4 both look like a missing field and are really a missing distinction.
+
+S3: RFC 9001 §5.2 derives Initial keys from the connection ID the client is
+addressing *now*; RFC 9000 §7.3 has the server report the one from the client's
+*first* Initial. A Retry makes those different, and after a Retry the original
+survives only inside the token — there is no other copy anywhere. One field for
+both meant every handshake involving a Retry decrypted nothing while every
+handshake without one worked perfectly.
+
+S4: the endpoint that *starts* a key update writes in the new generation
+immediately, but its peer is still writing in the old one until it notices and
+answers. For that round trip the send phase and the receive phase differ. With one
+field, the initiator's read path concluded the peer's replies were in "the current
+phase", tried the new keys on packets protected with the old ones, and discarded
+them — traffic stopping in exactly one direction, and only after a rotation.
+
+Splitting the field also made §6.2's response rule expressible as what it actually
+is: rotate the write keys *unless we are already writing in this generation*, which
+is precisely how "the peer answering our update" is told from "the peer starting
+one". A rule that is hard to state is usually a rule whose state is modelled
+wrongly.
+
+### One rule in two places, for the sixth time
+
+S5 is the sixth instance in this repository of a rule implemented twice and the
+copies diverging. The packet writer would happily emit HANDSHAKE_DONE; nothing
+ever asked it to write a packet, because `hasSomethingToSend` had no clause for
+it. The suite stayed green and the client simply never confirmed its handshake.
+
+The symptom is always identical — break one copy and every test passes — which is
+why the pattern is worth naming rather than fixing case by case. Previous five:
+the ACK `-2`, the non-empty connection ID check, `flowControlUsed`, the three
+closing gates, QPACK's 62-bit bound, and the record layer's sequence number.
+
+### What the self-checks found
+
+The mutation self-check earned its keep eight times this round, and three of those
+findings were about the *tests* rather than the code. Those are worth listing,
+because a weak test is invisible in a passing suite:
+
+* **A test using an uninitialised buffer.** Removing DNS's "compression pointers
+  must go backwards" rule left the suite green: the forward target happened to
+  hold bytes that looked like another pointer, so the hop budget caught it
+  instead. Zeroing the buffer makes the target a valid root label, and then only
+  the rule under test can reject it.
+* **A test that could not distinguish two spellings.** Relaxing the A-record length
+  check from `!= 4` to `>= 4` changed nothing, because the test only used a *short*
+  RDATA. A long one distinguishes them — and the long case is the dangerous one,
+  since taking the first four bytes and ignoring the rest hands a caller an address
+  the server never sent.
+* **Five tests that had never run.** Removing the resolver's canonical-name filter
+  left the suite green because `dns.zig` had no `test { _ = resolver; }`. This one
+  is the worst of the three, because it is completely invisible in a passing suite:
+  **the only symptom is the test count.**
+
+Two more findings were tests that covered the wrong half of a rule: HTTP/3's
+post-GOAWAY refusal was only tested through the *client's* local check, never
+reaching the server path, and the pool's "do not store a dead connection" was
+tested by closing the connection *after* releasing it. Both now test the case that
+actually happens — a request already in flight, a connection that dies while
+borrowed.
 
 ## R1 accept path (bootstrap.zig, event_loop.zig)
 

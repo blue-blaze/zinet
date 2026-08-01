@@ -33,18 +33,28 @@ RFC 9113 §3 lists three ways to arrive at HTTP/2:
 |---|---|---|
 | `h2c` with prior knowledge | a peer configured for cleartext HTTP/2 | **Works.** `addServerCodec` / `addClientCodec` |
 | `h2c` via `Upgrade:` | the HTTP/1.1 upgrade dance | Removed from the specification in §3.2 |
-| `h2` over TLS | ALPN advertising `h2` | Blocked upstream |
+| `h2` over TLS | ALPN advertising `h2` | **Works.** See below |
 
-The distinction that matters: **the protocol is implemented; one way of announcing it
-is not available.** §3.1 identifies `h2` by ALPN, and `std.crypto.tls.Client` offers no
-way to send it — `Client.Options` has no ALPN field, the `ClientHello` is assembled
-from five extensions of which ALPN is not one, and
+All three reachable paths now work, and the third took the longest way round.
+
+§3.1 identifies `h2` by ALPN, and `std.crypto.tls.Client` cannot send it —
+`Client.Options` has no ALPN field, the `ClientHello` is assembled from five
+extensions of which ALPN is not one, and
 `tls.ExtensionType.application_layer_protocol_negotiation` exists in
-`std/crypto/tls.zig` as an enum constant that appears nowhere else. Checked again on
-Zig 0.17-dev: `alpn` occurs zero times in `Client.zig`.
+`std/crypto/tls.zig` as an enum constant that appears nowhere else. That is still
+true on Zig 0.17-dev: `alpn` occurs zero times in `Client.zig`.
 
-When ALPN appears, `h2` needs the negotiated protocol name checked and nothing else.
-Nothing in the implementation is conditional on the transport.
+So this was listed as blocked upstream for two protocols' worth of work. What
+unblocked it was not the standard library but QUIC: RFC 9001 needs the TLS 1.3
+handshake as an engine rather than a `Reader`/`Writer` pair, so one had to be
+written, and an engine that assembles its own `ClientHello` can put ALPN in it. A
+record layer later, the same engine runs on TCP. The record is in
+[TLS.md](TLS.md).
+
+Nothing in the HTTP/2 implementation is conditional on the transport. `h2` over
+TLS is the negotiated protocol name being checked and nothing else — which is
+what the CI step proves: `curl --http2` against `tls13_server` returns
+`HTTP/2 200` with nghttp2 doing the negotiating on the other side.
 
 Prior knowledge is not a consolation prize. It is what gRPC between services uses, and
 what a reverse proxy uses to reach a backend. What it cannot do is talk to a browser.

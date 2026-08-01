@@ -28,7 +28,7 @@ see [Deliberately not done](#deliberately-not-done).
 * [The layers](#the-layers)
 * [Verified against whom](#verified-against-whom)
 * [The rule that kept being the bug](#the-rule-that-kept-being-the-bug)
-* [The server-side constraint](#the-server-side-constraint)
+* [The server side](#the-server-side)
 * [QPACK at zero capacity is not a stub](#qpack-at-zero-capacity-is-not-a-stub)
 * [Where time and randomness come from](#where-time-and-randomness-come-from)
 * [Deliberately not done](#deliberately-not-done)
@@ -163,20 +163,61 @@ buffer they borrow from), after two earlier appearances in HTTP/2. It is why eve
 in this stack carry stream IDs and never slices, and why every inbound string is
 copied at the boundary.
 
-## The server-side constraint
+## The server side
 
-There is no QUIC server here, and the reason is one missing upstream capability with
-a sharp edge: **the standard library can verify RSA signatures but cannot produce
-them** — `std.crypto.Certificate.rsa` has no secret-key or signing half. A TLS 1.3
-server must sign a `CertificateVerify` on every handshake. Ed25519 and ECDSA can
-sign, so a future server is possible with an ECDSA or Ed25519 certificate — but it
-could never serve an RSA certificate, and the test fixtures cannot sign at all,
-which is why the certificate verification path is covered by RFC 8448's genuine
-signature rather than fixture-generated ones.
+There is one, and the constraint that used to prevent it survives in reduced form:
+**the standard library can verify RSA signatures but cannot produce them** —
+`std.crypto.Certificate.rsa` has no signing half. A TLS 1.3 server signs a
+`CertificateVerify` on every handshake, so a server here presents ECDSA P-256 or
+Ed25519 certificates and cannot present an RSA one. That is a deployment
+limitation, not a missing feature, and it is reported at certificate-load time as
+`error.UnsupportedKeyType` rather than as a handshake failure later.
 
-The same constraint shaped the interop test: the aioquic server's certificate is
-ECDSA P-256, and that CI step is the first thing in the repository that would catch
-an RSA-only assumption.
+Three files make up the server, and the division is the same "no sockets until the
+last layer" the client side follows:
+
+* **`quic/acceptor.zig`** — what a server does *before* a connection exists.
+  §8.1's whole shape is that no state is created until an address is validated, and
+  the state that would have been created is handed to the client to hold, as a
+  token. So this file allocates nothing: it classifies a first packet into drop,
+  Version Negotiation, Retry, or accept. Tokens are HMAC-authenticated over their
+  own contents — address, expiry, kind, connection ID — and the checks happen in
+  that order, MAC first, because reading the address or the expiry before it is
+  acting on attacker-controlled bytes. The signing key is a parameter, since a
+  server that generated one internally could not be a fleet member.
+* **`quic/connection.zig`** — the same `Connection` as the client, with
+  `initServer`. Almost all of RFC 9000 is role-neutral, so the handshake is a union
+  whose methods forward and the ten call sites that drive it do not know which end
+  they are. What genuinely differs is marked with the section that makes it so: the
+  key halves swap, §14.1's anti-amplification limit applies on the sending side,
+  and §19.20's HANDSHAKE_DONE travels one way only.
+* **`http3/server.zig`** — one UDP socket, many connections, demultiplexed by
+  Destination Connection ID, each request stream getting its own `Pipeline` through
+  `http3/multiplex.zig`.
+
+**§14.1's anti-amplification limit is the rule most worth reading twice.** Until
+the client's address is validated a server may send at most three times what it
+received, and the credit is counted *before* anything is parsed. Counting only
+what turns out to be valid would let an attacker buy amplification with garbage,
+which is the exact thing being prevented. The 1200-byte padding obligation yields
+to the budget rather than breaking it — §14.1 says outright that a server may be
+unable to expand a datagram.
+
+The server's shape differs from every other server in this repository, and the
+reason is structural rather than incidental. A TCP server gets a new socket per
+connection and can give each one a task blocked in a read. A QUIC server gets one
+socket for everybody, so demultiplexing is the application's job rather than the
+kernel's, and every connection is driven from the endpoint's single reader task.
+The threading model's guarantee survives the change: "one task per connection, so
+handler state needs no locks" becomes "one task for the endpoint, so no
+connection's state is touched concurrently". Nothing in a stream handler can tell
+the difference.
+
+Interop runs in both directions in CI. Our client fetches from aioquic's server,
+and aioquic's client fetches from ours — which is the harder direction, because
+everything a server does and a client does not is on that path: issuing connection
+IDs, signing a `CertificateVerify`, the amplification limit, and the connection ID
+demultiplexing.
 
 ## QPACK at zero capacity is not a stub
 
@@ -226,18 +267,19 @@ exercise it is worse than one that is honestly absent.
 
 | Absent | Why, and what the refusal looks like |
 |---|---|
-| Server role | Upstream: std cannot produce RSA signatures (above). Client-only is stated at every layer. |
+| RSA server certificates | Upstream: std cannot produce RSA signatures. The server role itself exists; `error.UnsupportedKeyType` at load time is the refusal. |
 | HelloRetryRequest | `error.HelloRetryRequestUnsupported`. Correct support needs §4.4.1's transcript replacement; a half version fails only against servers that send HRR. RFC 9001 §4.7 points QUIC at its own Retry instead — which *is* implemented, including the §17.2.5 integrity checks. |
 | 0-RTT | Not attempted. The §3.2.3 QPACK interaction and the anti-replay obligations arrive with it. |
 | QPACK dynamic table | The zero-capacity mode above; a ratio feature with an explicit seam. |
-| Connection migration | Client-side, single-path. PATH_CHALLENGE is explicitly refused in the connection with a comment explaining why answering a challenge on an unvalidated path is worse than not answering. |
-| Key update in the connection | `crypto.Keys.update` implements §6's "quic ku" and is tested; the connection layer does not yet rotate. The §6.6 AEAD usage limits that make rotation mandatory *are* enforced, in `Keys`, where they cannot be bypassed. |
-| Server push | Refused by never inviting it: this client never sends MAX_PUSH_ID, so §4.6 makes every push ID the server could use an H3_ID_ERROR. |
+| Connection migration | Single-path. PATH_CHALLENGE is explicitly refused, with a comment explaining why answering a challenge on an unvalidated path is worse than not answering. The server updates a peer's address rather than checking it, so a NAT rebinding survives while a deliberate migration is unverified. |
+| Stateless reset | §10.3 needs a key that survives a restart, which is an operational input the server does not yet take. |
+| ~~Key update~~ | Done. §6 is wired into the connection: the Key Phase bit, a rotation answered rather than merely tolerated, the previous generation's read keys held for three PTOs (§6.4), §6.5's minimum interval, and §6.6's usage limits triggering a rotation without being asked. The send phase and the receive phase are separate fields, because the endpoint that starts a rotation writes in the new generation a round trip before its peer follows. |
+| Server push | Refused in both directions. As a client, never sending MAX_PUSH_ID makes every push ID an H3_ID_ERROR (§4.6). As a server, a client's MAX_PUSH_ID is *accepted and never acted on* — §4.6 makes push optional and declining means never sending a PUSH_PROMISE, not failing the connection over a frame that conformant clients send by default. |
 
 ## Numbers
 
-The QUIC and HTTP/3 stack is roughly 18,000 lines across the two directories,
-carrying 202 of the repository's 609 tests plus six of its 21 fuzz targets. All of
+The QUIC and HTTP/3 stack is roughly 21,000 lines across the two directories,
+carrying 230 of the repository's 712 tests plus six of its 21 fuzz targets. All of
 it runs under the leak-checking allocator, on threads and on fibers, on Linux and
 macOS, in Debug, ReleaseSafe and ReleaseFast — and against aioquic in CI on every
-push.
+push, in both directions.
