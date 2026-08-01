@@ -30,6 +30,7 @@ pub const http2 = @import("codec/http2.zig");
 pub const quic = @import("codec/quic.zig");
 pub const tls13 = @import("codec/tls13.zig");
 pub const http3 = @import("codec/http3.zig");
+pub const dns = @import("codec/dns.zig");
 pub const json = @import("codec/json.zig");
 pub const websocket = @import("codec/websocket.zig");
 pub const event_loop = @import("event_loop.zig");
@@ -131,6 +132,7 @@ test {
     _ = quic;
     _ = tls13;
     _ = http3;
+    _ = dns;
     _ = json;
     _ = lock;
     _ = message;

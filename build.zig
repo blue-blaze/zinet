@@ -15,6 +15,7 @@ const examples: []const []const u8 = &.{
     "tls13_client",
     "tls13_server",
     "http3_server",
+    "dns_lookup",
     "http3_client",
     "readme_snippets",
 };

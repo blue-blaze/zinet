@@ -670,6 +670,47 @@ jobs:
           wait "$server_pid" 2>/dev/null || true
           echo "http3 server interop ok"
 
+      # The resolver against a real one. `dig` and this ask the same server the
+      # same question, and the addresses must agree — which is a stronger check
+      # than any fixture, because the reply is whatever the internet says today
+      # and includes a CNAME chain we did not construct.
+      - name: DNS resolver agrees with dig
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 1.1.1.1 rather than the runner's own resolver: the runner's may be a
+          # link-local IPv6 address, and the example takes IPv4.
+          server=1.1.1.1
+
+          ours=$(perl -e 'alarm 30; exec @ARGV' \
+            ./zig-out/bin/dns_lookup "$server" example.com 2>&1 | \
+            grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u | tr '\n' ' ')
+          theirs=$(dig "@$server" +short example.com A | \
+            grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u | tr '\n' ' ')
+          echo "ours:   $ours"
+          echo "dig:    $theirs"
+          if [ -z "$ours" ]; then echo "no addresses resolved" >&2; exit 1; fi
+          if [ "$ours" != "$theirs" ]; then
+            echo "addresses disagree" >&2
+            exit 1
+          fi
+
+          # A CNAME chain, followed by name rather than by position.
+          cname=$(perl -e 'alarm 30; exec @ARGV' \
+            ./zig-out/bin/dns_lookup "$server" www.github.com 2>&1)
+          echo "$cname"
+          echo "$cname" | grep -q "is a CNAME for"
+
+          # And a name that does not exist must be reported as such rather than
+          # as a timeout: only NXDOMAIN means "stop looking".
+          if perl -e 'alarm 30; exec @ARGV' \
+            ./zig-out/bin/dns_lookup "$server" no-such-name.invalid > /tmp/nx.log 2>&1; then
+            echo "a nonexistent name resolved" >&2
+            exit 1
+          fi
+          grep -q NameNotFound /tmp/nx.log
+          echo "dns checks ok"
+
       - name: Benchmarks run without leaking
         shell: bash
         run: |
