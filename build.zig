@@ -13,6 +13,7 @@ const examples: []const []const u8 = &.{
     "udp_echo",
     "https_client",
     "tls13_client",
+    "tls13_server",
     "http3_client",
     "readme_snippets",
 };

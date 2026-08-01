@@ -430,6 +430,68 @@ jobs:
           wait "$pid" 2>/dev/null || true
           echo "tls checks ok"
 
+      # The self-written TLS 1.3 engine on both ends of a TCP connection,
+      # against the two clients that matter: curl (which is what everyone
+      # actually uses, and which coalesces its request with the handshake) and
+      # openssl s_client. The h2 case is the point — RFC 9113 §3.1 identifies
+      # HTTP/2 by ALPN, which `std.crypto.tls.Client` cannot send, so this step
+      # is the proof that the negotiation works with someone else's client.
+      # The certificate is ECDSA P-256: std can verify RSA signatures but not
+      # produce them, and here *we* are the one signing.
+      - name: TLS 1.3 server against curl and openssl s_client
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir=$(mktemp -d)
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+            -days 2 -keyout "$dir/key.pem" -out "$dir/cert.pem" \
+            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" \
+            >/dev/null 2>&1
+
+          start() {
+            ./zig-out/bin/tls13_server "$1" "$dir/cert.pem" "$dir/key.pem" "$2" \
+              > "$dir/server$1.log" 2>&1 &
+            echo $!
+          }
+
+          # HTTP/1.1 over TLS.
+          pid=$(start 18543 http/1.1)
+          for _ in $(seq 1 20); do
+            grep -q listening "$dir/server18543.log" && break
+            sleep 0.5
+          done
+          # 127.0.0.1 rather than localhost: the example binds IPv4, and curl
+          # would try ::1 first.
+          curl -sS -k --max-time 10 -i "https://127.0.0.1:18543/" > "$dir/curl1.log"
+          grep -q "HTTP/1.1 200" "$dir/curl1.log"
+          grep -q "hello from zinet" "$dir/curl1.log"
+
+          # The same server through openssl's client, which reports what was
+          # negotiated rather than trusting our own account of it.
+          openssl s_client -connect 127.0.0.1:18543 -alpn http/1.1 \
+            < /dev/null > "$dir/sclient1.log" 2>&1
+          grep -q "TLSv1.3" "$dir/sclient1.log"
+          grep -q "ALPN protocol: http/1.1" "$dir/sclient1.log"
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+
+          # h2 over TLS: negotiated by ALPN, served by the HTTP/2 codec, with
+          # nghttp2 underneath curl on the other side.
+          pid=$(start 18544 h2,http/1.1)
+          for _ in $(seq 1 20); do
+            grep -q listening "$dir/server18544.log" && break
+            sleep 0.5
+          done
+          curl -sS -k --max-time 10 -i --http2 "https://127.0.0.1:18544/" > "$dir/curl2.log"
+          grep -q "HTTP/2 200" "$dir/curl2.log"
+          grep -q "hello from zinet over h2" "$dir/curl2.log"
+          openssl s_client -connect 127.0.0.1:18544 -alpn h2 \
+            < /dev/null > "$dir/sclient2.log" 2>&1
+          grep -q "ALPN protocol: h2" "$dir/sclient2.log"
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          echo "tls 1.3 server checks ok"
+
       # The whole self-written QUIC + HTTP/3 stack against an implementation
       # that shares none of its code: aioquic. One GET crossing this boundary
       # exercises the TLS 1.3 handshake, packet protection, loss recovery, the

@@ -32,13 +32,12 @@ const Sink = pipeline_mod.Sink;
 const pool_mod = @import("../../pool.zig");
 const BufferPool = pool_mod.BufferPool;
 
+const driver = @import("driver.zig");
 const session_mod = @import("session.zig");
 const verify = @import("../quic/verify.zig");
 pub const ClientSession = session_mod.ClientSession;
 
-pub const Error = error{
-    ConnectionClosed,
-} || Buffer.Error;
+pub const Error = driver.Error;
 
 /// One connection: a socket, a `ClientSession`, a pipeline and one task.
 pub const Connection = struct {
@@ -65,21 +64,7 @@ pub const Connection = struct {
     finished: std.atomic.Value(bool),
     refs: std.atomic.Value(u32),
 
-    /// Same shape as `Channel.Outbound`: data, flushes and the close travel
-    /// one queue, so their order is the order they were asked for.
-    pub const Outbound = union(enum) {
-        data: Message,
-        submit: Message,
-        flush: void,
-        close: void,
-
-        pub fn deinit(item: *Outbound, gpa: Allocator) void {
-            switch (item.*) {
-                .data, .submit => |*msg| msg.deinit(gpa),
-                .flush, .close => {},
-            }
-        }
-    };
+    pub const Outbound = driver.Outbound;
 
     pub const Options = struct {
         gpa: Allocator,
@@ -258,16 +243,7 @@ pub const Connection = struct {
         msg: Message,
         comptime kind: std.meta.Tag(Outbound),
     ) Error!void {
-        var owned = msg;
-        errdefer owned.deinit(connection.gpa);
-        if (connection.finished.load(.acquire)) return error.ConnectionClosed;
-
-        var item: Outbound = @unionInit(Outbound, @tagName(kind), owned.move());
-        connection.outbound.putOne(connection.io, item) catch {
-            item.deinit(connection.gpa);
-            return error.ConnectionClosed;
-        };
-        _ = connection.pending.fetchAdd(1, .monotonic);
+        return driver.enqueue(connection, msg, kind);
     }
 
     /// Queues a graceful close: what is queued goes out, then close_notify.
@@ -345,161 +321,38 @@ pub const Connection = struct {
     }
 
     fn readLoop(connection: *Connection) void {
-        var scratch: [16 * 1024]u8 = undefined;
-        while (connection.isOpen()) {
-            if (!connection.pumpOutbound()) return;
-
-            const deadline: Io.Timestamp = Io.Timestamp.now(connection.io, .awake)
-                .addDuration(connection.options.write_poll);
-            const n = connection.readSocket(&scratch, deadline) catch |err| {
-                connection.finishRead(err);
-                return;
-            };
-            if (n == 0) continue; // Deadline passed; queued writes get a turn.
-
-            connection.session.receive(connection.gpa, scratch[0..n]) catch |err| {
-                connection.deliverPlaintext();
-                connection.finishRead(err);
-                return;
-            };
-            // Handshake progress (KeyUpdate answers) may want the wire.
-            connection.flushOutput() catch |err| {
-                connection.finishRead(err);
-                return;
-            };
-            connection.deliverPlaintext();
-
-            if (connection.session.state == .peer_closed) {
-                // close_notify: a clean end of stream. Answer in kind.
-                connection.farewell = true;
-                connection.closing.store(true, .release);
-                return;
-            }
-        }
+        return driver.readLoop(connection);
     }
 
     fn deliverPlaintext(connection: *Connection) void {
-        const data = connection.session.appData();
-        if (data.len == 0) return;
-        var chunk = connection.acquireInbound(data.len) catch |err| {
-            connection.pipeline.fireError(err);
-            return;
-        };
-        chunk.writeBytes(connection.gpa, data) catch |err| {
-            chunk.deinit(connection.gpa);
-            connection.pipeline.fireError(err);
-            return;
-        };
-        connection.session.consumeAppData(data.len);
-        connection.pipeline.fireRead(.initBuffer(&chunk));
-        connection.pipeline.fireReadComplete();
+        return driver.deliverPlaintext(connection);
     }
 
     /// Sends everything queued, then flushes. Returns false to stop the loop.
     fn pumpOutbound(connection: *Connection) bool {
-        const io = connection.io;
-        while (true) {
-            var one: [1]Outbound = undefined;
-            const count = connection.outbound.get(io, &one, 0) catch return false;
-            if (count == 0) break;
-            _ = connection.pending.fetchSub(1, .monotonic);
-
-            switch (one[0]) {
-                .data => |*msg| {
-                    defer msg.deinit(connection.gpa);
-                    const bytes = msg.bytes() orelse continue;
-                    connection.session.write(connection.gpa, bytes) catch return false;
-                },
-                .submit => |*msg| {
-                    const owned = msg.move();
-                    connection.pipeline.write(owned) catch |err| {
-                        connection.pipeline.fireError(err);
-                    };
-                },
-                .flush => connection.flushOutput() catch return false,
-                .close => {
-                    connection.farewell = true;
-                    connection.closing.store(true, .release);
-                    return false;
-                },
-            }
-        }
-
-        // Flush before blocking in the read: plaintext sitting in the record
-        // queue would be waiting for a reply to a request that was never sent.
-        connection.flushOutput() catch return false;
-        return true;
+        return driver.pumpOutbound(connection);
     }
 
     fn drainOutbound(connection: *Connection) void {
-        while (true) {
-            var item = connection.outbound.getOneUncancelable(connection.io) catch return;
-            _ = connection.pending.fetchSub(1, .monotonic);
-            item.deinit(connection.gpa);
-        }
+        return driver.drainOutbound(connection);
     }
 
     fn finishRead(connection: *Connection, err: anyerror) void {
-        connection.closing.store(true, .release);
-        if (err == error.EndOfStream) return;
-        connection.pipeline.fireError(err);
+        return driver.finishRead(connection, err);
     }
 
     /// One socket read. With a deadline, expiry is a zero-byte result rather
     /// than an error; without one, blocks until data or end of stream.
     fn readSocket(connection: *Connection, dest: []u8, deadline: ?Io.Timestamp) !usize {
-        var incoming: Io.net.IncomingMessage = .init;
-        const result = connection.io.operateTimeout(.{ .net_receive = .{
-            .socket_handle = connection.stream.socket.handle,
-            .message_buffer = (&incoming)[0..1],
-            .data_buffer = dest,
-            .flags = .{},
-        } }, if (deadline) |d|
-            .{ .deadline = d.withClock(.awake) }
-        else
-            .none) catch |err| switch (err) {
-            error.Timeout => return 0,
-            error.Canceled => return error.Canceled,
-            error.ConcurrencyUnavailable => return error.SystemResources,
-        };
-        const maybe_err, const count = result.net_receive;
-        if (maybe_err) |err| return switch (err) {
-            error.ConnectionResetByPeer => error.EndOfStream,
-            error.Canceled => error.Canceled,
-            else => error.Unexpected,
-        };
-        assert(count == 1);
-        // On a stream socket, zero bytes with no deadline pressure is the
-        // orderly shutdown.
-        if (incoming.data.len == 0 and deadline == null) return error.EndOfStream;
-        if (incoming.data.len == 0) return error.EndOfStream;
-        return incoming.data.len;
+        return driver.readSocket(connection, dest, deadline);
     }
 
     fn flushOutput(connection: *Connection) !void {
-        const out = connection.session.output();
-        if (out.len == 0) return;
-        try connection.stream_writer.interface.writeAll(out);
-        try connection.stream_writer.interface.flush();
-        connection.session.consumeOutput(out.len);
+        return driver.flushOutput(connection);
     }
 
     fn acquireInbound(connection: *Connection, wanted: usize) Buffer.Error!Buffer {
-        const size = @max(wanted, connection.options.read_chunk);
-        if (connection.options.pool) |pool| {
-            var pooled = try pool.acquire(size);
-            errdefer pool.release(&pooled);
-            try pooled.ensureWritable(connection.gpa, size);
-            pooled.max_capacity = @max(
-                pooled.capacity(),
-                connection.options.max_inbound_capacity,
-            );
-            return pooled;
-        }
-        return Buffer.init(connection.gpa, .{
-            .capacity = size,
-            .max_capacity = connection.options.max_inbound_capacity,
-        });
+        return driver.acquireInbound(connection, wanted);
     }
 };
 

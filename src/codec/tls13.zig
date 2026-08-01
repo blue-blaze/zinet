@@ -12,10 +12,14 @@ pub const record = @import("tls13/record.zig");
 pub const session = @import("tls13/session.zig");
 pub const client = @import("tls13/client.zig");
 pub const identity = @import("tls13/identity.zig");
+pub const driver = @import("tls13/driver.zig");
+pub const server = @import("tls13/server_connection.zig");
 
 test {
     _ = record;
     _ = session;
     _ = client;
     _ = identity;
+    _ = driver;
+    _ = server;
 }

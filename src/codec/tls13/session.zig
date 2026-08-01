@@ -35,6 +35,8 @@ const engine = @import("../quic/client.zig");
 const tls = @import("../quic/tls.zig");
 const handshake = @import("../quic/handshake.zig");
 const verify = @import("../quic/verify.zig");
+const server_engine = @import("../quic/server.zig");
+const identity_mod = @import("identity.zig");
 const quic_crypto = @import("../quic/crypto.zig");
 
 pub const Error = error{
@@ -72,6 +74,47 @@ pub const State = enum {
     closed,
     failed,
 };
+
+/// §6.1: a close_notify ends the peer's data but is not a failure; anything
+/// else fatal is. One implementation for both roles, because getting it wrong
+/// in one direction means a clean shutdown looks like an error to exactly half
+/// the connections.
+fn handleAlertInto(state: *State, close_alert: *?record.Alert, alert: record.Alert) Error!void {
+    close_alert.* = alert;
+    if (alert.description == record.Alert.close_notify) {
+        state.* = .peer_closed;
+        return;
+    }
+    state.* = .failed;
+    return error.AlertReceived;
+}
+
+/// Fragment `content` into protected records and append them to `out`.
+///
+/// One implementation for both directions on purpose: the loop's exit
+/// condition is the subtle part. It sits at the bottom so that zero-length
+/// application data still produces exactly one record — an earlier
+/// `while (offset <= content.len)` emitted a trailing empty record for every
+/// non-empty payload, which consumed a sequence number and made every
+/// subsequent record fail to decrypt.
+fn sealRecords(
+    gpa: Allocator,
+    out: *std.ArrayList(u8),
+    keys: *record.Keys,
+    content_type: record.ContentType,
+    content: []const u8,
+) Error!void {
+    var offset: usize = 0;
+    while (true) {
+        const chunk = @min(content.len - offset, record.max_plaintext_len);
+        const record_len = record.header_len + chunk + 1 + record.tag_len;
+        const dest = try out.addManyAsSlice(gpa, record_len);
+        const n = try keys.seal(dest, content_type, content[offset..][0..chunk], 0);
+        assert(n == record_len);
+        offset += chunk;
+        if (offset >= content.len) break;
+    }
+}
 
 pub const ClientSession = struct {
     client: engine.Client,
@@ -240,31 +283,11 @@ pub const ClientSession = struct {
         content_type: record.ContentType,
         content: []const u8,
     ) Error!void {
-        const keys = &self.write_keys.?;
-        var offset: usize = 0;
-        while (true) {
-            const chunk = @min(content.len - offset, record.max_plaintext_len);
-            const record_len = record.header_len + chunk + 1 + record.tag_len;
-            const dest = try self.to_send.addManyAsSlice(gpa, record_len);
-            const n = try keys.seal(dest, content_type, content[offset..][0..chunk], 0);
-            assert(n == record_len);
-            offset += chunk;
-            // The check sits at the bottom so zero-length application data
-            // still produces its one record — and nothing produces two.
-            if (offset >= content.len) break;
-        }
+        return sealRecords(gpa, &self.to_send, &self.write_keys.?, content_type, content);
     }
 
     fn handleAlert(self: *ClientSession, alert: record.Alert) Error!void {
-        self.close_alert = alert;
-        if (alert.description == record.Alert.close_notify) {
-            // §6.1: the peer will send no more data. Ours may still flow, but
-            // in practice everyone closes; the caller decides.
-            self.state = .peer_closed;
-            return;
-        }
-        self.state = .failed;
-        return error.AlertReceived;
+        return handleAlertInto(&self.state, &self.close_alert, alert);
     }
 
     /// §4.6: NewSessionTicket is ignored (no resumption here); KeyUpdate
@@ -354,6 +377,268 @@ pub const ClientSession = struct {
 
     pub fn negotiatedAlpn(self: *const ClientSession) []const u8 {
         return self.client.alpn();
+    }
+};
+
+pub const ServerOptions = struct {
+    /// Certificate chain and signing key. Borrowed; must outlive the session.
+    identity: *const identity_mod.Identity,
+    /// Protocols we speak, most preferred first. The choice is made in this
+    /// order (RFC 7301 §3.2).
+    alpn: []const []const u8 = &.{},
+    /// Whether failing to agree on ALPN ends the handshake. False is the
+    /// ordinary HTTPS server: a client that offers nothing we know still gets
+    /// served.
+    require_alpn: bool = false,
+    max_buffered_plaintext: usize = 64 * 1024,
+};
+
+/// The server side of a TLS 1.3 connection, sans-io.
+///
+/// The asymmetry with `ClientSession` is the part to be careful about, and it
+/// is not symmetric by accident: **the server's write keys advance one step
+/// ahead of its read keys.** After its own Finished the server may encrypt
+/// application data (§4.4.4 permits it, and 0.5-RTT data is exactly that),
+/// while its read keys stay at the handshake generation until the client's
+/// Finished arrives. Keeping one `read_at_application` flag per direction is
+/// what stops the read path from switching early and failing to decrypt the
+/// one message that completes the handshake.
+pub const ServerSession = struct {
+    /// The other end, for tests that need to drive a handshake by hand.
+    pub const ClientPeer = ClientSession;
+
+    server: server_engine.Server,
+    options: ServerOptions,
+    state: State = .handshaking,
+
+    parser: record.Parser = .{},
+    read_keys: ?record.Keys = null,
+    write_keys: ?record.Keys = null,
+    /// True once the client's Finished has been consumed and the read
+    /// direction has moved to the application keys.
+    read_at_application: bool = false,
+
+    to_send: std.ArrayList(u8) = .empty,
+    plaintext: std.ArrayList(u8) = .empty,
+    post_handshake: std.ArrayList(u8) = .empty,
+
+    close_alert: ?record.Alert = null,
+    scratch: [record.max_ciphertext_len]u8 = undefined,
+
+    pub fn init(options: ServerOptions, seed: [64]u8) !ServerSession {
+        const built: server_engine.Server = try .init(.{
+            .identity = options.identity,
+            .alpn = options.alpn,
+            .transport_parameters = null,
+            .require_alpn = options.require_alpn,
+        }, seed);
+        return .{ .server = built, .options = options };
+    }
+
+    pub fn deinit(self: *ServerSession, gpa: Allocator) void {
+        self.server.deinit(gpa);
+        self.to_send.deinit(gpa);
+        self.plaintext.deinit(gpa);
+        self.post_handshake.deinit(gpa);
+        self.* = undefined;
+    }
+
+    /// Feed bytes from the socket. A server has nothing to send until it has
+    /// heard a ClientHello, so there is no `start`.
+    pub fn receive(self: *ServerSession, gpa: Allocator, bytes: []const u8) !void {
+        if (self.state == .failed) return error.SessionClosed;
+        var remaining = bytes;
+        while (remaining.len > 0) {
+            const result = self.parser.next(remaining) catch |err| {
+                self.state = .failed;
+                return err;
+            };
+            const framed = result orelse return;
+            remaining = remaining[framed.consumed..];
+            self.handleRecord(gpa, &framed.record) catch |err| {
+                if (self.state != .peer_closed) self.state = .failed;
+                return err;
+            };
+        }
+    }
+
+    fn handleRecord(self: *ServerSession, gpa: Allocator, rec: *const record.Record) !void {
+        switch (rec.content_type) {
+            // §D.4: the client's compatibility-mode change_cipher_spec.
+            .change_cipher_spec => return,
+            .alert => return handleAlertInto(&self.state, &self.close_alert, try record.Alert.decode(rec.body())),
+            .handshake => {
+                // Plaintext handshake: the ClientHello, and nothing else.
+                try self.server.provide(gpa, .initial, rec.body());
+                try self.afterEngineProgress(gpa);
+            },
+            .application_data => {
+                const keys = if (self.read_keys) |*keys| keys else return error.BadRecord;
+                const opened = try keys.open(&self.scratch, rec.bytes);
+                const content = self.scratch[0..opened.len];
+                switch (opened.content_type) {
+                    .alert => return handleAlertInto(&self.state, &self.close_alert, try record.Alert.decode(content)),
+                    .handshake => {
+                        if (self.server.isComplete()) {
+                            try self.handlePostHandshake(gpa, content);
+                        } else {
+                            try self.server.provide(gpa, .handshake, content);
+                            try self.afterEngineProgress(gpa);
+                        }
+                    },
+                    .application_data => {
+                        if (!self.server.isComplete()) return error.BadRecord;
+                        if (self.plaintext.items.len + content.len > self.options.max_buffered_plaintext) {
+                            return error.PlaintextBufferFull;
+                        }
+                        try self.plaintext.appendSlice(gpa, content);
+                    },
+                    .change_cipher_spec => return error.BadRecord,
+                    _ => return error.BadRecord,
+                }
+            },
+            _ => unreachable, // The framer rejected it already.
+        }
+    }
+
+    fn afterEngineProgress(self: *ServerSession, gpa: Allocator) !void {
+        const first_flight = self.write_keys == null and self.server.secrets(.handshake) != null;
+        if (first_flight) {
+            const suite = self.server.suite().?;
+            const secrets = self.server.secrets(.handshake).?;
+            // Reversed from the client: we write with the server secret and
+            // read with the client's.
+            self.write_keys = .fromTrafficSecret(suite, secrets.server.slice());
+            self.read_keys = .fromTrafficSecret(suite, secrets.client.slice());
+        }
+
+        // ServerHello goes out in the clear; it is what the handshake keys are
+        // derived from.
+        const initial = self.server.output(.initial);
+        if (initial.len > 0) {
+            var offset: usize = 0;
+            while (offset < initial.len) {
+                const chunk = @min(initial.len - offset, record.max_plaintext_len);
+                const dest = try self.to_send.addManyAsSlice(gpa, record.header_len + chunk);
+                _ = try record.writePlaintextRecord(dest, .handshake, initial[offset..][0..chunk]);
+                offset += chunk;
+            }
+            self.server.consumeOutput(gpa, .initial, initial.len);
+            // §D.4: a client that sent a non-empty legacy_session_id is in
+            // compatibility mode and expects this record between the
+            // ServerHello and the encrypted flight. Harmless to any other
+            // client, since §5 makes it ignorable.
+            if (self.server.session_id_len > 0) {
+                try self.to_send.appendSlice(gpa, &record.change_cipher_spec_record);
+            }
+        }
+
+        // The flight (EE, Certificate, CertificateVerify, Finished) under the
+        // handshake write keys.
+        const hs = self.server.output(.handshake);
+        if (hs.len > 0) {
+            try sealRecords(gpa, &self.to_send, &self.write_keys.?, .handshake, hs);
+            self.server.consumeOutput(gpa, .handshake, hs.len);
+            // Our Finished is out, so our *write* direction moves to the
+            // application keys now — before the client's Finished has been
+            // seen. The read direction deliberately does not.
+            const suite = self.server.suite().?;
+            const secrets = self.server.secrets(.one_rtt).?;
+            self.write_keys = .fromTrafficSecret(suite, secrets.server.slice());
+        }
+
+        if (self.server.isComplete() and !self.read_at_application) {
+            const suite = self.server.suite().?;
+            const secrets = self.server.secrets(.one_rtt).?;
+            self.read_keys = .fromTrafficSecret(suite, secrets.client.slice());
+            self.read_at_application = true;
+            self.state = .established;
+        }
+    }
+
+    /// §4.6.3: a client KeyUpdate rotates our read keys, and an
+    /// update_requested is answered under the *current* write keys before
+    /// rotating them.
+    fn handlePostHandshake(self: *ServerSession, gpa: Allocator, content: []const u8) !void {
+        if (self.post_handshake.items.len + content.len >
+            tls.max_message_len + tls.message_header_len)
+        {
+            return error.UnexpectedMessage;
+        }
+        try self.post_handshake.appendSlice(gpa, content);
+        while (true) {
+            const message = tls.nextMessage(self.post_handshake.items) catch {
+                return error.UnexpectedMessage;
+            } orelse return;
+            const consumed = message.raw.len;
+            switch (message.type) {
+                .key_update => {
+                    if (message.body.len != 1) return error.UnexpectedMessage;
+                    const request = message.body[0];
+                    if (request > 1) return error.UnexpectedMessage;
+                    self.read_keys = self.read_keys.?.update();
+                    if (request == 1) {
+                        const reply = [_]u8{ @backingInt(tls.MessageType.key_update), 0, 0, 1, 0 };
+                        try sealRecords(gpa, &self.to_send, &self.write_keys.?, .handshake, &reply);
+                        self.write_keys = self.write_keys.?.update();
+                    }
+                },
+                // A server never asked for client authentication, so a
+                // Certificate here is a client inventing a conversation.
+                else => return error.UnexpectedMessage,
+            }
+            self.post_handshake.replaceRangeAssumeCapacity(0, consumed, &.{});
+        }
+    }
+
+    pub fn write(self: *ServerSession, gpa: Allocator, bytes: []const u8) Error!void {
+        if (self.state != .established and self.state != .peer_closed) {
+            return if (self.state == .handshaking) error.HandshakeIncomplete else error.SessionClosed;
+        }
+        return sealRecords(gpa, &self.to_send, &self.write_keys.?, .application_data, bytes);
+    }
+
+    pub fn close(self: *ServerSession, gpa: Allocator) Error!void {
+        if (self.state == .closed or self.state == .failed) return;
+        if (self.state == .established or self.state == .peer_closed) {
+            const alert: record.Alert = .{
+                .level = record.Alert.warning,
+                .description = record.Alert.close_notify,
+            };
+            try sealRecords(gpa, &self.to_send, &self.write_keys.?, .alert, &alert.encode());
+        }
+        self.state = .closed;
+    }
+
+    pub fn output(self: *const ServerSession) []const u8 {
+        return self.to_send.items;
+    }
+
+    pub fn consumeOutput(self: *ServerSession, n: usize) void {
+        assert(n <= self.to_send.items.len);
+        self.to_send.replaceRangeAssumeCapacity(0, n, &.{});
+    }
+
+    pub fn appData(self: *const ServerSession) []const u8 {
+        return self.plaintext.items;
+    }
+
+    pub fn consumeAppData(self: *ServerSession, n: usize) void {
+        assert(n <= self.plaintext.items.len);
+        self.plaintext.replaceRangeAssumeCapacity(0, n, &.{});
+    }
+
+    pub fn isEstablished(self: *const ServerSession) bool {
+        return self.state == .established or self.state == .peer_closed;
+    }
+
+    pub fn negotiatedAlpn(self: *const ServerSession) []const u8 {
+        return self.server.alpn();
+    }
+
+    /// The SNI the client sent, for logging or certificate selection.
+    pub fn serverName(self: *const ServerSession) []const u8 {
+        return self.server.serverName();
     }
 };
 
@@ -665,4 +950,270 @@ test "session: plaintext cap refuses data the caller has not consumed" {
     var rec_buf: [256]u8 = undefined;
     const n = try server.sealApp(&rec_buf, "0123456789abcdef!");
     try testing.expectError(error.PlaintextBufferFull, session.receive(gpa, rec_buf[0..n]));
+}
+
+// --- Server tests -----------------------------------------------------------
+
+fn testServerIdentity() identity_mod.Identity {
+    // Key from a scalar in code, certificate an opaque blob: the client under
+    // test runs with `verification = null`, so the handshake is what is being
+    // measured. `identity.zig` covers the loading.
+    const scalar: [32]u8 = .{
+        0x0d, 0x2c, 0x1f, 0x37, 0x4b, 0x59, 0x66, 0x71, 0x8a, 0x93, 0xa5, 0xb2, 0xc4, 0xd1, 0xe8, 0xf3,
+        0x02, 0x15, 0x24, 0x38, 0x47, 0x51, 0x63, 0x7a, 0x85, 0x9c, 0xab, 0xb7, 0xcd, 0xd9, 0xe4, 0xfb,
+    };
+    const secret = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(scalar) catch unreachable;
+    const key_pair = std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.fromSecretKey(secret) catch unreachable;
+    return .{ .certificates = &server_test_certificates, .key = .{ .ecdsa_p256 = key_pair } };
+}
+
+const server_test_certificate = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+const server_test_certificates = [_][]const u8{&server_test_certificate};
+
+/// Runs both sessions against each other until neither has anything to say.
+fn pump(gpa: Allocator, client: *ClientSession, server: *ServerSession) !void {
+    var rounds: usize = 0;
+    while (rounds < 8) : (rounds += 1) {
+        var moved = false;
+        if (client.output().len > 0) {
+            const bytes = try gpa.dupe(u8, client.output());
+            defer gpa.free(bytes);
+            client.consumeOutput(bytes.len);
+            try server.receive(gpa, bytes);
+            moved = true;
+        }
+        if (server.output().len > 0) {
+            const bytes = try gpa.dupe(u8, server.output());
+            defer gpa.free(bytes);
+            server.consumeOutput(bytes.len);
+            try client.receive(gpa, bytes);
+            moved = true;
+        }
+        if (!moved) return;
+    }
+    return error.PumpDidNotSettle;
+}
+
+test "session: our client and our server complete a handshake over records" {
+    const gpa = testing.allocator;
+    const identity = testServerIdentity();
+
+    var server = try ServerSession.init(.{
+        .identity = &identity,
+        .alpn = &.{ "h2", "http/1.1" },
+    }, @splat(0x13));
+    defer server.deinit(gpa);
+
+    var client = try ClientSession.init(.{
+        .host = "example.test",
+        .alpn = &.{ "http/1.1", "h2" },
+        .verification = null,
+    }, @splat(0x14));
+    defer client.deinit(gpa);
+
+    try client.start(gpa);
+    try pump(gpa, &client, &server);
+
+    try testing.expect(client.isEstablished());
+    try testing.expect(server.isEstablished());
+    // The server chose in its own order, and both agree on the result.
+    try testing.expectEqualStrings("h2", client.negotiatedAlpn());
+    try testing.expectEqualStrings("h2", server.negotiatedAlpn());
+    try testing.expectEqualStrings("example.test", server.serverName());
+
+    // Application data in both directions.
+    try client.write(gpa, "ping");
+    try pump(gpa, &client, &server);
+    try testing.expectEqualStrings("ping", server.appData());
+    server.consumeAppData(server.appData().len);
+
+    try server.write(gpa, "pong");
+    try pump(gpa, &client, &server);
+    try testing.expectEqualStrings("pong", client.appData());
+    client.consumeAppData(client.appData().len);
+}
+
+test "session: the server may write before the client's Finished arrives" {
+    // §4.4.4's asymmetry: the server's write keys advance at its own Finished,
+    // its read keys only at the client's. This is the 0.5-RTT case, and it is
+    // the one place where treating the two directions alike would break.
+    const gpa = testing.allocator;
+    const identity = testServerIdentity();
+
+    var server = try ServerSession.init(.{ .identity = &identity }, @splat(0x15));
+    defer server.deinit(gpa);
+    var client = try ClientSession.init(.{
+        .host = "example.test",
+        .verification = null,
+    }, @splat(0x16));
+    defer client.deinit(gpa);
+
+    try client.start(gpa);
+    const hello = try gpa.dupe(u8, client.output());
+    defer gpa.free(hello);
+    client.consumeOutput(hello.len);
+    try server.receive(gpa, hello);
+
+    // The server has sent its flight and is not yet established...
+    try testing.expect(!server.isEstablished());
+    // ...but it already holds application write keys, which is what makes
+    // early data possible. Sending through `write` is refused (the session
+    // reports what the state machine says), while the keys themselves exist.
+    try testing.expectError(error.HandshakeIncomplete, server.write(gpa, "early"));
+    try testing.expect(server.write_keys != null);
+    try testing.expect(!server.read_at_application);
+
+    try pump(gpa, &client, &server);
+    try testing.expect(server.isEstablished());
+    try testing.expect(server.read_at_application);
+}
+
+test "session: a compatibility-mode client gets its change_cipher_spec" {
+    // A TCP client that sends a 32-byte legacy_session_id is in compatibility
+    // mode (§D.4) and expects a CCS record after the ServerHello. Our own
+    // client never sends one — RFC 9001 §8.4 forbids it on QUIC — so the
+    // hello comes from the engine's builder.
+    const gpa = testing.allocator;
+    const identity = testServerIdentity();
+
+    // Compatibility mode: ServerHello, then CCS, then the protected flight.
+    {
+        var server = try ServerSession.init(.{ .identity = &identity }, @splat(0x17));
+        defer server.deinit(gpa);
+        var hello_buf: [1024]u8 = undefined;
+        const hello = server_engine.testClientHello(&hello_buf, &.{}, 32);
+        var framed_buf: [1200]u8 = undefined;
+        const record_bytes = try record.writePlaintextRecord(&framed_buf, .handshake, hello);
+        try server.receive(gpa, framed_buf[0..record_bytes]);
+
+        var parser: record.Parser = .{};
+        var offset: usize = 0;
+        const first = (try parser.next(server.output())).?;
+        try testing.expectEqual(record.ContentType.handshake, first.record.content_type);
+        offset += first.consumed;
+        const second = (try parser.next(server.output()[offset..])).?;
+        try testing.expectEqual(record.ContentType.change_cipher_spec, second.record.content_type);
+        offset += second.consumed;
+        const third = (try parser.next(server.output()[offset..])).?;
+        try testing.expectEqual(record.ContentType.application_data, third.record.content_type);
+    }
+
+    // An empty session id means no CCS: the flight follows the ServerHello
+    // directly. Emitting one anyway would be legal but would make the record
+    // stream differ from what the client's own tests expect.
+    {
+        var server = try ServerSession.init(.{ .identity = &identity }, @splat(0x18));
+        defer server.deinit(gpa);
+        var hello_buf: [1024]u8 = undefined;
+        const hello = server_engine.testClientHello(&hello_buf, &.{}, 0);
+        var framed_buf: [1200]u8 = undefined;
+        const record_bytes = try record.writePlaintextRecord(&framed_buf, .handshake, hello);
+        try server.receive(gpa, framed_buf[0..record_bytes]);
+
+        var parser: record.Parser = .{};
+        const first = (try parser.next(server.output())).?;
+        try testing.expectEqual(record.ContentType.handshake, first.record.content_type);
+        const second = (try parser.next(server.output()[first.consumed..])).?;
+        try testing.expectEqual(record.ContentType.application_data, second.record.content_type);
+    }
+}
+
+test "session: a client key update is answered and both directions rotate" {
+    const gpa = testing.allocator;
+    const identity = testServerIdentity();
+    var server = try ServerSession.init(.{ .identity = &identity }, @splat(0x1a));
+    defer server.deinit(gpa);
+    var client = try ClientSession.init(.{
+        .host = "example.test",
+        .verification = null,
+    }, @splat(0x1b));
+    defer client.deinit(gpa);
+
+    try client.start(gpa);
+    try pump(gpa, &client, &server);
+    try testing.expect(server.isEstablished());
+
+    // The client asks the server to update too.
+    const key_update = [_]u8{ @backingInt(tls.MessageType.key_update), 0, 0, 1, 1 };
+    try sealRecords(gpa, &client.to_send, &client.write_keys.?, .handshake, &key_update);
+    client.write_keys = client.write_keys.?.update();
+    try pump(gpa, &client, &server);
+    // The server's reply is a KeyUpdate of its own, and the client rotated its
+    // read keys while handling it — nothing for the test to do by hand, which
+    // is the point: both sides moved a generation through their own code.
+
+    // Data still flows both ways under the new generation.
+    try server.write(gpa, "after update");
+    try pump(gpa, &client, &server);
+    try testing.expectEqualStrings("after update", client.appData());
+    client.consumeAppData(client.appData().len);
+    try client.write(gpa, "and back");
+    try pump(gpa, &client, &server);
+    try testing.expectEqualStrings("and back", server.appData());
+}
+
+test "session: a client offering no shared protocol is served or refused by policy" {
+    const gpa = testing.allocator;
+    const identity = testServerIdentity();
+
+    // Lenient (the HTTPS default): no agreement, connection proceeds.
+    {
+        var server = try ServerSession.init(.{
+            .identity = &identity,
+            .alpn = &.{"h3"},
+        }, @splat(0x1c));
+        defer server.deinit(gpa);
+        var client = try ClientSession.init(.{
+            .host = "example.test",
+            .alpn = &.{"h2"},
+            .verification = null,
+        }, @splat(0x1d));
+        defer client.deinit(gpa);
+        try client.start(gpa);
+        try pump(gpa, &client, &server);
+        try testing.expect(server.isEstablished());
+        try testing.expectEqual(@as(usize, 0), server.negotiatedAlpn().len);
+    }
+
+    // Strict: the handshake ends.
+    {
+        var server = try ServerSession.init(.{
+            .identity = &identity,
+            .alpn = &.{"h3"},
+            .require_alpn = true,
+        }, @splat(0x1e));
+        defer server.deinit(gpa);
+        var client = try ClientSession.init(.{
+            .host = "example.test",
+            .alpn = &.{"h2"},
+            .verification = null,
+        }, @splat(0x1f));
+        defer client.deinit(gpa);
+        try client.start(gpa);
+        try testing.expectError(error.NoApplicationProtocol, server.receive(gpa, client.output()));
+        try testing.expectEqual(State.failed, server.state);
+    }
+}
+
+test "session: close_notify from the client is a clean end, not a failure" {
+    const gpa = testing.allocator;
+    const identity = testServerIdentity();
+    var server = try ServerSession.init(.{ .identity = &identity }, @splat(0x20));
+    defer server.deinit(gpa);
+    var client = try ClientSession.init(.{
+        .host = "example.test",
+        .verification = null,
+    }, @splat(0x21));
+    defer client.deinit(gpa);
+
+    try client.start(gpa);
+    try pump(gpa, &client, &server);
+    try client.close(gpa);
+    try pump(gpa, &client, &server);
+    try testing.expectEqual(State.peer_closed, server.state);
+    try testing.expectEqual(record.Alert.close_notify, server.close_alert.?.description);
+
+    // And the server can still answer in kind.
+    try server.close(gpa);
+    try testing.expect(server.output().len > 0);
 }

@@ -613,7 +613,10 @@ fn testEd25519Identity() Identity {
 const test_certificate = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
 const test_certificates = [_][]const u8{&test_certificate};
 
-fn testClientHello(dest: []u8, alpn: []const []const u8, session_id_len: usize) []const u8 {
+/// Builds a ClientHello for tests. Public because the TCP session layer needs
+/// one with a non-empty `legacy_session_id`, and our own client never sends
+/// that — RFC 9001 §8.4 forbids it on QUIC. Same reason `TestServer` is public.
+pub fn testClientHello(dest: []u8, alpn: []const []const u8, session_id_len: usize) []const u8 {
     const seed: [64]u8 = @splat(0x11);
     const key_pair = handshake.X25519.KeyPair.generateDeterministic(seed[0..32].*) catch unreachable;
     var builder: handshake.Builder = .init(dest);
