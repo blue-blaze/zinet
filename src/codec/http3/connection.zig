@@ -454,6 +454,14 @@ pub const Connection = struct {
         return req.body.items;
     }
 
+    /// Whether the peer has finished sending on `stream`. What `sweepAll` needs to
+    /// know before tearing a child pipeline down, and only the connection can
+    /// answer it — the FIN arrives at this layer.
+    pub fn inboundFinished(self: *const Connection, stream: u64) bool {
+        const req = self.requests.getPtr(stream) orelse return true;
+        return req.fin_seen;
+    }
+
     pub fn consumeBody(self: *Connection, stream: u64, n: usize) void {
         const req = self.requests.getPtr(stream) orelse return;
         assert(n <= req.body.items.len);
@@ -1439,7 +1447,18 @@ fn pumpH3(gpa: Allocator, a: *Connection, b: *Connection, rounds: usize) !void {
     return error.DidNotSettle;
 }
 
-fn testPair(gpa: Allocator) !struct { client: Connection, server: Connection } {
+pub const TestPair = struct { client: Connection, server: Connection };
+
+pub fn testPairForMultiplex(gpa: Allocator) !TestPair {
+    return testPair(gpa);
+}
+
+/// Bounded pumping, shared with `multiplex.zig`'s tests.
+pub fn pumpForMultiplex(gpa: Allocator, a: *Connection, b: *Connection, rounds: usize) !void {
+    return pumpH3(gpa, a, b, rounds);
+}
+
+fn testPair(gpa: Allocator) !TestPair {
     h3_identity = quic.server.testIdentity();
     const client_cid = quic.packet.ConnectionId.init(&.{ 0xc0, 0xc1, 0xc2, 0xc3 }) catch unreachable;
     const server_cid = quic.packet.ConnectionId.init(&.{ 0x50, 0x51, 0x52, 0x53 }) catch unreachable;

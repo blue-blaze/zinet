@@ -576,6 +576,100 @@ jobs:
           wait "$server_pid" 2>/dev/null || true
           echo "http3 interop ok"
 
+      # The mirror image of the step above, and the harder direction: our QUIC
+      # server accepting a connection from aioquic's client. Everything a server
+      # does that a client does not is exercised here — issuing connection IDs,
+      # signing a CertificateVerify, the anti-amplification limit, demultiplexing
+      # by connection ID on one socket — against an implementation that shares
+      # none of the code.
+      - name: HTTP/3 server against an aioquic client
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d /tmp/h3venv ]; then
+            python3 -m venv /tmp/h3venv
+            /tmp/h3venv/bin/pip install --quiet --disable-pip-version-check aioquic
+          fi
+          dir=$(mktemp -d)
+          # ECDSA P-256, because *we* are the one signing here and the standard
+          # library can verify RSA signatures but not produce them.
+          openssl ecparam -name prime256v1 -genkey -noout -out "$dir/key.pem"
+          openssl req -new -x509 -key "$dir/key.pem" -out "$dir/cert.pem" -days 2 \
+            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+          cat > "$dir/fetch.py" <<'PYEOF'
+          import asyncio, sys
+          from aioquic.asyncio.client import connect
+          from aioquic.h3.connection import H3_ALPN, H3Connection
+          from aioquic.h3.events import DataReceived, HeadersReceived
+          from aioquic.quic.configuration import QuicConfiguration
+
+          async def run(host, port, path):
+              config = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
+              config.verify_mode = False
+              async with connect(host, port, configuration=config) as client:
+                  h3 = H3Connection(client._quic)
+                  stream_id = client._quic.get_next_available_stream_id()
+                  h3.send_headers(stream_id=stream_id, headers=[
+                      (b":method", b"GET"), (b":scheme", b"https"),
+                      (b":authority", host.encode()), (b":path", path.encode()),
+                  ], end_stream=True)
+                  client.transmit()
+
+                  status, body, done = None, b"", asyncio.Event()
+                  original = client.quic_event_received
+
+                  def wrapper(event):
+                      nonlocal status, body
+                      for h3_event in h3.handle_event(event):
+                          if isinstance(h3_event, HeadersReceived):
+                              for name, value in h3_event.headers:
+                                  if name == b":status":
+                                      status = value.decode()
+                              if h3_event.stream_ended:
+                                  done.set()
+                          elif isinstance(h3_event, DataReceived):
+                              body += h3_event.data
+                              if h3_event.stream_ended:
+                                  done.set()
+                      original(event)
+
+                  client.quic_event_received = wrapper
+                  try:
+                      await asyncio.wait_for(done.wait(), timeout=15)
+                  except asyncio.TimeoutError:
+                      print("TIMEOUT", file=sys.stderr)
+                      return 1
+                  print(f"STATUS={status}")
+                  print(f"BODY={body.decode(errors='replace')!r}")
+                  return 0 if status == "200" else 1
+
+          sys.exit(asyncio.run(run(sys.argv[1], int(sys.argv[2]), sys.argv[3])))
+          PYEOF
+
+          ./zig-out/bin/http3_server 18446 "$dir/cert.pem" "$dir/key.pem" \
+            > /tmp/h3server.log 2>&1 &
+          server_pid=$!
+          for _ in $(seq 1 50); do
+            if grep -q listening /tmp/h3server.log 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+
+          # perl's alarm rather than `timeout`, which the macOS runner does not
+          # have; a cross-implementation check that can hang gets disabled the
+          # first time it does.
+          output=$(perl -e 'alarm 40; exec @ARGV' \
+            /tmp/h3venv/bin/python "$dir/fetch.py" 127.0.0.1 18446 /ci-server 2>/dev/null)
+          echo "$output"
+          echo "$output" | grep -q "STATUS=200"
+          echo "$output" | grep -q "hello from zinet over HTTP/3"
+          # And the server saw the request rather than merely answering something.
+          grep -q "h3 request for /ci-server" /tmp/h3server.log
+
+          kill "$server_pid" 2>/dev/null || true
+          wait "$server_pid" 2>/dev/null || true
+          echo "http3 server interop ok"
+
       - name: Benchmarks run without leaking
         shell: bash
         run: |

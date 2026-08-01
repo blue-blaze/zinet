@@ -21,11 +21,21 @@
 pub const frame = @import("http3/frame.zig");
 pub const qpack = @import("http3/qpack.zig");
 pub const connection = @import("http3/connection.zig");
+pub const multiplex = @import("http3/multiplex.zig");
 pub const client = @import("http3/client.zig");
+pub const server = @import("http3/server.zig");
+
+pub const Headers = multiplex.Headers;
+pub const OutgoingHeaders = multiplex.OutgoingHeaders;
+pub const StreamChannel = multiplex.StreamChannel;
+pub const InboundComplete = multiplex.InboundComplete;
+pub const StreamReset = multiplex.StreamReset;
 
 test {
     _ = frame;
     _ = qpack;
     _ = connection;
+    _ = multiplex;
     _ = client;
+    _ = server;
 }
