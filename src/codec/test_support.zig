@@ -4,6 +4,23 @@
 //! sink, bytes are fired in with `Pipeline.fireRead`, and decoded messages are
 //! captured by a collector handler at the tail. Only test code references this
 //! file, so nothing here ends up in a release build.
+//!
+//! ## Relationship to `EmbeddedChannel`
+//!
+//! `embedded.EmbeddedChannel` is the public version of this idea, and it is what
+//! an application testing its own handlers should use. This file stays because
+//! the two record *different things* rather than the same thing twice:
+//!
+//! * `RecordingSink` keeps outbound **bytes**, concatenated. That is exactly what
+//!   a byte-level codec test wants to assert on, and it is what the several
+//!   hundred assertions in this directory are written against.
+//! * `EmbeddedChannel` keeps outbound **messages**, with their types. That is what
+//!   a test of a handler in the middle of a pipeline needs, where the output is
+//!   another handler's input and may not be bytes at all.
+//!
+//! So this is not a second implementation of one rule; it is a narrower tool
+//! whose narrowness is the point. New tests that need either shape should prefer
+//! `EmbeddedChannel`, which can do both.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

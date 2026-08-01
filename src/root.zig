@@ -22,6 +22,8 @@ const std = @import("std");
 
 pub const bootstrap = @import("bootstrap.zig");
 pub const channel_pool = @import("channel_pool.zig");
+pub const embedded = @import("embedded.zig");
+pub const EmbeddedChannel = embedded.EmbeddedChannel;
 pub const ChannelPool = channel_pool.Pool;
 pub const buffer = @import("buffer.zig");
 pub const channel = @import("channel.zig");
@@ -136,6 +138,7 @@ test {
     _ = http3;
     _ = dns;
     _ = channel_pool;
+    _ = embedded;
     _ = json;
     _ = lock;
     _ = message;
