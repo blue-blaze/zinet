@@ -21,6 +21,8 @@
 const std = @import("std");
 
 pub const bootstrap = @import("bootstrap.zig");
+pub const channel_pool = @import("channel_pool.zig");
+pub const ChannelPool = channel_pool.Pool;
 pub const buffer = @import("buffer.zig");
 pub const channel = @import("channel.zig");
 pub const codec = @import("codec/codec.zig");
@@ -133,6 +135,7 @@ test {
     _ = tls13;
     _ = http3;
     _ = dns;
+    _ = channel_pool;
     _ = json;
     _ = lock;
     _ = message;
