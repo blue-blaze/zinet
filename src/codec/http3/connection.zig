@@ -108,7 +108,26 @@ pub const Options = struct {
     max_field_section_size: u64 = 64 * 1024,
 };
 
+pub const ServerOptions = struct {
+    /// The certificate chain and signing key for the TLS handshake QUIC carries.
+    identity: *const @import("../tls13/identity.zig").Identity,
+    parameters: quic.transport.Parameters = .server_defaults,
+    local_cid: quic.packet.ConnectionId,
+    /// What the client is addressing now — the Initial keys derive from it.
+    destination: quic.packet.ConnectionId,
+    /// What the client's first Initial carried, which §7.3 of RFC 9000 has the
+    /// server report. Differs from `destination` only after a Retry.
+    original_destination: quic.packet.ConnectionId,
+    peer_cid: quic.packet.ConnectionId,
+    after_retry: bool = false,
+    max_field_section_size: u64 = 64 * 1024,
+};
+
 pub const Connection = struct {
+    /// Which end this is. HTTP/3 is less symmetric than QUIC beneath it: the two
+    /// roles read different stream ID patterns, validate different pseudo-fields,
+    /// and GOAWAY means a different kind of identifier in each direction.
+    role: quic.transport.Role = .client,
     transport: quic.connection.Connection,
     max_field_section_size: u64,
 
@@ -129,6 +148,11 @@ pub const Connection = struct {
     peer_settings: ?frame.Settings = null,
     /// §5.2: GOAWAY IDs may only decrease; recorded to enforce it.
     goaway_id: ?u64 = null,
+    /// The GOAWAY *we* sent, which bounds what we will still accept. Separate
+    /// from `goaway_id` because the two directions constrain different things:
+    /// the peer's tells us what it will not serve, ours is a promise we have to
+    /// keep.
+    local_goaway_id: ?u64 = null,
 
     /// Request streams by ID.
     requests: std.AutoHashMapUnmanaged(u64, Request) = .empty,
@@ -157,6 +181,27 @@ pub const Connection = struct {
                 .local_cid = options.local_cid,
                 .initial_destination = options.initial_destination,
                 .token = options.token,
+            }, seed),
+            .max_field_section_size = options.max_field_section_size,
+        };
+    }
+
+    /// The server side. Takes what the first datagram carried, because a server
+    /// does not choose when a connection starts — see `quic.connection.initServer`.
+    pub fn initServer(options: ServerOptions, seed: [64]u8) !Connection {
+        return .{
+            .role = .server,
+            .transport = try quic.connection.Connection.initServer(.{
+                .identity = options.identity,
+                // §3.1: "h3" and nothing else. A server that accepted another
+                // token for these frames would be misdescribing itself.
+                .alpn = &.{"h3"},
+                .parameters = options.parameters,
+                .local_cid = options.local_cid,
+                .destination = options.destination,
+                .original_destination = options.original_destination,
+                .peer_cid = options.peer_cid,
+                .after_retry = options.after_retry,
             }, seed),
             .max_field_section_size = options.max_field_section_size,
         };
@@ -328,6 +373,72 @@ pub const Connection = struct {
         if (fin) try self.transport.finishStream(id);
     }
 
+    /// Send a response header section on a request stream.
+    ///
+    /// Mirrors `request`, and deliberately does not reuse it: a response goes on
+    /// a stream the *peer* opened, so there is nothing to open and no stream ID
+    /// to return, and the field section that is valid differs.
+    pub fn respond(
+        self: *Connection,
+        gpa: Allocator,
+        stream: u64,
+        fields: []const qpack.FieldLine,
+        fin: bool,
+    ) !void {
+        assert(self.role == .server);
+        if (!self.requests.contains(stream)) return error.StreamStateError;
+
+        var encoded: std.ArrayList(u8) = .empty;
+        defer encoded.deinit(gpa);
+        try qpack.encodeSection(gpa, &encoded, fields);
+
+        var header: [16]u8 = undefined;
+        const header_len = frame.writeFrameHeader(
+            &header,
+            @backingInt(frame.FrameType.headers),
+            encoded.items.len,
+        );
+        _ = try self.transport.write(gpa, stream, header[0..header_len]);
+        _ = try self.transport.write(gpa, stream, encoded.items);
+        if (fin) try self.transport.finishStream(stream);
+    }
+
+    /// §5.2: announce that this endpoint is shutting down.
+    ///
+    /// The identifier means different things in each direction, which is the one
+    /// thing about GOAWAY worth being careful with: from a server it is a
+    /// client-initiated bidirectional *stream ID*, and requests on streams at or
+    /// above it were not processed and may be retried elsewhere. From a client it
+    /// is a *push ID*. This endpoint never permits pushes, so a client's GOAWAY
+    /// can only ever carry zero.
+    pub fn goaway(self: *Connection, gpa: Allocator, id: u64) !void {
+        if (!self.h3_ready) return error.StreamStateError;
+        // A GOAWAY that raised the limit would un-refuse requests the previous
+        // one disowned, and the peer has already acted on that promise.
+        if (self.local_goaway_id) |previous| {
+            if (id > previous) return error.StreamStateError;
+        }
+        const value = switch (self.role) {
+            .server => id,
+            .client => 0,
+        };
+        var buf: [32]u8 = undefined;
+        const len = frame.writeGoaway(&buf, value);
+        _ = try self.transport.write(gpa, self.control_out.?, buf[0..len]);
+        self.local_goaway_id = value;
+    }
+
+    /// The largest stream ID a `goaway` may name and still be honest: one past
+    /// everything seen, so nothing in flight is disowned retroactively.
+    pub fn nextRequestStreamId(self: *const Connection) u64 {
+        var highest: ?u64 = null;
+        var it = self.requests.keyIterator();
+        while (it.next()) |key| {
+            if (highest == null or key.* > highest.?) highest = key.*;
+        }
+        return if (highest) |h| h + 4 else 0;
+    }
+
     // ── Receiving ────────────────────────────────────────────────────────────
 
     /// The oldest undelivered field section for `stream`, ownership passed to
@@ -358,14 +469,40 @@ pub const Connection = struct {
         // occur (we open no other bidi kinds, servers cannot open bidi toward
         // us in HTTP/3 — §6.1 gives server-initiated bidirectional streams no
         // meaning, and our transport parameters allow none).
-        switch (id & 0x3) {
-            0b00 => try self.onRequestData(gpa, id, fin),
-            0b11 => try self.onUniData(gpa, id, fin),
-            else => return self.fail(0x0101), // H3_GENERAL_PROTOCOL_ERROR
-        }
+        //
+        // The pattern differs by role and this is the whole of the difference:
+        // client-initiated bidirectional (0b00) carries requests in one
+        // direction and responses in the other, so both ends read it; the
+        // unidirectional streams a peer opens are 0b10 from a client and 0b11
+        // from a server. Reading the wrong one would mean a server treating its
+        // *own* control stream as the peer's.
+        const peer_uni: u64 = switch (self.role) {
+            .client => 0b11,
+            .server => 0b10,
+        };
+        const kind = id & 0x3;
+        if (kind == 0b00) return self.onRequestData(gpa, id, fin);
+        if (kind == peer_uni) return self.onUniData(gpa, id, fin);
+        // §6.1: server-initiated bidirectional streams have no meaning in
+        // HTTP/3, and our transport parameters allow a client none.
+        return self.fail(0x0101); // H3_GENERAL_PROTOCOL_ERROR
     }
 
     fn onRequestData(self: *Connection, gpa: Allocator, id: u64, fin: bool) !void {
+        if (self.role == .server and !self.requests.contains(id)) {
+            // A client opening a bidirectional stream *is* the request arriving;
+            // there is nothing to have registered it in advance. §5.2: after
+            // GOAWAY, streams at or above the named ID are refused rather than
+            // half-served, which is what makes the ID a promise the client can
+            // rely on when retrying elsewhere.
+            if (self.local_goaway_id) |limit| {
+                if (id >= limit) {
+                    self.transport.resetStream(id, 0x010c) catch {}; // H3_REQUEST_REJECTED
+                    return;
+                }
+            }
+            try self.requests.put(gpa, id, .{});
+        }
         const req = self.requests.getPtr(id) orelse return; // reset or unknown
         if (fin) req.fin_seen = true;
 
@@ -429,7 +566,15 @@ pub const Connection = struct {
                 errdefer section.deinit(gpa);
 
                 const is_trailers = req.saw_data;
-                if (!validResponseSection(&section, is_trailers)) {
+                // A server validates requests, a client validates responses.
+                // Sharing one function would mean accepting `:status` in a
+                // request and `:method` in a response, which is exactly the
+                // confusion §4.3 exists to forbid.
+                const valid = switch (self.role) {
+                    .client => validResponseSection(&section, is_trailers),
+                    .server => validRequestSection(&section, is_trailers),
+                };
+                if (!valid) {
                     // The errdefer above frees the section — `fail` returns an
                     // error, so freeing here too would be a double deinit on
                     // poisoned memory (and was, briefly).
@@ -447,9 +592,14 @@ pub const Connection = struct {
                     .fin = stream_done,
                 } });
             },
-            // §7.2.5: PUSH_PROMISE references a push ID, and this client never
-            // sent MAX_PUSH_ID, so no push ID is small enough (§4.6).
-            .push_promise => return self.fail(0x0108), // H3_ID_ERROR
+            // §7.2.5: PUSH_PROMISE travels server to client. Reaching a client
+            // it names a push ID we never permitted, since we send no
+            // MAX_PUSH_ID (§4.6); reaching a server it is the wrong direction
+            // entirely.
+            .push_promise => return switch (self.role) {
+                .client => self.fail(0x0108), // H3_ID_ERROR
+                .server => self.fail(0x0105), // H3_FRAME_UNEXPECTED
+            },
             // §7.2: control-stream frames on a request stream.
             .settings, .goaway, .cancel_push, .max_push_id => return self.fail(0x0105),
             .unknown => {}, // §9: ignore
@@ -588,10 +738,20 @@ pub const Connection = struct {
                     self.goaway_id = goaway_id;
                     try self.events.append(gpa, .{ .goaway = .{ .id = goaway_id } });
                 },
-                // §7.2.3: CANCEL_PUSH names a push we never allowed.
+                // §7.2.3: CANCEL_PUSH names a push. This endpoint never
+                // promises one in either direction, so any ID in it refers to
+                // nothing.
                 .cancel_push => return self.fail(0x0108),
-                // §7.2.7: only the client sends MAX_PUSH_ID.
-                .max_push_id => return self.fail(0x0105),
+                // §7.2.7: MAX_PUSH_ID travels client to server. A server
+                // receiving it is being *offered* permission to push, which it
+                // simply does not take up — §4.6 makes server push optional, and
+                // declining is done by never sending a PUSH_PROMISE rather than
+                // by refusing the frame. A client receiving one is a role
+                // confusion and is H3_FRAME_UNEXPECTED.
+                .max_push_id => switch (self.role) {
+                    .server => {},
+                    .client => return self.fail(0x0105),
+                },
                 .headers, .push_promise => return self.fail(0x0105),
                 .unknown => {},
                 .data => unreachable,
@@ -672,6 +832,102 @@ fn validResponseSection(section: *const qpack.FieldSection, is_trailers: bool) b
 
     // §4.3.2: a non-interim response has exactly one :status; trailers none.
     if (!is_trailers and !seen_status) return false;
+    return true;
+}
+
+/// Whether a received *request* field section is one §4.3.1 permits.
+///
+/// The rules read like a list but are one idea: a request's shape is fixed, and
+/// anything that could be read two ways is rejected rather than guessed at. That
+/// is what keeps request smuggling out — the same reason the HTTP/1.1 decoder in
+/// this repository is a flat state machine.
+fn validRequestSection(section: *const qpack.FieldSection, is_trailers: bool) bool {
+    var seen_regular = false;
+    var seen: struct {
+        method: bool = false,
+        scheme: bool = false,
+        authority: bool = false,
+        path: bool = false,
+        protocol: bool = false,
+    } = .{};
+    var method: []const u8 = &.{};
+    var path: []const u8 = &.{};
+    var scheme: []const u8 = &.{};
+
+    for (section.fields.items) |field| {
+        if (field.name.len == 0) return false;
+        if (field.name[0] == ':') {
+            // §4.3: pseudo-fields precede regular ones, and trailers have none.
+            if (seen_regular) return false;
+            if (is_trailers) return false;
+            if (field.value.len == 0 and !std.mem.eql(u8, field.name, ":authority")) return false;
+
+            if (std.mem.eql(u8, field.name, ":method")) {
+                if (seen.method) return false;
+                seen.method = true;
+                method = field.value;
+            } else if (std.mem.eql(u8, field.name, ":scheme")) {
+                if (seen.scheme) return false;
+                seen.scheme = true;
+                scheme = field.value;
+            } else if (std.mem.eql(u8, field.name, ":authority")) {
+                if (seen.authority) return false;
+                seen.authority = true;
+            } else if (std.mem.eql(u8, field.name, ":path")) {
+                if (seen.path) return false;
+                seen.path = true;
+                path = field.value;
+            } else if (std.mem.eql(u8, field.name, ":protocol")) {
+                // RFC 9220's extended CONNECT. Accepted as a name so that a
+                // client using it gets a clean rejection later rather than a
+                // malformed-message error now.
+                if (seen.protocol) return false;
+                seen.protocol = true;
+            } else {
+                // §4.3: an unknown pseudo-field is malformed, unlike an unknown
+                // regular field. The set is closed on purpose — a peer inventing
+                // one is not extending HTTP, it is disagreeing about the message.
+                return false;
+            }
+            continue;
+        }
+        seen_regular = true;
+
+        for (field.name) |c| {
+            if (c >= 'A' and c <= 'Z') return false;
+        }
+        // §4.2: the connection is QUIC's business, so these do not exist.
+        for ([_][]const u8{
+            "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade",
+        }) |banned| {
+            if (std.mem.eql(u8, field.name, banned)) return false;
+        }
+        // §4.2: `te` may appear, but only as exactly "trailers".
+        if (std.mem.eql(u8, field.name, "te") and !std.mem.eql(u8, field.value, "trailers")) {
+            return false;
+        }
+    }
+
+    if (is_trailers) return true;
+
+    // §4.3.1: CONNECT is the one shape that differs, and it differs in both
+    // directions — it must omit :scheme and :path, and must carry :authority.
+    if (seen.method and std.mem.eql(u8, method, "CONNECT")) {
+        if (seen.protocol) {
+            // RFC 9220 §4: extended CONNECT reinstates :scheme and :path.
+            return seen.scheme and seen.path and seen.authority;
+        }
+        return !seen.scheme and !seen.path and seen.authority;
+    }
+
+    if (!seen.method or !seen.scheme or !seen.path) return false;
+    // §4.3.1: an empty :path is malformed except for OPTIONS *, and for http(s)
+    // URIs the path must begin with "/". Both are cases where two readings exist
+    // and the RFC picks one.
+    if (path.len == 0) return false;
+    const http_scheme = std.mem.eql(u8, scheme, "http") or std.mem.eql(u8, scheme, "https");
+    if (http_scheme and path[0] != '/' and !std.mem.eql(u8, path, "*")) return false;
+    if (std.mem.eql(u8, path, "*") and !std.mem.eql(u8, method, "OPTIONS")) return false;
     return true;
 }
 
@@ -1149,4 +1405,384 @@ test "http3: the peer's QPACK encoder stream must stay silent at zero capacity" 
         h3.inject(gpa, 3, @intCast(type_len), &.{0x3f}, false),
     );
     try testing.expectEqual(@as(?u64, 0x0201), h3.conn.close_code);
+}
+
+// ── Server role ─────────────────────────────────────────────────────────────
+
+var h3_identity: @import("../tls13/identity.zig").Identity = undefined;
+
+/// Drives datagrams between two HTTP/3 connections until neither has more to
+/// send. Bounded, because a handshake that has not settled is a defect and an
+/// unbounded loop would hang the suite rather than report it.
+fn pumpH3(gpa: Allocator, a: *Connection, b: *Connection, rounds: usize) !void {
+    var buf: [1500]u8 = undefined;
+    var round: usize = 0;
+    while (round < rounds) : (round += 1) {
+        var moved = false;
+        for ([_][2]*Connection{ .{ a, b }, .{ b, a } }) |pair| {
+            const from, const to = pair;
+            // Bounded per direction as well as per round: two endpoints that
+            // each answer the other's acknowledgement would otherwise spin
+            // forever, and a hung suite reports nothing.
+            var datagrams: usize = 0;
+            while (datagrams < 64) : (datagrams += 1) {
+                const n = try from.send(gpa, &buf);
+                if (n == 0) break;
+                moved = true;
+                try to.receive(gpa, buf[0..n]);
+            }
+            if (datagrams == 64) return error.DidNotSettle;
+            try from.poll(gpa);
+        }
+        if (!moved) return;
+    }
+    return error.DidNotSettle;
+}
+
+fn testPair(gpa: Allocator) !struct { client: Connection, server: Connection } {
+    h3_identity = quic.server.testIdentity();
+    const client_cid = quic.packet.ConnectionId.init(&.{ 0xc0, 0xc1, 0xc2, 0xc3 }) catch unreachable;
+    const server_cid = quic.packet.ConnectionId.init(&.{ 0x50, 0x51, 0x52, 0x53 }) catch unreachable;
+    const dcid = quic.packet.ConnectionId.init(
+        &.{ 0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7 },
+    ) catch unreachable;
+
+    var client = try Connection.init(.{
+        .host = "example.com",
+        .verification = null,
+        .local_cid = client_cid,
+        .initial_destination = dcid,
+    }, @splat(0x71));
+    errdefer client.deinit(gpa);
+    var server = try Connection.initServer(.{
+        .identity = &h3_identity,
+        .local_cid = server_cid,
+        .destination = dcid,
+        .original_destination = dcid,
+        .peer_cid = client_cid,
+    }, @splat(0x72));
+    errdefer server.deinit(gpa);
+    try client.start(gpa);
+    return .{ .client = client, .server = server };
+}
+
+test "http3 server: a request and response cross a connection made of our own two ends" {
+    // The whole stack against itself with no fixture anywhere: QUIC handshake,
+    // both control streams, SETTINGS in both directions, QPACK, request
+    // validation, response generation.
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+
+    try pumpH3(gpa, client, server, 16);
+
+    // Both sides saw SETTINGS from the other, which is what "established" means
+    // at this layer rather than merely at QUIC's.
+    try testing.expect(client.peerSettings() != null);
+    try testing.expect(server.peerSettings() != null);
+
+    var buf: [8]qpack.FieldLine = undefined;
+    const fields = requestFields("GET", "https", "example.com", "/index.html", &.{}, &buf);
+    const stream = try client.request(gpa, fields, true);
+    try pumpH3(gpa, client, server, 8);
+
+    // The server saw it as a request, on the stream the client opened.
+    var saw_request = false;
+    while (server.nextEvent()) |event| switch (event) {
+        .headers => |h| {
+            try testing.expectEqual(stream, h.stream);
+            try testing.expect(h.fin);
+            var section = server.takeSection(h.stream).?;
+            defer section.deinit(gpa);
+            try testing.expectEqualStrings(":method", section.fields.items[0].name);
+            try testing.expectEqualStrings("GET", section.fields.items[0].value);
+            saw_request = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw_request);
+
+    try server.respond(gpa, stream, &.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "text/plain" },
+    }, false);
+    try server.writeBody(gpa, stream, "hello from h3", true);
+    try pumpH3(gpa, client, server, 8);
+
+    var saw_response = false;
+    var body_done = false;
+    while (client.nextEvent()) |event| switch (event) {
+        .headers => |h| {
+            var section = client.takeSection(h.stream).?;
+            defer section.deinit(gpa);
+            try testing.expectEqualStrings(":status", section.fields.items[0].name);
+            try testing.expectEqualStrings("200", section.fields.items[0].value);
+            saw_response = true;
+        },
+        .body => |b| {
+            try testing.expectEqualStrings("hello from h3", client.readBody(b.stream));
+            client.consumeBody(b.stream, "hello from h3".len);
+            if (b.fin) body_done = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw_response and body_done);
+}
+
+test "http3 server: a malformed request is rejected rather than served" {
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    // §4.3.1: a request with no :path is malformed. The client here is a
+    // deliberate liar — nothing in the normal API can produce this.
+    _ = try client.request(gpa, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+    }, true);
+
+    // The server closes with H3_MESSAGE_ERROR rather than guessing a path.
+    var buf: [1500]u8 = undefined;
+    const n = try client.send(gpa, &buf);
+    try testing.expectError(error.H3Error, server.receive(gpa, buf[0..n]));
+    try testing.expectEqual(@as(u64, 0x010e), server.close_code.?);
+}
+
+test "http3 server: request validation follows §4.3.1, including CONNECT" {
+    const gpa = testing.allocator;
+
+    const cases = [_]struct { fields: []const qpack.FieldLine, valid: bool, note: []const u8 }{
+        .{ .fields = &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "h" },
+            .{ .name = ":path", .value = "/" },
+        }, .valid = true, .note = "the ordinary shape" },
+        .{ .fields = &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "/" },
+        }, .valid = true, .note = ":authority may be absent when Host is present" },
+        .{ .fields = &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":path", .value = "/" },
+        }, .valid = false, .note = ":scheme is required" },
+        .{ .fields = &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "/" },
+            .{ .name = ":path", .value = "/other" },
+        }, .valid = false, .note = "a duplicate pseudo-field admits two readings" },
+        .{ .fields = &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "index.html" },
+        }, .valid = false, .note = "an http path must be rooted" },
+        .{ .fields = &.{
+            .{ .name = ":method", .value = "OPTIONS" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "*" },
+        }, .valid = true, .note = "OPTIONS * is the exception" },
+        .{ .fields = &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "*" },
+        }, .valid = false, .note = "and only for OPTIONS" },
+        .{ .fields = &.{
+            .{ .name = ":method", .value = "CONNECT" },
+            .{ .name = ":authority", .value = "h:443" },
+        }, .valid = true, .note = "CONNECT carries authority alone" },
+        .{ .fields = &.{
+            .{ .name = ":method", .value = "CONNECT" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "/" },
+            .{ .name = ":authority", .value = "h:443" },
+        }, .valid = false, .note = "CONNECT with scheme and path needs :protocol" },
+        .{ .fields = &.{
+            .{ .name = ":method", .value = "CONNECT" },
+            .{ .name = ":protocol", .value = "websocket" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "/chat" },
+            .{ .name = ":authority", .value = "h:443" },
+        }, .valid = true, .note = "extended CONNECT reinstates both" },
+        .{ .fields = &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "/" },
+            .{ .name = ":unknown", .value = "x" },
+        }, .valid = false, .note = "the pseudo-field set is closed" },
+        .{ .fields = &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "/" },
+            .{ .name = "connection", .value = "close" },
+        }, .valid = false, .note = "connection-specific fields do not exist here" },
+        .{ .fields = &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "/" },
+            .{ .name = "te", .value = "gzip" },
+        }, .valid = false, .note = "te may only be \"trailers\"" },
+        .{ .fields = &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "/" },
+            .{ .name = "te", .value = "trailers" },
+        }, .valid = true, .note = "and that one is allowed" },
+        .{ .fields = &.{
+            .{ .name = "x", .value = "1" },
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "/" },
+        }, .valid = false, .note = "pseudo-fields come first" },
+        .{ .fields = &.{
+            .{ .name = "Accept", .value = "*/*" },
+            .{ .name = ":method", .value = "GET" },
+        }, .valid = false, .note = "and names are lowercase" },
+    };
+
+    for (cases) |case| {
+        var section: qpack.FieldSection = .{};
+        defer section.deinit(gpa);
+        for (case.fields) |field| {
+            try section.fields.append(gpa, .{
+                .name = try gpa.dupe(u8, field.name),
+                .value = try gpa.dupe(u8, field.value),
+            });
+        }
+        const got = validRequestSection(&section, false);
+        if (got != case.valid) {
+            std.debug.print("case failed: {s}\n", .{case.note});
+            return error.ValidationDisagrees;
+        }
+    }
+
+    // Trailers: no pseudo-fields at all, and that is the only rule left.
+    var trailers: qpack.FieldSection = .{};
+    defer trailers.deinit(gpa);
+    try trailers.fields.append(gpa, .{
+        .name = try gpa.dupe(u8, "x-checksum"),
+        .value = try gpa.dupe(u8, "abc"),
+    });
+    try testing.expect(validRequestSection(&trailers, true));
+    try trailers.fields.append(gpa, .{
+        .name = try gpa.dupe(u8, ":method"),
+        .value = try gpa.dupe(u8, "GET"),
+    });
+    try testing.expect(!validRequestSection(&trailers, true));
+}
+
+test "http3 server: GOAWAY names a stream ID and refuses requests at or above it" {
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    // One request served normally, so there is a real boundary to draw.
+    var buf: [8]qpack.FieldLine = undefined;
+    const first = try client.request(gpa, requestFields("GET", "https", "h", "/a", &.{}, &buf), true);
+    try pumpH3(gpa, client, server, 8);
+    while (server.nextEvent()) |event| switch (event) {
+        .headers => |h| {
+            var section = server.takeSection(h.stream).?;
+            section.deinit(gpa);
+        },
+        else => {},
+    };
+
+    // §5.2: the ID is one past what has been accepted, so nothing in flight is
+    // disowned retroactively.
+    const limit = server.nextRequestStreamId();
+    try testing.expect(limit > first);
+    try server.goaway(gpa, limit);
+    try pumpH3(gpa, client, server, 8);
+
+    // The client learned the limit, and a raised one is refused locally.
+    try testing.expectEqual(limit, client.goaway_id.?);
+    try testing.expectError(error.StreamStateError, server.goaway(gpa, limit + 4));
+
+    // Once the client knows, it refuses locally rather than sending into a void.
+    try testing.expectError(error.StreamStateError, client.request(gpa, requestFields(
+        "GET",
+        "https",
+        "h",
+        "/b",
+        &.{},
+        &buf,
+    ), true));
+}
+
+test "http3 server: a request already in flight when GOAWAY is sent is reset, not served" {
+    // The half of §5.2 that matters and that a local check cannot cover: a
+    // request the client sent *before* learning of the GOAWAY. The promise the ID
+    // makes is that such a request was not processed, so the client may retry it
+    // on another connection — serving it anyway would make that promise false,
+    // and a client that retried would have the request executed twice.
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    // The server draws the line before anything has arrived, so the very first
+    // request is already at or above it.
+    try server.goaway(gpa, 0);
+
+    // The client has not heard yet, so nothing stops it locally.
+    var buf: [8]qpack.FieldLine = undefined;
+    const id = try client.request(gpa, requestFields("GET", "https", "h", "/late", &.{}, &buf), true);
+    try pumpH3(gpa, client, server, 8);
+
+    // The server never took it on: no stream state, and no headers event.
+    try testing.expect(!server.requests.contains(id));
+    while (server.nextEvent()) |event| switch (event) {
+        .headers => return error.RequestWasServedAnyway,
+        else => {},
+    };
+    // And it is still up: refusing a request is not failing the connection.
+    try testing.expect(server.close_code == null);
+}
+
+test "http3 server: MAX_PUSH_ID is accepted and never acted on" {
+    // §4.6: server push is optional. A server declines by never promising one,
+    // not by rejecting the frame — a client offering permission is being
+    // conformant, and failing the connection over it would break interop with
+    // every client that sends it by default.
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    var payload: [16]u8 = undefined;
+    var len = frame.writeFrameHeader(
+        &payload,
+        @backingInt(frame.FrameType.max_push_id),
+        quic.varint.encodedLen(100),
+    );
+    len += quic.varint.encode(payload[len..], 100);
+    _ = try client.transport.write(gpa, client.control_out.?, payload[0..len]);
+    try pumpH3(gpa, client, server, 8);
+
+    // Still up, and still no push stream in existence.
+    try testing.expect(server.close_code == null);
+    var buf: [8]qpack.FieldLine = undefined;
+    _ = try client.request(gpa, requestFields("GET", "https", "h", "/", &.{}, &buf), true);
+    try pumpH3(gpa, client, server, 8);
+    try testing.expect(server.close_code == null);
 }

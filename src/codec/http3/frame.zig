@@ -471,6 +471,15 @@ pub fn writeSettings(dest: []u8, settings: []const Setting) usize {
     return i;
 }
 
+/// Serialize a GOAWAY frame (§7.2.6). Its payload is one varint whose meaning
+/// depends on which end sent it: a stream ID from a server, a push ID from a
+/// client.
+pub fn writeGoaway(dest: []u8, id: u64) usize {
+    var i = writeFrameHeader(dest, @backingInt(FrameType.goaway), varint.encodedLen(id));
+    i += varint.encode(dest[i..], id);
+    return i;
+}
+
 const testing = std.testing;
 
 /// Feed the parser a buffer in one piece and collect frames.
