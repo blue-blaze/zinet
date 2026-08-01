@@ -466,6 +466,45 @@ pub const Connection = struct {
     /// after its own handshake completes.
     handshake_done_pending: bool = false,
     handshake_done_sent: bool = false,
+
+    // ── §6 of RFC 9001: key update ──────────────────────────────────────────
+    /// The Key Phase bit we set on outgoing 1-RTT packets — the generation our
+    /// *write* keys belong to. Announced on the wire and nowhere else: the bit is
+    /// how the peer learns a rotation happened.
+    send_key_phase: u1 = 0,
+    /// The generation our *read* keys belong to.
+    ///
+    /// Separate from the send phase, and it has to be: the endpoint that starts a
+    /// rotation writes in the new generation immediately, but the peer is still
+    /// writing in the old one until it notices and answers. During that round trip
+    /// the two phases differ. One field for both was the first thing tried here,
+    /// and it fails in a way worth recording — the initiator's own read path
+    /// concluded that the peer's replies were in "the current phase" and tried the
+    /// old keys on them, so traffic stopped in one direction only.
+    recv_key_phase: u1 = 0,
+    /// §6.2: the next generation's read keys, derived ahead of time so a packet
+    /// arriving with a flipped phase can be tried without a round trip. Derived
+    /// eagerly on purpose — deriving them on arrival would make the first packet
+    /// of a new generation cost a key schedule step in the receive path.
+    next_recv_keys: ?crypto.Keys = null,
+    /// §6.4: the previous generation's read keys, kept because packets in flight
+    /// when the peer rotated are still protected with them. Without this, a
+    /// reordered packet after a rotation is indistinguishable from an attack.
+    previous_recv_keys: ?crypto.Keys = null,
+    /// When the previous generation's keys may be dropped: §6.4 wants them held
+    /// for three times the PTO after the rotation.
+    previous_recv_expiry: u64 = 0,
+    /// §6.5: the earliest moment another rotation is allowed. An endpoint that
+    /// rotated on every packet would make the peer derive keys as fast as it can
+    /// send, which is a denial of service with extra steps.
+    key_update_allowed_at: u64 = 0,
+    /// Set when this endpoint wants to rotate but has not yet sent a packet in
+    /// the new phase. The rotation happens on the *write*, since it is that
+    /// packet that tells the peer.
+    key_update_wanted: bool = false,
+    /// How many key updates have happened, for tests and for anything that wants
+    /// to see the mechanism working.
+    key_updates: u64 = 0,
     spaces: [Level.count]Space = .{ .{}, .{}, .{} },
 
     /// Ours, the peer's, and the bookkeeping §7.3 checks against.
@@ -1201,19 +1240,30 @@ pub const Connection = struct {
         if (body_end > buf.len or body_start > body_end) return;
 
         var plain: [max_datagram]u8 = undefined;
-        const plain_len = recv_keys.open(
-            &plain,
-            pn,
-            header,
-            buf[body_start..body_end],
-        ) catch {
-            // §5.3: a failure to decrypt is a discarded packet, never a
-            // connection error. Write the counter back so the integrity limit in
-            // §6.6 keeps counting across packets.
+        var plain_len: usize = undefined;
+
+        if (level == .one_rtt) {
+            // §6: the Key Phase bit says which generation protected this packet.
+            // It is only readable now, after header protection was removed —
+            // which is why the choice of keys cannot be made earlier.
+            const phase: u1 = if (buf[0] & packet.key_phase_bit != 0) 1 else 0;
+            plain_len = self.openOneRtt(&plain, phase, pn, header, buf[body_start..body_end]) orelse
+                return;
+        } else {
+            plain_len = recv_keys.open(
+                &plain,
+                pn,
+                header,
+                buf[body_start..body_end],
+            ) catch {
+                // §5.3: a failure to decrypt is a discarded packet, never a
+                // connection error. Write the counter back so the integrity limit
+                // in §6.6 keeps counting across packets.
+                sp.recv = recv_keys;
+                return;
+            };
             sp.recv = recv_keys;
-            return;
-        };
-        sp.recv = recv_keys;
+        }
 
         // Only now is the packet known to be genuine, so only now may it change
         // any state. Everything above this line is reversible — and that ordering
@@ -1477,6 +1527,158 @@ pub const Connection = struct {
         };
     }
 
+    /// Decrypt a 1-RTT packet, choosing keys by the Key Phase bit.
+    ///
+    /// Returns null when the packet could not be read, which is always a discard
+    /// rather than an error (§5.3) — an off-path attacker can flip the phase bit
+    /// on a forged packet, and failing the connection over that would hand it a
+    /// way to close connections it cannot even read.
+    ///
+    /// Three cases, and the third is the one worth being careful about:
+    ///
+    /// * The current phase: ordinary.
+    /// * The previous phase: a packet in flight when we rotated (§6.4). Read with
+    ///   the old keys, held for a bounded time afterwards.
+    /// * The next phase: the peer rotated. Try the next generation's keys, and
+    ///   only if they *work* does the rotation happen — §6.2 is explicit that an
+    ///   endpoint must not update state on a packet it cannot authenticate.
+    fn openOneRtt(
+        self: *Connection,
+        dest: []u8,
+        phase: u1,
+        pn: u64,
+        header: []const u8,
+        body: []const u8,
+    ) ?usize {
+        const sp = self.spaceFor(.one_rtt);
+
+        if (phase == self.recv_key_phase) {
+            var keys = sp.recv.?;
+            const len = keys.open(dest, pn, header, body) catch {
+                sp.recv = keys;
+                return null;
+            };
+            sp.recv = keys;
+            return len;
+        }
+
+        // A flipped bit means either the generation before ours or the one after.
+        // §6.4: a packet number below everything we have seen in the current
+        // generation is a reordered old packet; anything else is a rotation.
+        if (self.previous_recv_keys) |*previous| {
+            var keys = previous.*;
+            if (keys.open(dest, pn, header, body)) |len| {
+                self.previous_recv_keys = keys;
+                return len;
+            } else |_| {
+                self.previous_recv_keys = keys;
+            }
+        }
+
+        // §6.1: a key update before the handshake is confirmed is a protocol
+        // violation on the peer's part, but the answer is still to discard — we
+        // have no keys for a generation that should not exist.
+        if (!self.handshake_confirmed) return null;
+
+        var next = self.next_recv_keys orelse return null;
+        const len = next.open(dest, pn, header, body) catch {
+            self.next_recv_keys = next;
+            return null;
+        };
+
+        // Authenticated, so the rotation is real.
+        self.previous_recv_keys = sp.recv;
+        self.previous_recv_expiry = self.now_ns +| self.retirementDelay();
+        sp.recv = next;
+        self.next_recv_keys = next.update();
+        self.recv_key_phase = phase;
+        self.key_update_allowed_at = self.now_ns +| self.retirementDelay();
+
+        // §6.2: respond by updating our own keys — unless we are already writing
+        // in this generation, which is the case when *we* started the rotation and
+        // this is the peer answering. The condition is the whole rule: rotating
+        // again here would leave us a generation ahead of the peer forever, each
+        // side chasing the other.
+        //
+        // The counter lives here rather than beside the read rotation because a
+        // generation is one thing, not two: counting both halves would report two
+        // updates per rotation at the initiator and one at the responder.
+        if (self.send_key_phase != phase) {
+            self.rotateSendKeys();
+            self.send_key_phase = phase;
+            self.key_updates += 1;
+        }
+        return len;
+    }
+
+    /// §6.4: let the previous generation's read keys go once nothing protected
+    /// with them can still be in flight. Holding them forever would mean a
+    /// compromise of an old key stays useful; dropping them immediately would
+    /// discard reordered packets that are perfectly valid.
+    fn dropExpiredKeys(self: *Connection) void {
+        if (self.previous_recv_keys == null) return;
+        if (self.now_ns < self.previous_recv_expiry) return;
+        self.previous_recv_keys = null;
+    }
+
+    /// §6.4's holding period, and §6.5's minimum interval between rotations: both
+    /// are "three times the PTO", so both come from here.
+    fn retirementDelay(self: *const Connection) u64 {
+        return self.rtt.probeTimeout(.application) *| 3;
+    }
+
+    /// Advance the write keys one generation. The Key Phase bit changes with them
+    /// — never separately, since the bit is what tells the peer which keys to use.
+    fn rotateSendKeys(self: *Connection) void {
+        const sp = self.spaceFor(.one_rtt);
+        if (sp.send) |keys| sp.send = keys.update();
+    }
+
+    /// §6: begin a key update, if one is permitted.
+    ///
+    /// Returns whether it will happen. Refused before the handshake is confirmed
+    /// (§6.1: there is no generation to move to yet) and within §6.5's interval of
+    /// the last one.
+    pub fn requestKeyUpdate(self: *Connection) bool {
+        if (!self.handshake_confirmed) return false;
+        if (self.now_ns < self.key_update_allowed_at) return false;
+        if (self.key_update_wanted) return true;
+        self.key_update_wanted = true;
+        return true;
+    }
+
+    /// Apply a pending update just before protecting a packet. Done here rather
+    /// than in `requestKeyUpdate` because it is the *packet* that announces the
+    /// new phase: rotating without sending would leave the peer reading a
+    /// generation we no longer write.
+    fn applyPendingKeyUpdate(self: *Connection) void {
+        if (!self.key_update_wanted) return;
+        if (!self.handshake_confirmed) return;
+        self.key_update_wanted = false;
+        self.rotateSendKeys();
+        self.send_key_phase = ~self.send_key_phase;
+        self.key_updates += 1;
+        self.key_update_allowed_at = self.now_ns +| self.retirementDelay();
+    }
+
+    /// §6.6: rotate before the AEAD's usage limits are reached rather than after.
+    ///
+    /// The limits are on the *cipher*, not on politeness: past them the
+    /// confidentiality and integrity guarantees stop holding, and RFC 9001 says
+    /// an endpoint that cannot rotate must close the connection instead. Checking
+    /// against a fraction of the limit leaves room for the update to be sent and
+    /// acknowledged before the hard boundary arrives.
+    fn checkUsageLimits(self: *Connection) void {
+        const sp = self.spaceFor(.one_rtt);
+        const keys = sp.send orelse return;
+        const limit = keys.suite.confidentialityLimit();
+        // Three quarters: far enough ahead that the rotation completes, late
+        // enough that a short connection never rotates at all.
+        if (keys.packets_protected >= limit - (limit / 4)) {
+            _ = self.requestKeyUpdate();
+        }
+    }
+
     /// The half of a TLS secret pair we protect with, and the half we read with.
     /// Stated once: a swap here yields keys that decrypt nothing, and the symptom
     /// is indistinguishable from a corrupted packet.
@@ -1511,6 +1713,11 @@ pub const Connection = struct {
             if (sp.send == null) {
                 sp.send = .fromSecret(suite, self.writeSecret(pair).slice());
                 sp.recv = .fromSecret(suite, self.readSecret(pair).slice());
+                // §6.2: the next generation's read keys, ready before they are
+                // needed. A peer may rotate as soon as the handshake is
+                // confirmed, and deriving on arrival would put a key schedule
+                // step in the path of an ordinary packet.
+                self.next_recv_keys = sp.recv.?.update();
             }
         }
 
@@ -1603,6 +1810,13 @@ pub const Connection = struct {
         if (budget == 0) return 0;
 
         const limit = @min(@min(dest.len, max_datagram), budget);
+
+        // §6.6 first, and §6 second: the rotation has to be settled before any
+        // packet number is chosen, because the Key Phase bit and the keys that
+        // protect the packet must come from the same generation.
+        self.checkUsageLimits();
+        self.applyPendingKeyUpdate();
+        self.dropExpiredKeys();
 
         // Which levels have something to say. Decided up front because §14.1's
         // padding goes in the *last* packet of the datagram, and a packet cannot
@@ -1727,8 +1941,12 @@ pub const Connection = struct {
 
         if (is_short) {
             if (dest.len < 1) return error.BufferTooSmall;
-            // §17.3: form bit clear, fixed bit set, spin and key phase zero.
+            // §17.3: form bit clear, fixed bit set, spin zero. The Key Phase
+            // bit is not decoration — it is the only signal the peer gets that
+            // a rotation happened, which is why it is written from the same
+            // field the sealing keys come from and never computed twice.
             dest[0] = packet.fixed_bit | (@as(u8, pn_len - 1) & 0x03);
+            if (self.send_key_phase == 1) dest[0] |= packet.key_phase_bit;
             cursor = 1;
             const destination = self.remote.active();
             @memcpy(dest[cursor..][0..destination.len], destination.slice());
@@ -1766,6 +1984,7 @@ pub const Connection = struct {
 
         const length_offset = cursor;
         if (!is_short) cursor += length_field_len;
+        assert(!is_short or self.key_update_wanted == false);
         const pn_offset = cursor;
         packet.encodePacketNumber(dest[cursor..][0..pn_len], pn, pn_len);
         cursor += pn_len;
@@ -4463,4 +4682,178 @@ test "connection: a Retry validates the address and the handshake still complete
     // The client verified §7.3 against what the Retry and the token carried:
     // `original_destination_connection_id` *and* `retry_source_connection_id`.
     try testing.expect(c.peerParameters() != null);
+}
+
+// ── Key update (RFC 9001 §6) ─────────────────────────────────────────────────
+
+/// A connected pair, handshake complete, ready for 1-RTT traffic.
+fn establishedPair(gpa: Allocator, seed: u8) !struct { a: Connection, b: Connection } {
+    initServerIdentity();
+    const client_cid = testCid(&.{ 0xa0, 0xa1, 0xa2, seed });
+    const server_cid = testCid(&.{ 0xb0, 0xb1, 0xb2, seed });
+    const dcid = testCid(&.{ 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, seed });
+
+    var c = try Connection.initClient(testOptions(client_cid, dcid), @splat(seed));
+    errdefer c.deinit(gpa);
+    var srv = try Connection.initServer(
+        testServerOptions(server_cid, dcid, client_cid),
+        @splat(seed +% 1),
+    );
+    errdefer srv.deinit(gpa);
+    try c.start(gpa);
+    try exchange(gpa, &c, &srv, 12);
+    return .{ .a = c, .b = srv };
+}
+
+/// Send one stream's worth of data across and read it back, so a test can check
+/// that whatever keys are in force actually work.
+fn roundTrip(gpa: Allocator, from: *Connection, to: *Connection, payload: []const u8) !void {
+    const id = try from.openStream(gpa, false);
+    _ = try from.write(gpa, id, payload);
+    try from.finishStream(id);
+    try exchange(gpa, from, to, 8);
+    try testing.expectEqualStrings(payload, to.read(id));
+    to.consume(gpa, id, payload.len);
+}
+
+test "connection: a key update rotates both directions and traffic keeps flowing" {
+    // §6.1 and §6.2 together, which is the only way they can be checked: an
+    // update is announced by the Key Phase bit on a packet, and the peer must
+    // both read that packet and rotate its own keys in response. If either half
+    // is wrong the connection stops working, and nothing before that point
+    // notices.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0x61);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    try testing.expect(cl.handshake_confirmed);
+    try roundTrip(gpa, cl, srv, "before the update");
+
+    // Time has to pass: §6.5 refuses a rotation within three PTOs of the last
+    // one, and the handshake counts as the last one.
+    const later = cl.now_ns + 10 * std.time.ns_per_s;
+    cl.setTime(later);
+    srv.setTime(later);
+
+    try testing.expect(cl.requestKeyUpdate());
+    const phase_before = cl.send_key_phase;
+    try roundTrip(gpa, cl, srv, "after the update");
+
+    // The phase flipped, and the server followed rather than merely tolerating it.
+    try testing.expect(cl.send_key_phase != phase_before);
+    try testing.expectEqual(cl.send_key_phase, srv.send_key_phase);
+    try testing.expectEqual(cl.recv_key_phase, srv.recv_key_phase);
+    try testing.expectEqual(@as(u64, 1), srv.key_updates);
+
+    // And the reverse direction works, which is what proves the server rotated
+    // its *write* keys too rather than only its read keys.
+    try roundTrip(gpa, srv, cl, "and back again");
+}
+
+test "connection: a key update is refused before the handshake is confirmed" {
+    // §6.1: there is no generation to move to until the handshake is confirmed,
+    // and rotating early would leave the peer unable to read anything.
+    const gpa = testing.allocator;
+    initServerIdentity();
+    const dcid = testCid(&.{ 1, 1, 1, 1, 1, 1, 1, 1 });
+    var cl = try Connection.initClient(
+        testOptions(testCid(&.{ 2, 2, 2, 2 }), dcid),
+        @splat(0x62),
+    );
+    defer cl.deinit(gpa);
+    try cl.start(gpa);
+
+    try testing.expect(!cl.requestKeyUpdate());
+    try testing.expectEqual(@as(u64, 0), cl.key_updates);
+}
+
+test "connection: two updates in quick succession are refused by §6.5" {
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0x63);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    const later = cl.now_ns + 10 * std.time.ns_per_s;
+    cl.setTime(later);
+    srv.setTime(later);
+    try testing.expect(cl.requestKeyUpdate());
+    try roundTrip(gpa, cl, srv, "one");
+
+    // Immediately again: refused. Without this an endpoint could make its peer
+    // derive keys as fast as it can send packets.
+    try testing.expect(!cl.requestKeyUpdate());
+    try testing.expectEqual(@as(u64, 1), cl.key_updates);
+
+    // Once the interval has passed it is allowed.
+    cl.setTime(later + 20 * std.time.ns_per_s);
+    srv.setTime(later + 20 * std.time.ns_per_s);
+    try testing.expect(cl.requestKeyUpdate());
+    try roundTrip(gpa, cl, srv, "two");
+    try testing.expectEqual(@as(u64, 2), cl.key_updates);
+}
+
+test "connection: a packet from before a rotation is still readable" {
+    // §6.4: packets in flight when the peer rotates are protected with the old
+    // keys, and discarding them would turn every rotation into a burst of loss.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0x64);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    const later = cl.now_ns + 10 * std.time.ns_per_s;
+    cl.setTime(later);
+    srv.setTime(later);
+
+    // A packet sealed under the current generation, held back rather than sent.
+    const id = try cl.openStream(gpa, false);
+    _ = try cl.write(gpa, id, "sent before rotating");
+    try cl.finishStream(id);
+    var held: [max_datagram]u8 = undefined;
+    const held_len = try cl.send(gpa, &held);
+    try testing.expect(held_len > 0);
+
+    // Now the server rotates, so its read keys move on while that packet is
+    // still "in flight".
+    try testing.expect(srv.requestKeyUpdate());
+    try roundTrip(gpa, srv, cl, "server rotates");
+    try testing.expectEqual(@as(u64, 1), srv.key_updates);
+
+    // The held packet still arrives and is still read: the previous generation's
+    // keys are kept for exactly this.
+    try srv.receive(gpa, held[0..held_len]);
+    try testing.expectEqualStrings("sent before rotating", srv.read(id));
+    srv.consume(gpa, id, "sent before rotating".len);
+}
+
+test "connection: the AEAD usage limit triggers a rotation without being asked" {
+    // §6.6: past the confidentiality limit the cipher's guarantees stop holding,
+    // so the rotation is not a courtesy. Driven by pushing the counter rather
+    // than by sending billions of packets.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0x65);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    const later = cl.now_ns + 10 * std.time.ns_per_s;
+    cl.setTime(later);
+    srv.setTime(later);
+
+    const sp = cl.spaceFor(.one_rtt);
+    const limit = sp.send.?.suite.confidentialityLimit();
+    sp.send.?.packets_protected = limit - (limit / 4);
+
+    try roundTrip(gpa, cl, srv, "at the limit");
+    try testing.expectEqual(@as(u64, 1), cl.key_updates);
+    try testing.expectEqual(@as(u64, 1), srv.key_updates);
+    // The new generation starts its own count, which is the point of rotating.
+    try testing.expect(cl.spaceFor(.one_rtt).send.?.packets_protected < limit / 2);
 }
