@@ -63,6 +63,12 @@ pub const Error = error{
 /// each *message* is bounded, and that is what has to be held at once.
 const max_buffered = tls.max_message_len + tls.message_header_len;
 
+/// Room for our own encoded transport parameters. RFC 9000 §18 has no total
+/// limit, so this is a stated one: everything defined there fits several times
+/// over, and an unbounded copy would be an unbounded allocation driven by a
+/// caller's struct.
+pub const max_local_parameters = 512;
+
 pub const Options = struct {
     /// Sent as SNI and matched against the certificate. Empty omits SNI, which
     /// also means there is no name to verify.
@@ -132,6 +138,16 @@ pub const Client = struct {
     /// found the same way — by a test asserting the value survived.
     negotiated_alpn_buf: [255]u8 = @splat(0),
     negotiated_alpn_len: u8 = 0,
+    /// Our own transport parameters, copied rather than borrowed.
+    ///
+    /// `Options` carries a slice, and the caller that encodes those parameters
+    /// usually does so into a local buffer and then returns the connection by
+    /// value — at which point the slice points into a dead stack frame. That
+    /// defect existed here and survived every test plus the aioquic
+    /// cross-check, because the bytes happened to still be intact when they
+    /// were read. An inline array moves with the struct and cannot dangle.
+    local_parameters: [max_local_parameters]u8 = undefined,
+    local_parameters_len: usize = 0,
     peer_transport_parameters: std.ArrayList(u8) = .empty,
 
     /// Incoming CRYPTO bytes per level, awaiting a whole message.
@@ -144,12 +160,25 @@ pub const Client = struct {
         // the whole handshake reproducible, and so that nothing here reaches for
         // a global source of randomness.
         const key_pair = try handshake.X25519.KeyPair.generateDeterministic(seed[0..32].*);
-        return .{
+        var self: @This() = .{
             .options = options,
             .private_key = key_pair.secret_key,
             .public_key = key_pair.public_key,
             .random = seed[32..64].*,
         };
+        if (options.transport_parameters) |parameters| {
+            if (parameters.len > max_local_parameters) return error.BufferTooSmall;
+            @memcpy(self.local_parameters[0..parameters.len], parameters);
+            self.local_parameters_len = parameters.len;
+        }
+        return self;
+    }
+
+    /// Our transport parameters, or null when this handshake carries none —
+    /// which is what tells the peer this is TLS over TCP rather than QUIC.
+    fn localParameters(self: *const @This()) ?[]const u8 {
+        if (self.options.transport_parameters == null) return null;
+        return self.local_parameters[0..self.local_parameters_len];
     }
 
     pub fn deinit(self: *Client, gpa: Allocator) void {
@@ -171,7 +200,7 @@ pub const Client = struct {
             .key_share = self.public_key,
             .server_name = self.options.host,
             .alpn = self.options.alpn,
-            .transport_parameters = self.options.transport_parameters,
+            .transport_parameters = self.localParameters(),
         });
 
         try self.client_hello.appendSlice(gpa, hello);

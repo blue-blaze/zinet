@@ -69,6 +69,8 @@ const max_buffered = tls.max_message_len + tls.message_header_len;
 /// §4.1.2: opaque legacy_session_id<0..32>.
 const max_session_id = 32;
 
+const max_local_parameters = client_mod.max_local_parameters;
+
 pub const Options = struct {
     /// The certificate chain and signing key. Borrowed; must outlive the
     /// handshake.
@@ -117,6 +119,16 @@ pub const Server = struct {
     /// choose a certificate by it.
     server_name_buf: [253]u8 = @splat(0),
     server_name_len: u8 = 0,
+    /// Our own transport parameters, copied rather than borrowed.
+    ///
+    /// `Options` carries a slice, and the caller that encodes those parameters
+    /// usually does so into a local buffer and then returns the connection by
+    /// value — at which point the slice points into a dead stack frame. That
+    /// defect existed here and survived every test plus the aioquic
+    /// cross-check, because the bytes happened to still be intact when they
+    /// were read. An inline array moves with the struct and cannot dangle.
+    local_parameters: [max_local_parameters]u8 = undefined,
+    local_parameters_len: usize = 0,
     peer_transport_parameters: std.ArrayList(u8) = .empty,
 
     inbox: [Level.count]std.ArrayList(u8) = .{ .empty, .empty, .empty },
@@ -126,12 +138,25 @@ pub const Server = struct {
     /// rather than drawn, so a handshake is reproducible in a test.
     pub fn init(options: Options, seed: [64]u8) !Server {
         const key_pair = try handshake.X25519.KeyPair.generateDeterministic(seed[0..32].*);
-        return .{
+        var self: @This() = .{
             .options = options,
             .private_key = key_pair.secret_key,
             .public_key = key_pair.public_key,
             .random = seed[32..64].*,
         };
+        if (options.transport_parameters) |parameters| {
+            if (parameters.len > max_local_parameters) return error.BufferTooSmall;
+            @memcpy(self.local_parameters[0..parameters.len], parameters);
+            self.local_parameters_len = parameters.len;
+        }
+        return self;
+    }
+
+    /// Our transport parameters, or null when this handshake carries none —
+    /// which is what tells the peer this is TLS over TCP rather than QUIC.
+    fn localParameters(self: *const @This()) ?[]const u8 {
+        if (self.options.transport_parameters == null) return null;
+        return self.local_parameters[0..self.local_parameters_len];
     }
 
     pub fn deinit(self: *Server, gpa: Allocator) void {
@@ -303,7 +328,7 @@ pub const Server = struct {
                 builder.end(list);
                 builder.end(ext);
             }
-            if (self.options.transport_parameters) |parameters| {
+            if (self.localParameters()) |parameters| {
                 const ext = builder.beginExtension(.quic_transport_parameters);
                 builder.bytes(parameters);
                 builder.end(ext);
@@ -588,7 +613,7 @@ const testing = std.testing;
 /// `identity.zig`, and what matters here is the handshake. The certificate is
 /// an opaque blob, which is all it can be — the client under test runs with
 /// `verification = null` precisely so the *handshake* is what is measured.
-fn testIdentity() Identity {
+pub fn testIdentity() Identity {
     const scalar: [32]u8 = .{
         0x0d, 0x2c, 0x1f, 0x37, 0x4b, 0x59, 0x66, 0x71, 0x8a, 0x93, 0xa5, 0xb2, 0xc4, 0xd1, 0xe8, 0xf3,
         0x02, 0x15, 0x24, 0x38, 0x47, 0x51, 0x63, 0x7a, 0x85, 0x9c, 0xab, 0xb7, 0xcd, 0xd9, 0xe4, 0xfb,

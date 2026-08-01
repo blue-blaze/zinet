@@ -24,6 +24,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
 const client = @import("client.zig");
+const server_engine = @import("server.zig");
 const crypto = @import("crypto.zig");
 const frame = @import("frame.zig");
 const packet = @import("packet.zig");
@@ -36,6 +37,82 @@ const streams_mod = @import("streams.zig");
 
 const ConnectionId = packet.ConnectionId;
 const Level = client.Level;
+
+/// The TLS 1.3 handshake, from whichever end this connection is.
+///
+/// A union rather than two `Connection` types: almost all of RFC 9000 is
+/// role-neutral — packet assembly, coalescing, loss recovery, the §7.3 header
+/// checks — and duplicating it to vary the handshake would put every one of
+/// those rules in two places. The methods forward so the ten call sites that
+/// drive the handshake do not know which end they are.
+pub const Engine = union(enum) {
+    client: client.Client,
+    server: server_engine.Server,
+
+    pub fn deinit(self: *Engine, gpa: Allocator) void {
+        switch (self.*) {
+            inline else => |*e| e.deinit(gpa),
+        }
+    }
+
+    pub fn provide(self: *Engine, gpa: Allocator, level: Level, bytes: []const u8) !void {
+        switch (self.*) {
+            inline else => |*e| return e.provide(gpa, level, bytes),
+        }
+    }
+
+    pub fn output(self: *const Engine, level: Level) []const u8 {
+        switch (self.*) {
+            inline else => |*e| return e.output(level),
+        }
+    }
+
+    pub fn consumeOutput(self: *Engine, gpa: Allocator, level: Level, n: usize) void {
+        switch (self.*) {
+            inline else => |*e| return e.consumeOutput(gpa, level, n),
+        }
+    }
+
+    pub fn secrets(self: *const Engine, level: Level) ?@import("tls.zig").Pair {
+        switch (self.*) {
+            inline else => |*e| return e.secrets(level),
+        }
+    }
+
+    pub fn suite(self: *const Engine) ?crypto.Suite {
+        switch (self.*) {
+            inline else => |*e| return e.suite(),
+        }
+    }
+
+    pub fn isComplete(self: *const Engine) bool {
+        switch (self.*) {
+            inline else => |*e| return e.isComplete(),
+        }
+    }
+
+    pub fn alpn(self: *const Engine) []const u8 {
+        switch (self.*) {
+            inline else => |*e| return e.alpn(),
+        }
+    }
+
+    pub fn transportParameters(self: *const Engine) []const u8 {
+        switch (self.*) {
+            inline else => |*e| return e.transportParameters(),
+        }
+    }
+
+    /// Only a client speaks first. Calling this on a server is a caller error
+    /// rather than a no-op: a server that thinks it must open a handshake has
+    /// confused the two roles, and silence would hide it.
+    pub fn start(self: *Engine, gpa: Allocator) !void {
+        switch (self.*) {
+            .client => |*c| return c.start(gpa),
+            .server => unreachable,
+        }
+    }
+};
 
 pub const Error = error{
     /// §7.5: more out-of-order CRYPTO data than the buffer allows. A real limit:
@@ -152,6 +229,38 @@ pub const Options = struct {
     stream_window: u64 = 256 * 1024,
 };
 
+pub const ServerOptions = struct {
+    /// The certificate chain and the key that signs `CertificateVerify`.
+    identity: *const @import("../tls13/identity.zig").Identity,
+    /// §8.1 of RFC 9001 makes ALPN mandatory, and a server that accepts its
+    /// absence has silently agreed to speak something unspecified.
+    alpn: []const []const u8,
+    parameters: transport.Parameters,
+    /// The connection ID we issue for ourselves. Must be unpredictable, which is
+    /// why it comes from the caller along with everything else random here.
+    local_cid: ConnectionId,
+    /// What the client is addressing *now*, and what RFC 9001 §5.2 derives the
+    /// Initial keys from. Normally the same as `original_destination`; after a
+    /// Retry it is the connection ID that Retry supplied, because the client
+    /// re-derives its Initial keys from that value.
+    destination: ConnectionId,
+    /// The Destination Connection ID from the client's *first* Initial, which
+    /// §7.3 has us report as `original_destination_connection_id`.
+    ///
+    /// Separate from `destination` because a Retry makes them differ, and
+    /// conflating them is a defect that only shows up when a Retry happens: the
+    /// keys derive from the wrong value, every packet fails to decrypt, and it
+    /// looks like corruption. After a Retry this value survives only inside the
+    /// token — there is no other copy anywhere.
+    original_destination: ConnectionId,
+    /// The client's Source Connection ID — where our packets are addressed.
+    peer_cid: ConnectionId,
+    /// Whether a Retry preceded this connection, which both validates the
+    /// address and adds `retry_source_connection_id` to what we must report.
+    after_retry: bool = false,
+    stream_window: u64 = 256 * 1024,
+};
+
 /// One packet number space: RFC 9000 §12.3 has three, and 0-RTT shares the
 /// application space with 1-RTT.
 const Space = struct {
@@ -216,7 +325,7 @@ const CryptoStream = struct {
         gpa: Allocator,
         offset: u64,
         data: []const u8,
-        engine: *client.Client,
+        engine: *Engine,
         level: Level,
     ) !void {
         if (data.len == 0) return;
@@ -252,7 +361,7 @@ const CryptoStream = struct {
     fn drain(
         self: *CryptoStream,
         gpa: Allocator,
-        engine: *client.Client,
+        engine: *Engine,
         level: Level,
     ) !void {
         while (self.pending.items.len > 0) {
@@ -315,6 +424,10 @@ const SentMeta = struct {
     retire_count: u8 = 0,
     carried_max_data: bool = false,
     carried_max_streams: [2]bool = .{ false, false },
+    /// Whether this packet carried HANDSHAKE_DONE, so that losing it re-arms
+    /// the obligation. §19.20 says the server retransmits until acknowledged,
+    /// and a client that never gets it never confirms the handshake.
+    carried_handshake_done: bool = false,
 
     const StreamRange = struct { id: u64, offset: u64, len: u64, fin: bool };
 
@@ -330,7 +443,29 @@ const max_stream_frames_per_packet = 8;
 const max_credit_frames_per_packet = 8;
 
 pub const Connection = struct {
-    engine: client.Client,
+    /// Which end of the handshake this is. Almost nothing in RFC 9000 depends on
+    /// it, which is why one `Connection` serves both; the places that do are
+    /// marked with the section that makes them asymmetric.
+    role: transport.Role = .client,
+    engine: Engine,
+
+    // ── §8.1 address validation, server side ────────────────────────────────
+    /// Whether the peer's address is validated. A client's is, trivially: it
+    /// received a packet the server could only send by having the address.
+    /// A server's peer is not, until a handshake packet arrives from it or a
+    /// token proves an earlier exchange.
+    address_validated: bool = false,
+    /// Bytes received from an unvalidated address, and bytes sent to it. §14.1
+    /// caps the second at three times the first, and it is the *sending* side
+    /// of that rule — the receiving side is the 1200-byte floor on Initial
+    /// datagrams, which is already enforced. A server without this limit is an
+    /// amplifier for anyone willing to spoof a source address.
+    received_from_unvalidated: usize = 0,
+    sent_to_unvalidated: usize = 0,
+    /// §19.20: the server owes exactly one HANDSHAKE_DONE, and owes it only
+    /// after its own handshake completes.
+    handshake_done_pending: bool = false,
+    handshake_done_sent: bool = false,
     spaces: [Level.count]Space = .{ .{}, .{}, .{} },
 
     /// Ours, the peer's, and the bookkeeping §7.3 checks against.
@@ -439,12 +574,12 @@ pub const Connection = struct {
         const params_len = transport.encode(&encoded, &parameters, .client);
 
         var self: Connection = .{
-            .engine = try client.Client.init(.{
+            .engine = .{ .client = try client.Client.init(.{
                 .host = options.host,
                 .alpn = options.alpn,
                 .transport_parameters = encoded[0..params_len],
                 .verification = options.verification,
-            }, seed),
+            }, seed) },
             .streams = .init(.client, .{
                 // Derived from the transport parameters rather than configured
                 // separately: two places to state the same window is two places
@@ -470,6 +605,63 @@ pub const Connection = struct {
         const initial = crypto.InitialKeys.derive(options.initial_destination.slice());
         self.spaces[@backingInt(Level.initial)].send = initial.client;
         self.spaces[@backingInt(Level.initial)].recv = initial.server;
+
+        return self;
+    }
+
+    /// The server side of the same connection.
+    ///
+    /// A server does not choose when a connection begins — a datagram does — so
+    /// this takes what that first datagram carried: the Destination Connection
+    /// ID the client invented (which is what Initial keys derive from, and what
+    /// §7.3 later checks against `original_destination_connection_id`), and the
+    /// client's own Source Connection ID, which is where replies go.
+    pub fn initServer(options: ServerOptions, seed: [64]u8) !Connection {
+        var parameters = options.parameters;
+        // §7.3, and not the caller's to choose: it must be the connection ID we
+        // are actually addressed by.
+        parameters.initial_source_connection_id = options.local_cid;
+        // §7.3: only a server sends these, and getting them wrong is
+        // indistinguishable from an attacker having rewritten the handshake.
+        // They are derived here rather than accepted so a caller cannot state
+        // them inconsistently with the packets that were actually exchanged.
+        parameters.original_destination_connection_id = options.original_destination;
+        parameters.retry_source_connection_id = if (options.after_retry) options.local_cid else null;
+
+        var encoded: [512]u8 = undefined;
+        const params_len = transport.encode(&encoded, &parameters, .server);
+
+        var self: Connection = .{
+            .role = .server,
+            .engine = .{ .server = try server_engine.Server.init(.{
+                .identity = options.identity,
+                .alpn = options.alpn,
+                .transport_parameters = encoded[0..params_len],
+                .require_alpn = true,
+            }, seed) },
+            .streams = .init(.server, .{
+                .local_max_data = parameters.initial_max_data,
+                .local_max_stream_data = parameters.initial_max_stream_data_bidi_remote,
+                .local_max_streams_bidi = parameters.initial_max_streams_bidi,
+                .local_max_streams_uni = parameters.initial_max_streams_uni,
+            }),
+            .local = .init(options.local_cid),
+            .remote = .init(options.peer_cid, parameters.active_connection_id_limit),
+            .original_destination = options.original_destination,
+            .parameters = parameters,
+            // A Retry already proved the address: the client echoed a token only
+            // reachable by receiving our packet.
+            .address_validated = options.after_retry,
+        };
+
+        // §5.2: the same client-chosen connection ID keys both directions; only
+        // which half is read and which is written swaps. And it is the connection
+        // ID the client is using *now* — after a Retry the client re-derived from
+        // the Retry's Source Connection ID, so a server still using the original
+        // would decrypt nothing.
+        const initial = crypto.InitialKeys.derive(options.destination.slice());
+        self.spaces[@backingInt(Level.initial)].send = initial.server;
+        self.spaces[@backingInt(Level.initial)].recv = initial.client;
 
         return self;
     }
@@ -796,6 +988,7 @@ pub const Connection = struct {
         for (meta.retires[0..meta.retire_count]) |sequence| {
             self.remote.requeueRetire(sequence);
         }
+        if (meta.carried_handshake_done) self.handshake_done_pending = true;
         if (meta.carried_max_data) self.rearm_max_data = true;
         if (meta.carried_max_streams[0]) self.rearm_max_streams[0] = true;
         if (meta.carried_max_streams[1]) self.rearm_max_streams[1] = true;
@@ -828,6 +1021,14 @@ pub const Connection = struct {
             },
             // §10.2.2 and §10.3.1: nothing is processed and nothing is sent.
             .draining, .drained => return,
+        }
+
+        // §14.1's credit, counted before anything is parsed: the rule is about
+        // datagrams *received* from an address, not about packets that turned out
+        // to be valid. Counting only what parses would let an attacker send
+        // garbage to buy amplification credit — the exact thing being prevented.
+        if (self.role == .server and !self.address_validated) {
+            self.received_from_unvalidated +|= datagram.len;
         }
 
         // §10.3: a stateless reset is indistinguishable from a short-header
@@ -873,7 +1074,7 @@ pub const Connection = struct {
                     self.state = .drained;
                     return error.VersionNegotiationFailed;
                 },
-                .retry => |retry| try self.handleRetry(gpa, retry, slice),
+                .retry => |retry| if (self.role == .client) try self.handleRetry(gpa, retry, slice),
                 .protected => |protected| try self.handleProtected(gpa, protected, slice),
             }
         }
@@ -951,7 +1152,10 @@ pub const Connection = struct {
         const level: Level = switch (protected.long_type orelse .zero_rtt) {
             .initial => .initial,
             .handshake => .handshake,
-            // A client never receives 0-RTT, and a short header is 1-RTT.
+            // A short header is 1-RTT. A long-header 0-RTT packet reaches only a
+            // server, and this one does not offer 0-RTT, so it is dropped rather
+            // than treated as an error: §17.2.3 permits exactly that, and a
+            // client that tried gets its data again in 1-RTT.
             .zero_rtt => if (protected.long_type == null) .one_rtt else return,
             .retry => return,
         };
@@ -967,7 +1171,7 @@ pub const Connection = struct {
         // A short header is only ours if its destination connection ID is.
         if (protected.long_type == null and !self.local.accepts(&protected.destination)) return;
 
-        if (level == .initial) {
+        if (level == .initial and self.role == .client) {
             // §7.2: once a valid Initial has arrived from the server, a later one
             // with a *different* Source Connection ID must be discarded. Without
             // this, anyone able to inject a packet could move the connection to a
@@ -1021,7 +1225,7 @@ pub const Connection = struct {
         self.idle_restarted_at = self.now_ns;
         self.idle_sent_since_receive = false;
 
-        if (level == .initial) {
+        if (level == .initial and self.role == .client) {
             // §7.2: the server's first Initial packet chooses the connection ID
             // the client uses from then on. **A client may have to change this
             // twice during establishment** — once for a Retry and once for the
@@ -1044,6 +1248,12 @@ pub const Connection = struct {
             sp.largest_received_at = self.now_ns;
         }
         sp.received.add(pn);
+
+        // §8.1: receiving a Handshake packet validates the client's address —
+        // producing one requires having received our own Handshake keys, which a
+        // spoofed source address never sees. This is the ordinary path out of the
+        // anti-amplification limit; a token is the shortcut.
+        if (self.role == .server and level != .initial) self.address_validated = true;
 
         try self.handleFrames(gpa, level, plain[0..plain_len]);
     }
@@ -1085,6 +1295,8 @@ pub const Connection = struct {
                     try self.afterHandshakeProgress(gpa);
                 },
                 .new_token => |token| {
+                    // §19.7: a server sends NEW_TOKEN, never receives it.
+                    if (self.role == .server) return error.ProtocolViolation;
                     if (token.len > max_token_len) return error.ProtocolViolation;
                     @memcpy(self.event_token_buf[0..token.len], token);
                     try self.events.append(gpa, .{ .new_token = self.event_token_buf[0..token.len] });
@@ -1108,7 +1320,9 @@ pub const Connection = struct {
                 },
                 .handshake_done => {
                     // §4.1.2 of RFC 9001: only the server sends this, and it is
-                    // what confirms the handshake for a client.
+                    // what confirms the handshake for a client. §19.20 makes
+                    // receiving it as a server a PROTOCOL_VIOLATION.
+                    if (self.role == .server) return error.ProtocolViolation;
                     self.handshake_confirmed = true;
                     self.discardHandshakeKeys(gpa);
                 },
@@ -1263,6 +1477,23 @@ pub const Connection = struct {
         };
     }
 
+    /// The half of a TLS secret pair we protect with, and the half we read with.
+    /// Stated once: a swap here yields keys that decrypt nothing, and the symptom
+    /// is indistinguishable from a corrupted packet.
+    fn writeSecret(self: *const Connection, pair: @import("tls.zig").Pair) @import("tls.zig").Secret {
+        return switch (self.role) {
+            .client => pair.client,
+            .server => pair.server,
+        };
+    }
+
+    fn readSecret(self: *const Connection, pair: @import("tls.zig").Pair) @import("tls.zig").Secret {
+        return switch (self.role) {
+            .client => pair.server,
+            .server => pair.client,
+        };
+    }
+
     /// After CRYPTO data reaches the TLS engine, new keys may exist and the
     /// handshake may have completed.
     fn afterHandshakeProgress(self: *Connection, gpa: Allocator) !void {
@@ -1271,27 +1502,39 @@ pub const Connection = struct {
         if (self.engine.secrets(.handshake)) |pair| {
             const sp = self.spaceFor(.handshake);
             if (sp.send == null) {
-                sp.send = .fromSecret(suite, pair.client.slice());
-                sp.recv = .fromSecret(suite, pair.server.slice());
+                sp.send = .fromSecret(suite, self.writeSecret(pair).slice());
+                sp.recv = .fromSecret(suite, self.readSecret(pair).slice());
             }
         }
         if (self.engine.secrets(.one_rtt)) |pair| {
             const sp = self.spaceFor(.one_rtt);
             if (sp.send == null) {
-                sp.send = .fromSecret(suite, pair.client.slice());
-                sp.recv = .fromSecret(suite, pair.server.slice());
+                sp.send = .fromSecret(suite, self.writeSecret(pair).slice());
+                sp.recv = .fromSecret(suite, self.readSecret(pair).slice());
             }
         }
 
         if (!self.engine.isComplete() or self.established) return;
+
+        // §4.1.2 of RFC 9001: the server confirms the handshake for the client,
+        // and its own is confirmed the moment its handshake completes — there is
+        // nobody to wait for.
+        if (self.role == .server) {
+            self.handshake_done_pending = !self.handshake_done_sent;
+            self.handshake_confirmed = true;
+        }
 
         // The handshake is done as far as TLS is concerned. Before saying so, the
         // transport parameters have to be checked — including §7.3's connection
         // ID comparison, which is the whole reason those parameters carry
         // connection IDs.
         const raw = self.engine.transportParameters();
-        const peer = transport.decode(raw, .server) catch return error.ProtocolViolation;
-        transport.checkConnectionIds(&peer, .server, .{
+        // Decoded as the *peer's* role: `original_destination_connection_id` from
+        // a client is not merely odd, it is forbidden (§18.2), and which side is
+        // permitted to send what is exactly what the role argument decides.
+        const peer_role: transport.Role = if (self.role == .client) .server else .client;
+        const peer = transport.decode(raw, peer_role) catch return error.ProtocolViolation;
+        transport.checkConnectionIds(&peer, peer_role, .{
             .peer_source = self.remote.active(),
             .original_destination = self.original_destination,
             .retry_source = self.retry_source,
@@ -1347,7 +1590,19 @@ pub const Connection = struct {
         }
         if (dest.len < min_initial_datagram) return error.BufferTooSmall;
 
-        const limit = @min(dest.len, max_datagram);
+        // §14.1: until the client's address is validated a server may send at
+        // most three times what it received. This is the *sending* half of the
+        // amplification defence — the receiving half is the 1200-byte floor on
+        // Initial datagrams, enforced elsewhere — and without it a server
+        // answering a spoofed 1200-byte Initial with a full certificate chain is
+        // a several-fold amplifier pointed at whoever the attacker names.
+        const budget: usize = if (self.role == .server and !self.address_validated)
+            (self.received_from_unvalidated *| 3) -| self.sent_to_unvalidated
+        else
+            std.math.maxInt(usize);
+        if (budget == 0) return 0;
+
+        const limit = @min(@min(dest.len, max_datagram), budget);
 
         // Which levels have something to say. Decided up front because §14.1's
         // padding goes in the *last* packet of the datagram, and a packet cannot
@@ -1362,8 +1617,12 @@ pub const Connection = struct {
         const final = last orelse return 0;
 
         // §14.1 applies when the datagram contains an Initial packet at all, not
-        // only when that is all it contains.
-        const needs_padding = wants[@backingInt(Level.initial)];
+        // only when that is all it contains. A server whose budget is smaller
+        // than 1200 bytes pads to what it may send instead: §14.1 states outright
+        // that a server may be unable to expand a datagram, and the
+        // anti-amplification limit is the constraint that wins — padding to 1200
+        // by exceeding the budget would defeat the rule the padding serves.
+        const needs_padding = wants[@backingInt(Level.initial)] and limit >= min_initial_datagram;
 
         var len: usize = 0;
         for ([_]Level{ .initial, .handshake, .one_rtt }) |level| {
@@ -1374,6 +1633,10 @@ pub const Connection = struct {
 
         assert(len <= limit);
         assert(!needs_padding or len >= min_initial_datagram);
+        if (self.role == .server and !self.address_validated) {
+            self.sent_to_unvalidated +|= len;
+            assert(self.sent_to_unvalidated <= self.received_from_unvalidated *| 3);
+        }
         return len;
     }
 
@@ -1394,6 +1657,14 @@ pub const Connection = struct {
 
         // Retirements owed for the peer's connection IDs need 1-RTT.
         if (level == .one_rtt and self.remote.pendingRetire().len > 0) return true;
+
+        // HANDSHAKE_DONE, which the server owes the client (§19.20). This has to
+        // be here as well as in `writeFrames`, and the two disagreeing is the
+        // exact failure this repository has hit five times: the writer would
+        // happily emit the frame, but nothing ever asked it to write a packet,
+        // so the client never confirmed its handshake and never discarded its
+        // handshake keys.
+        if (level == .one_rtt and self.handshake_done_pending) return true;
 
         if (level == .one_rtt and self.established) {
             // Stream data is the one thing the congestion window gates (§7):
@@ -1483,7 +1754,10 @@ pub const Connection = struct {
             cursor += source.len;
 
             if (level == .initial) {
-                const token = self.token_buf[0..self.token_len];
+                // §17.2.2: the field exists in both directions but a server's is
+                // always empty — a token is what a client replays, not what it
+                // is given mid-connection.
+                const token = if (self.role == .client) self.token_buf[0..self.token_len] else "";
                 cursor += varint.encode(dest[cursor..], token.len);
                 @memcpy(dest[cursor..][0..token.len], token);
                 cursor += token.len;
@@ -1665,6 +1939,21 @@ pub const Connection = struct {
                 meta.crypto_len = take;
                 meta.ack_eliciting = true;
                 sp.crypto_sent += take;
+            }
+        }
+
+        // §19.20: the server tells the client the handshake is confirmed. It goes
+        // before stream data because it is one byte and it unblocks the client's
+        // key discarding; a packet full of stream frames that had no room for it
+        // would delay that by a round trip.
+        if (level == .one_rtt and self.handshake_done_pending and !terminal) {
+            const f: frame.Frame = .handshake_done;
+            if (len + frame.encodedLen(f) <= dest.len) {
+                len += frame.encode(dest[len..], f);
+                self.handshake_done_pending = false;
+                self.handshake_done_sent = true;
+                meta.carried_handshake_done = true;
+                meta.ack_eliciting = true;
             }
         }
 
@@ -2337,12 +2626,12 @@ test "connection: out-of-order CRYPTO frames are reassembled" {
     var stream: CryptoStream = .{};
     defer stream.deinit(gpa);
 
-    var engine = try client.Client.init(.{
+    var engine: Engine = .{ .client = try client.Client.init(.{
         .host = "example.com",
         .alpn = &.{"h3"},
         .transport_parameters = &.{},
         .verification = null,
-    }, @splat(0x7e));
+    }, @splat(0x7e)) };
     defer engine.deinit(gpa);
     try engine.start(gpa);
 
@@ -2384,12 +2673,12 @@ test "connection: the CRYPTO reassembly buffer is bounded" {
     var stream: CryptoStream = .{};
     defer stream.deinit(gpa);
 
-    var engine = try client.Client.init(.{
+    var engine: Engine = .{ .client = try client.Client.init(.{
         .host = "h",
         .alpn = &.{"h3"},
         .transport_parameters = &.{},
         .verification = null,
-    }, @splat(0x11));
+    }, @splat(0x11)) };
     defer engine.deinit(gpa);
 
     const chunk: [1024]u8 = @splat(0xaa);
@@ -3893,4 +4182,285 @@ test "connection: the idle timeout closes silently, and traffic restarts it" {
     try testing.expect(saw_idle);
     var out: [max_datagram]u8 = undefined;
     try testing.expectEqual(@as(usize, 0), try conn.send(gpa, &out));
+}
+
+// ── Server role ─────────────────────────────────────────────────────────────
+
+/// Drives datagrams between two connections until neither has anything to send.
+/// Bounded: a handshake that has not settled in this many exchanges is a defect,
+/// and an unbounded loop would hang the test suite rather than report it.
+fn exchange(gpa: Allocator, a: *Connection, b: *Connection, rounds: usize) !void {
+    var buf: [max_datagram]u8 = undefined;
+    var round: usize = 0;
+    while (round < rounds) : (round += 1) {
+        var moved = false;
+        for ([_][2]*Connection{ .{ a, b }, .{ b, a } }) |pair| {
+            const from, const to = pair;
+            while (true) {
+                const n = try from.send(gpa, &buf);
+                if (n == 0) break;
+                moved = true;
+                try to.receive(gpa, buf[0..n]);
+            }
+        }
+        if (!moved) return;
+    }
+    return error.HandshakeDidNotSettle;
+}
+
+fn testCid(bytes: []const u8) ConnectionId {
+    return ConnectionId.init(bytes) catch unreachable;
+}
+
+fn testServerOptions(local: ConnectionId, original: ConnectionId, peer: ConnectionId) ServerOptions {
+    return .{
+        .identity = &server_identity,
+        .alpn = &.{"h3"},
+        .parameters = .server_defaults,
+        .local_cid = local,
+        .destination = original,
+        .original_destination = original,
+        .peer_cid = peer,
+    };
+}
+
+var server_identity: @import("../tls13/identity.zig").Identity = undefined;
+
+fn initServerIdentity() void {
+    server_identity = server_engine.testIdentity();
+}
+
+test "connection: our client and our server complete a handshake over datagrams" {
+    // The one test that says the server role exists: no fixture on either side,
+    // both ends running the real state machine, everything from header protection
+    // to the transport parameters exercised in both directions.
+    const gpa = testing.allocator;
+    initServerIdentity();
+
+    const client_cid: ConnectionId = testCid(&.{ 0xc1, 0xc2, 0xc3, 0xc4 });
+    const server_cid: ConnectionId = testCid(&.{ 0x51, 0x52, 0x53, 0x54 });
+    const initial_dcid: ConnectionId = testCid(&.{ 0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7 });
+
+    var c = try Connection.initClient(testOptions(client_cid, initial_dcid), @splat(0x21));
+    defer c.deinit(gpa);
+    var srv = try Connection.initServer(
+        testServerOptions(server_cid, initial_dcid, client_cid),
+        @splat(0x22),
+    );
+    defer srv.deinit(gpa);
+
+    try c.start(gpa);
+    try exchange(gpa, &c, &srv, 12);
+
+    try testing.expect(c.isEstablished());
+    try testing.expect(srv.isEstablished());
+    // §19.20: the client learns the handshake is confirmed from the server.
+    try testing.expect(c.handshake_confirmed);
+    try testing.expect(srv.handshake_done_sent);
+    // Both agreed on the same application protocol, and each authenticated the
+    // other's transport parameters — including §7.3's connection ID check, which
+    // is what a server's `original_destination_connection_id` exists for.
+    try testing.expect(c.peerParameters() != null);
+    try testing.expect(srv.peerParameters() != null);
+}
+
+test "connection: a request crosses a self-made connection in both directions" {
+    const gpa = testing.allocator;
+    initServerIdentity();
+
+    var c = try Connection.initClient(
+        testOptions(testCid(&.{ 1, 2, 3, 4 }), testCid(&.{ 9, 9, 9, 9, 9, 9, 9, 9 })),
+        @splat(0x31),
+    );
+    defer c.deinit(gpa);
+    var srv = try Connection.initServer(
+        testServerOptions(testCid(&.{ 5, 6, 7, 8 }), testCid(&.{ 9, 9, 9, 9, 9, 9, 9, 9 }), testCid(&.{ 1, 2, 3, 4 })),
+        @splat(0x32),
+    );
+    defer srv.deinit(gpa);
+
+    try c.start(gpa);
+    try exchange(gpa, &c, &srv, 12);
+    try testing.expect(c.isEstablished() and srv.isEstablished());
+
+    // A client-opened bidirectional stream: what a request is. The server's
+    // `initial_max_streams_bidi` is what permits it, which is the one transport
+    // parameter that genuinely differs between the roles.
+    const id = try c.openStream(gpa, true);
+    _ = try c.write(gpa, id, "GET /");
+    try c.finishStream(id);
+    try exchange(gpa, &c, &srv, 8);
+
+    try testing.expectEqualStrings("GET /", srv.read(id));
+    srv.consume(gpa, id, 5);
+
+    _ = try srv.write(gpa, id, "200 OK");
+    try srv.finishStream(id);
+    try exchange(gpa, &c, &srv, 8);
+    try testing.expectEqualStrings("200 OK", c.read(id));
+    c.consume(gpa, id, 6);
+}
+
+var big_identity: @import("../tls13/identity.zig").Identity = undefined;
+var big_chain: [3][]const u8 = undefined;
+const big_certificate: [2048]u8 = @splat(0xa5);
+
+/// A certificate chain of realistic size — real ones run to a few kilobytes.
+/// This matters because the anti-amplification limit is only observable when the
+/// flight does not fit inside it, and the repository's test certificate is eight
+/// bytes of placeholder. Nothing parses these bytes: verification is off on the
+/// client, and a server never inspects its own chain.
+fn initBigIdentity() void {
+    big_chain = .{ &big_certificate, &big_certificate, &big_certificate };
+    big_identity = .{ .certificates = &big_chain, .key = server_engine.testIdentity().key };
+}
+
+test "connection: a server will not amplify beyond three times what it received" {
+    // §14.1's sending half. Without it, a spoofed 1200-byte Initial makes a
+    // server send a whole certificate chain to whoever the attacker named.
+    const gpa = testing.allocator;
+    initServerIdentity();
+
+    const initial_dcid: ConnectionId = testCid(&.{ 7, 7, 7, 7, 7, 7, 7, 7 });
+    var c = try Connection.initClient(
+        testOptions(testCid(&.{ 1, 1, 1, 1 }), initial_dcid),
+        @splat(0x41),
+    );
+    defer c.deinit(gpa);
+    initBigIdentity();
+    var server_options = testServerOptions(testCid(&.{ 2, 2, 2, 2 }), initial_dcid, testCid(&.{ 1, 1, 1, 1 }));
+    server_options.identity = &big_identity;
+    var srv = try Connection.initServer(server_options, @splat(0x42));
+    defer srv.deinit(gpa);
+
+    try c.start(gpa);
+
+    // One datagram from the client, then let the server say everything it wants.
+    var buf: [max_datagram]u8 = undefined;
+    const first = try c.send(gpa, &buf);
+    try testing.expect(first >= min_initial_datagram);
+    try srv.receive(gpa, buf[0..first]);
+
+    var out: [max_datagram]u8 = undefined;
+    var sent_total: usize = 0;
+    var delivered: [8][max_datagram]u8 = undefined;
+    var delivered_len: [8]usize = @splat(0);
+    var count: usize = 0;
+    while (count < delivered.len) {
+        const n = try srv.send(gpa, &out);
+        if (n == 0) break;
+        sent_total += n;
+        @memcpy(delivered[count][0..n], out[0..n]);
+        delivered_len[count] = n;
+        count += 1;
+    }
+    // The ceiling held, and it is a ceiling that actually bit: this chain does
+    // not fit in three datagrams, so handshake bytes must still be waiting
+    // rather than having been sent anyway.
+    try testing.expect(sent_total <= first * 3);
+    try testing.expect(!srv.address_validated);
+    try testing.expect(srv.engine.output(.handshake).len > srv.spaceFor(.handshake).crypto_sent);
+
+    // The stall is not a deadlock, and this is why: what the server did send
+    // gives the client Handshake keys, its answer validates the address, and the
+    // limit lifts. A test that stopped at the ceiling would not have shown that
+    // the handshake still completes — which is the property that matters.
+    for (delivered[0..count], delivered_len[0..count]) |*datagram, n| {
+        try c.receive(gpa, datagram[0..n]);
+    }
+    try exchange(gpa, &c, &srv, 12);
+    try testing.expect(srv.address_validated);
+    try testing.expect(c.isEstablished() and srv.isEstablished());
+}
+
+test "connection: a Retry validates the address and the handshake still completes" {
+    // The Retry path end to end, which is the only way to check it: the client
+    // must accept the Retry, re-send its ClientHello under the new connection ID,
+    // and the server must recover the *original* one from the token — because
+    // §7.3 has it report that value, and the client checks it. Getting that wrong
+    // breaks only handshakes involving a Retry, which is to say none of the tests
+    // that came before this one.
+    const gpa = testing.allocator;
+    initServerIdentity();
+
+    const acceptor = @import("acceptor.zig");
+    const policy: acceptor.Policy = .{ .key = .init(@splat(0x6c)), .require_validation = true };
+    const address = "\x7f\x00\x00\x01\x04\xd2";
+
+    const odcid = testCid(&.{ 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7 });
+    const client_cid = testCid(&.{ 0xc0, 0xc1, 0xc2, 0xc3 });
+    var c = try Connection.initClient(testOptions(client_cid, odcid), @splat(0x51));
+    defer c.deinit(gpa);
+    try c.start(gpa);
+
+    var buf: [max_datagram]u8 = undefined;
+    const first = try c.send(gpa, &buf);
+
+    // The server side, deciding without any connection state at all.
+    const parsed = try packet.parse(buf[0..first], 8);
+    const decision = acceptor.classify(policy, parsed.packet.protected, address, 1_000);
+    const retry_scid = testCid(&.{ 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57 });
+    var retry_buf: [256]u8 = undefined;
+    switch (decision) {
+        .retry => |r| {
+            var token_buf: [acceptor.max_token_len]u8 = undefined;
+            const token = try acceptor.mintToken(
+                &token_buf,
+                policy.key,
+                .retry,
+                1_000,
+                address,
+                r.original_destination,
+            );
+            const len = try acceptor.writeRetry(
+                &retry_buf,
+                r.client_source,
+                retry_scid,
+                r.original_destination,
+                token,
+            );
+            try c.receive(gpa, retry_buf[0..len]);
+        },
+        else => return error.ExpectedRetry,
+    }
+
+    // The client accepted it: §17.2.5.2 allows exactly one, and it now addresses
+    // the server by the connection ID the Retry supplied.
+    try testing.expect(c.retry_seen);
+    try testing.expect(c.addressToken().len > 0);
+
+    // Its next Initial carries the token, and the server can now recover the
+    // original connection ID from it — which is the only copy that survives.
+    const second = try c.send(gpa, &buf);
+    const reparsed = try packet.parse(buf[0..second], 8);
+    const after = acceptor.classify(policy, reparsed.packet.protected, address, 1_100);
+    var server_options: ServerOptions = undefined;
+    switch (after) {
+        .accept => |a| {
+            try testing.expect(a.after_retry);
+            try testing.expect(a.original_destination.eql(&odcid));
+            try testing.expect(a.destination.eql(&retry_scid));
+            server_options = testServerOptions(retry_scid, a.original_destination, a.client_source);
+            // The two differ here, and only here: keys from what the client is
+            // using now, §7.3's report from what it used before the Retry.
+            server_options.destination = a.destination;
+            server_options.after_retry = true;
+        },
+        else => return error.ExpectedAccept,
+    }
+
+    // A server created from that decision derives Initial keys from the original
+    // connection ID, so the packet already in flight decrypts.
+    var srv = try Connection.initServer(server_options, @splat(0x52));
+    defer srv.deinit(gpa);
+    // A Retry proved the address, so §14.1's limit does not apply.
+    try testing.expect(srv.address_validated);
+
+    try srv.receive(gpa, buf[0..second]);
+    try exchange(gpa, &c, &srv, 12);
+
+    try testing.expect(c.isEstablished() and srv.isEstablished());
+    // The client verified §7.3 against what the Retry and the token carried:
+    // `original_destination_connection_id` *and* `retry_source_connection_id`.
+    try testing.expect(c.peerParameters() != null);
 }

@@ -158,6 +158,20 @@ pub const Parameters = struct {
         .max_idle_timeout_ms = 30_000,
         .active_connection_id_limit = 4,
     };
+
+    /// What a server advertises. It differs from a client's in exactly the place
+    /// the asymmetry is real: a server accepts client-opened bidirectional
+    /// streams — that is what a request is — while a client accepts none.
+    pub const server_defaults: Parameters = .{
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_local = 256 * 1024,
+        .initial_max_stream_data_bidi_remote = 256 * 1024,
+        .initial_max_stream_data_uni = 256 * 1024,
+        .initial_max_streams_bidi = 100,
+        .initial_max_streams_uni = 16,
+        .max_idle_timeout_ms = 30_000,
+        .active_connection_id_limit = 4,
+    };
 };
 
 /// Bytes `encode` will write, so a caller can size its buffer.

@@ -37,6 +37,7 @@ pub const recovery = @import("quic/recovery.zig");
 pub const client = @import("quic/client.zig");
 pub const server = @import("quic/server.zig");
 pub const connection = @import("quic/connection.zig");
+pub const acceptor = @import("quic/acceptor.zig");
 /// RFC 8448 test vectors, shared by the tests of the layers above.
 pub const rfc8448 = @import("quic/rfc8448.zig");
 
@@ -58,6 +59,7 @@ test {
     _ = recovery;
     _ = client;
     _ = server;
+    _ = acceptor;
     _ = connection;
     _ = rfc8448;
 }
