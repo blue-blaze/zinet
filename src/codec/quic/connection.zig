@@ -114,6 +114,24 @@ pub const Engine = union(enum) {
     }
 };
 
+/// One path validation in flight (§8.2.1).
+const PathValidation = struct {
+    /// The payload the peer must echo. §8.2.3: only a PATH_RESPONSE carrying this
+    /// exact value validates the path — an acknowledgement of the packet does not,
+    /// since an ACK can be spoofed by a peer that never received the challenge.
+    data: [8]u8,
+    /// Whether the challenge still needs to go out, or go out again. §13.3 sends
+    /// PATH_CHALLENGE periodically until answered, unlike PATH_RESPONSE.
+    pending: bool = true,
+    /// When to give up (§8.2.4).
+    deadline_ns: u64,
+    /// How many challenges have gone out for this validation, to keep the rate
+    /// below §8.2.1's "no more often than an Initial".
+    sent: u32 = 0,
+    /// When the last one went out, for the same reason.
+    last_sent_ns: u64 = 0,
+};
+
 pub const Error = error{
     /// §7.5: more out-of-order CRYPTO data than the buffer allows. A real limit:
     /// without it a peer sends one byte at a huge offset and we allocate to
@@ -434,6 +452,9 @@ const SentMeta = struct {
     /// resending it is resending the same frame, which is what §13.3 asks for.
     new_cids: [max_credit_frames_per_packet]u64 = undefined,
     new_cid_count: usize = 0,
+    /// Whether this packet carried a PATH_CHALLENGE. §13.3: a challenge is repeated
+    /// periodically until answered — unlike the response, which is sent once.
+    carried_path_challenge: bool = false,
     /// Whether this packet carried a NEW_TOKEN. §13.3: retransmitted if lost,
     /// since a client that never receives it simply validates its address the slow
     /// way next time — no harm, but no benefit either, and the frame is cheap.
@@ -568,6 +589,26 @@ pub const Connection = struct {
     new_cid_count: usize = 0,
     /// How many NEW_CONNECTION_ID frames have gone out, for tests.
     new_cids_sent: u64 = 0,
+
+    // ── §8.2.1 path validation, initiator side ──────────────────────────────
+    /// The validation in progress, if any.
+    ///
+    /// One at a time. §8.2 permits probing several paths at once, bounded by the
+    /// spare connection IDs the peer supplied, but each costs state and a timer,
+    /// and nothing here needs to probe more than the one path a peer just moved to.
+    /// The limit is stated rather than left implicit so that `beginPathValidation`
+    /// refusing a second one is not mistaken for a defect.
+    validating: ?PathValidation = null,
+    /// Where challenge payloads come from: a counter under a secret, rather than a
+    /// live entropy source, so a whole connection stays reproducible while §8.2.1's
+    /// "unpredictable data" still holds against anyone who does not know the seed.
+    challenge_secret: [32]u8 = @splat(0),
+    challenges_issued: u64 = 0,
+    /// Set when a validation succeeded, for the endpoint to act on.
+    path_validated: bool = false,
+    /// Set when a validation was abandoned (§8.2.4), so the caller can revert to
+    /// the last address it knew was good (§9.3.2).
+    path_validation_failed: bool = false,
     spaces: [Level.count]Space = .{ .{}, .{}, .{} },
 
     /// Ours, the peer's, and the bookkeeping §7.3 checks against.
@@ -708,6 +749,7 @@ pub const Connection = struct {
         self.spaces[@backingInt(Level.initial)].send = initial.client;
         self.spaces[@backingInt(Level.initial)].recv = initial.server;
 
+        self.challenge_secret = deriveChallengeSecret(seed);
         return self;
     }
 
@@ -765,7 +807,20 @@ pub const Connection = struct {
         self.spaces[@backingInt(Level.initial)].send = initial.server;
         self.spaces[@backingInt(Level.initial)].recv = initial.client;
 
+        self.challenge_secret = deriveChallengeSecret(seed);
         return self;
+    }
+
+    /// §8.2.1's "unpredictable data", derived from the seed the caller injected
+    /// rather than read from the system. Separate from the handshake's use of the
+    /// same seed by domain separation, so that a challenge reveals nothing about
+    /// key material.
+    fn deriveChallengeSecret(seed: [64]u8) [32]u8 {
+        var mac: std.crypto.auth.hmac.sha2.HmacSha256 = .init(&seed);
+        mac.update("zinet path challenge secret");
+        var digest: [32]u8 = undefined;
+        mac.final(&digest);
+        return digest;
     }
 
     pub fn deinit(self: *Connection, gpa: Allocator) void {
@@ -803,6 +858,10 @@ pub const Connection = struct {
     /// schedule the test writes.
     pub fn setTime(self: *Connection, now_ns: u64) void {
         self.now_ns = @max(self.now_ns, now_ns);
+        // §8.2.4 abandons a validation on a timer, so it has to be checked when time
+        // advances rather than when a packet arrives: a path that answers nothing
+        // produces no packets to hang the check on.
+        self.expirePathValidation();
     }
 
     /// The connection has left `.active` and may (once `.drained`) be freed.
@@ -996,6 +1055,61 @@ pub const Connection = struct {
         self.pending_stream_data = true;
     }
 
+    /// §8.2.1: start validating the path this connection is currently sending on.
+    ///
+    /// Returns false when one is already in progress, which is not an error: the
+    /// answer to "is this path good" is already being sought.
+    pub fn beginPathValidation(self: *Connection) bool {
+        if (self.validating != null) return false;
+
+        // §8.2.1: unpredictable data, so that a response can only come from someone
+        // who received the challenge. A counter under the connection's secret gives
+        // that without a live entropy source.
+        var mac: std.crypto.auth.hmac.sha2.HmacSha256 = .init(&self.challenge_secret);
+        var counter: [8]u8 = undefined;
+        std.mem.writeInt(u64, &counter, self.challenges_issued, .big);
+        mac.update("zinet path challenge");
+        mac.update(&counter);
+        var digest: [32]u8 = undefined;
+        mac.final(&digest);
+        self.challenges_issued += 1;
+
+        // §8.2.4 recommends three times the larger of the current PTO and the PTO a
+        // new path would start with. The new path's is the larger whenever the
+        // current one is fast, which is exactly when the recommendation matters.
+        // A fresh path starts from kInitialRtt with no variance, so its PTO is that
+        // RTT plus our own max_ack_delay allowance; `probeTimeout` supplies the
+        // current path's.
+        const pto = @max(self.rtt.probeTimeout(.application), recovery.initial_rtt_ns);
+        self.validating = .{
+            .data = digest[0..8].*,
+            .deadline_ns = self.now_ns +| 3 *| pto,
+        };
+        self.path_validated = false;
+        self.path_validation_failed = false;
+        return true;
+    }
+
+    /// Whether a challenge is owed. Separate from `validating != null` because a
+    /// validation in progress spends most of its life waiting for an answer.
+    fn owesPathChallenge(self: *const Connection) bool {
+        const v = self.validating orelse return false;
+        return v.pending;
+    }
+
+    /// §8.2.4: give up on a validation whose deadline has passed. Called from the
+    /// same place the other timers are serviced, so that a caller that never sends
+    /// still learns the path is dead.
+    fn expirePathValidation(self: *Connection) void {
+        const v = self.validating orelse return;
+        if (self.now_ns < v.deadline_ns) return;
+        self.validating = null;
+        // §9.3.2: the caller reverts to the last address it validated. Failure here
+        // is not a connection error — §8.2.4 is explicit that an unusable path does
+        // not imply an unusable connection.
+        self.path_validation_failed = true;
+    }
+
     /// §5.1.1: issue a spare connection ID and announce it to the peer.
     ///
     /// The ID and its stateless reset token come from the caller for the same
@@ -1182,6 +1296,9 @@ pub const Connection = struct {
             if (self.new_cid_count == self.new_cids.len) break;
             self.new_cids[self.new_cid_count] = sequence;
             self.new_cid_count += 1;
+        }
+        if (meta.carried_path_challenge) {
+            if (self.validating) |*v| v.pending = true;
         }
         if (meta.carried_new_token) self.new_token_sent = false;
         if (meta.carried_handshake_done) self.handshake_done_pending = true;
@@ -1650,12 +1767,20 @@ pub const Connection = struct {
                         self.path_response_count += 1;
                     }
                 },
-                // §19.18: a response whose data matches no challenge we sent *may*
-                // be a PROTOCOL_VIOLATION. Discarded instead, and deliberately:
-                // this endpoint sends no PATH_CHALLENGE, so every response is
-                // unmatched, and treating that as fatal would hand anyone who can
-                // inject one packet a way to close the connection.
-                .path_response => {},
+                .path_response => |data| {
+                    // §8.2.3: the path a challenge was *sent* on is validated by a
+                    // matching response arriving on any path.
+                    if (self.validating) |v| {
+                        if (std.mem.eql(u8, &v.data, data)) {
+                            self.validating = null;
+                            self.path_validated = true;
+                        }
+                    }
+                    // §19.18 makes an unmatched response a PROTOCOL_VIOLATION at
+                    // most a MAY, and it stays discarded here: an old response can
+                    // arrive after a validation was abandoned, and anyone able to
+                    // inject one packet should not be able to close the connection.
+                },
             }
         }
     }
@@ -2051,9 +2176,14 @@ pub const Connection = struct {
         // carry a full-size datagram *in both directions*. The same
         // anti-amplification exception applies, and §8.2.2 anticipates it — it is
         // expected when the challenge itself arrived unexpanded.
-        const carries_path_response = self.path_response_count > 0 and
+        // §8.2.1 says the same of a datagram carrying a PATH_CHALLENGE, for the
+        // matching reason: validation should establish that the path carries a
+        // full-size datagram, not merely that something got through. §8.2.1 also
+        // anticipates the anti-amplification exception, and requires a *second*
+        // validation later when it applies.
+        const carries_path_frame = (self.path_response_count > 0 or self.owesPathChallenge()) and
             wants[@backingInt(Level.one_rtt)];
-        const needs_padding = (wants[@backingInt(Level.initial)] or carries_path_response) and
+        const needs_padding = (wants[@backingInt(Level.initial)] or carries_path_frame) and
             limit >= min_initial_datagram;
 
         var len: usize = 0;
@@ -2089,6 +2219,9 @@ pub const Connection = struct {
 
         // Retirements owed for the peer's connection IDs need 1-RTT.
         if (level == .one_rtt and self.remote.pendingRetire().len > 0) return true;
+
+        // A path challenge owed (§8.2.1).
+        if (level == .one_rtt and self.owesPathChallenge()) return true;
 
         // A connection ID issued but not yet announced (§19.15).
         if (level == .one_rtt and self.new_cid_count > 0) return true;
@@ -2445,6 +2578,26 @@ pub const Connection = struct {
                 for (0..rest) |i| self.path_responses[i] = self.path_responses[sent + i];
                 self.path_response_count = rest;
                 self.path_responses_sent += sent;
+            }
+        }
+
+        // §8.2.1: the challenge that validates a path. Before stream data for the
+        // same reason as the announcements below — a path whose viability is unknown
+        // is not one to be filling with data — and one per packet, which §8.2.1 asks
+        // for explicitly.
+        if (level == .one_rtt and self.owesPathChallenge() and !terminal) {
+            const v = &self.validating.?;
+            const f: frame.Frame = .{ .path_challenge = &v.data };
+            if (len + frame.encodedLen(f) <= dest.len) {
+                len += frame.encode(dest[len..], f);
+                v.pending = false;
+                v.sent += 1;
+                v.last_sent_ns = self.now_ns;
+                meta.carried_path_challenge = true;
+                meta.ack_eliciting = true;
+                // Expanding the datagram to 1200 bytes (§8.2.1) is decided before
+                // any frame is written — see `needs_padding` in `send`, which asks
+                // the same question this branch does.
             }
         }
 
@@ -5805,4 +5958,119 @@ test "connection: an ID retired before it was announced is not announced" {
     while (try srv.send(gpa, &out) > 0) {}
     try testing.expectEqual(@as(u64, 0), srv.new_cids_sent);
     try testing.expectEqual(@as(usize, 0), srv.new_cid_count);
+}
+
+// ── Path validation, initiator side (§8.2.1, §8.2.3, §8.2.4) ─────────────────
+
+test "connection: a challenge is answered and the path is validated" {
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xd1);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    try testing.expect(srv.beginPathValidation());
+    // A second request is refused rather than starting a duplicate: the question is
+    // already being asked.
+    try testing.expect(!srv.beginPathValidation());
+    try testing.expect(srv.hasSomethingToSend(.one_rtt));
+
+    try exchange(gpa, cl, srv, 8);
+    try testing.expect(srv.path_validated);
+    try testing.expect(srv.validating == null);
+    try testing.expect(!srv.path_validation_failed);
+}
+
+test "connection: the challenge datagram is expanded to 1200 bytes" {
+    // §8.2.1: validation should establish that the path carries a full-size
+    // datagram, not merely that something got through.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xd2);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    var out: [max_datagram]u8 = undefined;
+    while (try srv.send(gpa, &out) > 0) {} // quiescent
+
+    try testing.expect(srv.beginPathValidation());
+    const n = try srv.send(gpa, &out);
+    try testing.expectEqual(@as(usize, min_initial_datagram), n);
+}
+
+test "connection: an unmatched response neither validates nor closes" {
+    // §19.18 makes this a MAY, and closing would let anyone able to inject one
+    // packet end the connection. It must also not be mistaken for success.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xd3);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    try testing.expect(srv.beginPathValidation());
+    var frames: [16]u8 = undefined;
+    const wrong: [8]u8 = @splat(0xee);
+    const frames_len = frame.encode(&frames, .{ .path_response = &wrong });
+    try injectOneRtt(gpa, cl, srv, frames[0..frames_len]);
+
+    try testing.expect(!srv.path_validated);
+    try testing.expect(srv.validating != null);
+    try testing.expect(srv.lifecycle() == .active);
+}
+
+test "connection: a validation nobody answers is abandoned on a timer" {
+    // §8.2.4: abandoned on a timer, and not a connection error — an unusable path
+    // does not imply an unusable connection. The caller learns of it so that it can
+    // revert to the last address it knew was good (§9.3.2).
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xd4);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    try testing.expect(srv.beginPathValidation());
+    const deadline = srv.validating.?.deadline_ns;
+
+    // Just short of the deadline: still waiting.
+    srv.setTime(deadline - 1);
+    try testing.expect(srv.validating != null);
+    try testing.expect(!srv.path_validation_failed);
+
+    srv.setTime(deadline);
+    try testing.expect(srv.validating == null);
+    try testing.expect(srv.path_validation_failed);
+    try testing.expect(!srv.path_validated);
+    try testing.expect(srv.lifecycle() == .active);
+}
+
+test "connection: a lost challenge is sent again" {
+    // §13.3: PATH_CHALLENGE is repeated until answered — the opposite of
+    // PATH_RESPONSE, which is sent once and then relies on a fresh challenge.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xd5);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    var out: [max_datagram]u8 = undefined;
+    while (try srv.send(gpa, &out) > 0) {}
+
+    try testing.expect(srv.beginPathValidation());
+    try testing.expect(try srv.send(gpa, &out) > 0);
+    try testing.expectEqual(@as(u32, 1), srv.validating.?.sent);
+    try testing.expect(!srv.owesPathChallenge());
+
+    // Declared lost: owed again, and with the *same* payload, since a different one
+    // would be a different question and the peer's answer could not be matched.
+    const data = srv.validating.?.data;
+    srv.validating.?.pending = true;
+    try testing.expect(srv.hasSomethingToSend(.one_rtt));
+    try testing.expect(try srv.send(gpa, &out) > 0);
+    try testing.expectEqual(@as(u32, 2), srv.validating.?.sent);
+    try testing.expectEqualSlices(u8, &data, &srv.validating.?.data);
 }
