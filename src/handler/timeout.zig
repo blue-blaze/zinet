@@ -210,9 +210,7 @@ pub const IdleCloser = struct {
     pub const handler_name = "idle-closer";
 
     pub fn init(on: []const IdleState) IdleCloser {
-        var set: std.EnumSet(IdleState) = .initEmpty();
-        for (on) |kind| set.insert(kind);
-        return .{ .on = set };
+        return .{ .on = .initMany(on) };
     }
 
     pub fn onEvent(self: *IdleCloser, ctx: *HandlerContext, event: Event) Error!void {
@@ -401,6 +399,54 @@ const TickCounter = struct {
         ctx.fireEvent(event);
     }
 };
+
+/// A sink that records whether it was closed, for the composition test below.
+const CloseWatch = struct {
+    closed: bool = false,
+
+    fn sink(self: *CloseWatch) pipeline_mod.Sink {
+        return .{ .context = self, .vtable = &.{
+            .write = nullWrite,
+            .flush = watchFlush,
+            .close = watchClose,
+        } };
+    }
+
+    fn watchFlush(_: *anyopaque) Error!void {}
+
+    fn watchClose(context: *anyopaque) Error!void {
+        const self: *CloseWatch = @ptrCast(@alignCast(context));
+        self.closed = true;
+    }
+};
+
+test "addReadTimeout: a quiet reader ends the connection" {
+    // The composition README promises as Netty's ReadTimeoutHandler. It was
+    // written, documented, and never called or tested — so nothing established
+    // that the two handlers it installs are in the right order, or that the
+    // closer listens for the kind of idleness the state handler reports.
+    const gpa = testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var watch: CloseWatch = .{};
+    var pipeline = try Pipeline.create(.{ .gpa = gpa, .io = io, .sink = watch.sink() });
+    defer pipeline.destroy();
+
+    try addReadTimeout(pipeline, .fromMilliseconds(10));
+    pipeline.fireActive();
+
+    // Real time rather than a reached-in `last_read`, because the point is to drive
+    // the composition the way an application does — the handlers it installs are
+    // owned by the pipeline and not reachable from here, which is itself the reason
+    // this went untested.
+    try io.sleep(.fromMilliseconds(25), .awake);
+    var tick: Channel.Tick = .{ .at = Io.Timestamp.now(io, .awake) };
+    pipeline.fireEvent(.init(&tick));
+
+    try testing.expect(watch.closed);
+}
 
 fn nullSink() pipeline_mod.Sink {
     return .{ .context = undefined, .vtable = &.{

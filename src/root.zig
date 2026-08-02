@@ -122,9 +122,38 @@ pub const connect = bootstrap.connect;
 /// Semantic version of the framework.
 pub const version = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 0 };
 
+/// Reference every public declaration, and every one inside those, so that the
+/// compiler analyses them.
+///
+/// `std.testing.refAllDecls` is one level deep, which is not enough here: this
+/// module is mostly re-exports, and referencing `pub const IdleCloser = ...` yields
+/// the type without analysing a single one of its methods. Zig only type-checks a
+/// function body when something reaches it, so "never called" and "never compiled"
+/// are the same condition — and a public API that no test exercises can be broken
+/// in a way no build reveals. That is exactly what happened to `IdleCloser.init`,
+/// which called an `EnumSet` constructor that does not exist in this Zig version and
+/// still shipped, because the only caller was `addReadTimeout` and nothing called
+/// that either.
+///
+/// This walks types rather than values, and stops at non-containers. It is a
+/// compile-time check with no run-time cost.
+fn refAllDeep(comptime T: type) void {
+    if (!@import("builtin").is_test) return;
+    inline for (comptime std.meta.declarations(T)) |decl_name| {
+        const field = @field(T, decl_name);
+        if (@TypeOf(field) == type) {
+            switch (@typeInfo(field)) {
+                .@"struct", .@"enum", .@"union", .@"opaque" => refAllDeep(field),
+                else => {},
+            }
+        }
+        _ = &field;
+    }
+}
+
 test {
     // Submodule tests are pulled in here as modules are added.
-    std.testing.refAllDecls(@This());
+    refAllDeep(@This());
     _ = bootstrap;
     _ = buffer;
     _ = channel;
