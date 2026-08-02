@@ -25,6 +25,8 @@ const qpack = http3.qpack;
 const Outcome = union(enum) {
     response: struct { status: [3]u8, len: usize, body: [4096]u8 },
     closed: u64,
+    /// §4.1.1: the request stream was reset, with the error code the peer chose.
+    reset: u64,
     timed_out,
 };
 
@@ -77,6 +79,10 @@ const Collector = struct {
             .peer_closed => |e| outcomes.putOne(self.io, .{ .closed = e.code }) catch {},
             .idle_timeout => outcomes.putOne(self.io, .timed_out) catch {},
             .goaway => {},
+            // §4.1.1: the server abandoned the exchange. Reported as an outcome
+            // rather than ignored, because the code says whether this request could
+            // be retried — which is the whole reason the code is carried.
+            .stream_reset => |e| outcomes.putOne(self.io, .{ .reset = e.code }) catch {},
         }
     }
 
@@ -148,6 +154,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .closed => |code| {
             std.debug.print("connection closed by peer, code 0x{x}\n", .{code});
             std.process.exit(3);
+        },
+        .reset => |code| {
+            // 0x010b is H3_REQUEST_REJECTED, which §4.1.1 says may be retried as
+            // though never sent; anything else promises less.
+            std.debug.print("request reset by peer, code 0x{x}{s}\n", .{
+                code,
+                if (code == 0x010b) " (rejected: safe to retry)" else "",
+            });
+            std.process.exit(5);
         },
         .timed_out => {
             std.debug.print("idle timeout\n", .{});

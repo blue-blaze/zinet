@@ -233,6 +233,13 @@ pub const Multiplexer = struct {
                 if (incoming.fin) multiplexer.finishInbound(incoming.stream);
                 return true;
             },
+            .stream_reset => |reset_event| {
+                // §4.1.1: the exchange is over, and the code is what the handler
+                // needs — it decides whether the request may be retried. `reset`
+                // was written for this and had no caller but a test.
+                multiplexer.reset(reset_event.stream, reset_event.code);
+                return true;
+            },
             .established, .goaway, .peer_closed, .idle_timeout => return false,
         }
     }
@@ -363,6 +370,8 @@ test "http3 multiplex: every declaration compiles" {
 /// A stream handler for tests: answers every request and records what it saw.
 const Responder = struct {
     reads: usize = 0,
+    /// The code from a `StreamReset`, if the handler was told of one.
+    reset_code: ?u64 = null,
     inbound_complete: bool = false,
     inactive: bool = false,
     saw_trailers: bool = false,
@@ -372,6 +381,10 @@ const Responder = struct {
     const Log = struct {
         created: usize = 0,
         finished: usize = 0,
+        /// The code of the last `StreamReset` any handler was told about. On the
+        /// shared log rather than the handler, because the handler is destroyed with
+        /// its pipeline the moment the reset is delivered.
+        last_reset_code: ?u64 = null,
     };
 
     pub fn onRead(self: *Responder, ctx: *HandlerContext, msg: Message) !void {
@@ -401,6 +414,10 @@ const Responder = struct {
     pub fn onEvent(self: *Responder, ctx: *HandlerContext, event: pipeline_mod.Event) !void {
         _ = ctx;
         if (event.get(InboundComplete) != null) self.inbound_complete = true;
+        if (event.get(StreamReset)) |reset| {
+            self.reset_code = reset.code;
+            self.log.last_reset_code = reset.code;
+        }
     }
 
     pub fn onInactive(self: *Responder, ctx: *HandlerContext) !void {
@@ -523,5 +540,53 @@ test "http3 multiplex: a reset tells the handler before the pipeline goes away" 
     // then does the pipeline go away.
     multiplexer.reset(4, 0x010c);
     try testing.expectEqual(@as(usize, 1), builder.log.finished);
+    try testing.expectEqual(@as(usize, 0), multiplexer.count());
+}
+
+test "http3 multiplex: a peer's reset reaches the stream handler with its code" {
+    // Through `dispatch` rather than by calling `reset` directly. The distinction
+    // matters: `reset` had no caller outside a test, so nothing established that a
+    // reset arriving from the peer was routed to the stream at all — and the code is
+    // what the handler needs, since §4.1.1 makes it the difference between a request
+    // that may be retried and one that may not.
+    const gpa = testing.allocator;
+    var threaded = try backend.Runtime.init(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try connection_mod.testPairForMultiplex(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try connection_mod.pumpForMultiplex(gpa, client, server, 16);
+
+    var builder: Builder = .{};
+    var multiplexer: Multiplexer = .init(gpa, io, server, .init(&builder));
+    defer multiplexer.deinit();
+
+    // A request the server has a stream for, left open at the client.
+    var buf: [8]@import("qpack.zig").FieldLine = undefined;
+    const id = try client.request(
+        gpa,
+        connection_mod.requestFields("GET", "https", "h", "/abandoned", &.{}, &buf),
+        false,
+    );
+    try connection_mod.pumpForMultiplex(gpa, client, server, 8);
+    while (server.nextEvent()) |event| _ = try multiplexer.dispatch(event);
+    try testing.expectEqual(@as(usize, 1), builder.log.created);
+
+    // The client gives up on it.
+    client.cancel(gpa, id, 0x010c); // H3_REQUEST_CANCELLED
+    try connection_mod.pumpForMultiplex(gpa, client, server, 8);
+
+    var handled = false;
+    while (server.nextEvent()) |event| {
+        if (try multiplexer.dispatch(event)) handled = true;
+    }
+    try testing.expect(handled);
+
+    // The handler heard it, with the code, before its pipeline went away.
+    try testing.expectEqual(@as(?u64, 0x010c), builder.log.last_reset_code);
     try testing.expectEqual(@as(usize, 0), multiplexer.count());
 }

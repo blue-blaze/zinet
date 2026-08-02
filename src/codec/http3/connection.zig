@@ -50,6 +50,15 @@ pub const Event = union(enum) {
     /// §5.2: the server is shutting down; requests on streams at or above
     /// `id` were not processed and are safe to retry elsewhere.
     goaway: struct { id: u64 },
+    /// §4.1.1: the peer abruptly terminated `stream`, giving `code`.
+    ///
+    /// The code is reported rather than swallowed because the whole point of
+    /// §4.1.1's vocabulary is what the application may do next:
+    /// `H3_REQUEST_REJECTED` says the request was never processed and may be
+    /// retried as though never sent, while `H3_REQUEST_CANCELLED` promises nothing
+    /// of the kind. An implementation that drops the code makes that distinction
+    /// unusable no matter how carefully the peer chose it.
+    stream_reset: struct { stream: u64, code: u64 },
     /// The peer closed the connection (either layer's mechanism).
     peer_closed: struct { code: u64, application: bool },
     /// The transport idled out (§10.1 of RFC 9000), silently.
@@ -279,6 +288,10 @@ pub const Connection = struct {
                     if (self.requests.getPtr(e.id)) |req| {
                         req.fin_seen = true;
                     }
+                    try self.events.append(gpa, .{ .stream_reset = .{
+                        .stream = e.id,
+                        .code = e.code,
+                    } });
                 },
                 .peer_closed => |e| try self.events.append(gpa, .{
                     .peer_closed = .{ .code = e.code, .application = e.application },
@@ -412,6 +425,42 @@ pub const Connection = struct {
         if (fin) try self.transport.finishStream(stream);
     }
 
+    /// §4.1.1: cancel an exchange, in whichever directions are still open.
+    ///
+    /// "Implementations SHOULD cancel requests by abruptly terminating any
+    /// directions of a stream that are still open": the sending part is reset and
+    /// reading is aborted on the receiving part. Both, because either alone leaves
+    /// the peer working — a reset with no STOP_SENDING lets a server keep producing
+    /// a response nobody will read, and a STOP_SENDING with no reset leaves the
+    /// server waiting for a request body that will never come.
+    ///
+    /// `code` is the application's, since only it knows which of §4.1.1's meanings
+    /// applies. A client cancelling because the response stopped being interesting
+    /// wants `H3_REQUEST_CANCELLED`; a server refusing without looking wants
+    /// `H3_REQUEST_REJECTED`, which §4.1.1 forbids for anything it has processed.
+    ///
+    /// Idempotent: cancelling twice, or cancelling a stream that has already ended,
+    /// does nothing. A cancel racing the last of a response is ordinary rather than
+    /// exceptional, and §4.1.1 says a client MAY use a complete response it has
+    /// already received.
+    pub fn cancel(self: *Connection, gpa: Allocator, id: u64, code: u64) void {
+        // Reset what we are still sending. The transport refuses this once the
+        // stream is in a terminal state, which is the "already ended" case.
+        self.transport.resetStream(id, code) catch {};
+        // And stop what is still arriving. §3.5 of RFC 9000 makes this a request
+        // that the peer reset its own sending side, which is how the other
+        // direction actually stops rather than merely being ignored.
+        self.transport.stopSending(id, code) catch {};
+
+        // Locally the exchange is over: no further events for it, and the state is
+        // released. Anything still in flight arrives for an unknown stream and is
+        // dropped, which is what `onRequestData`'s missing-entry path already does.
+        if (self.requests.fetchRemove(id)) |entry| {
+            var state = entry.value;
+            state.deinit(gpa);
+        }
+    }
+
     /// §5.2: announce that this endpoint is shutting down.
     ///
     /// The identifier means different things in each direction, which is the one
@@ -435,6 +484,31 @@ pub const Connection = struct {
         const len = frame.writeGoaway(&buf, value);
         _ = try self.transport.write(gpa, self.control_out.?, buf[0..len]);
         self.local_goaway_id = value;
+
+        // §5.2: "Upon sending a GOAWAY frame, the endpoint SHOULD explicitly cancel
+        // any requests or pushes that have identifiers greater than or equal to the
+        // one indicated, in order to clean up transport state for the affected
+        // streams." Without this the promise is made and the streams are left open,
+        // so both ends keep flow-control and stream state for exchanges neither
+        // intends to finish.
+        //
+        // H3_REQUEST_REJECTED, for the same reason the refusal path uses it: these
+        // are requests this endpoint has decided not to process, and §4.1.1's
+        // "as though they had never been sent" is what makes the GOAWAY identifier
+        // useful to a client choosing what to retry.
+        if (self.role == .server) {
+            var doomed: [32]u64 = undefined;
+            var found: usize = 0;
+            var it = self.requests.iterator();
+            while (it.next()) |kv| {
+                if (kv.key_ptr.* < value) continue;
+                if (found == doomed.len) break;
+                doomed[found] = kv.key_ptr.*;
+                found += 1;
+            }
+            // Collected first: cancelling mutates the map being walked.
+            for (doomed[0..found]) |id_above| self.cancel(gpa, id_above, 0x010b);
+        }
     }
 
     /// The largest stream ID a `goaway` may name and still be honest: one past
@@ -1829,4 +1903,135 @@ test "http3 server: MAX_PUSH_ID is accepted and never acted on" {
     _ = try client.request(gpa, requestFields("GET", "https", "h", "/", &.{}, &buf), true);
     try pumpH3(gpa, client, server, 8);
     try testing.expect(server.close_code == null);
+}
+
+// ── Request cancellation (§4.1.1) ─────────────────────────────────────────────
+
+test "http3: a cancelled request stops both directions" {
+    // §4.1.1: "abruptly terminating any directions of a stream that are still
+    // open". Both, and the test checks both, because either alone leaves the peer
+    // working on an exchange nobody will finish.
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    var buf: [8]qpack.FieldLine = undefined;
+    const id = try client.request(gpa, requestFields("GET", "https", "h", "/big", &.{}, &buf), false);
+    try pumpH3(gpa, client, server, 8);
+    while (server.nextEvent()) |_| {}
+
+    // The response is no longer of interest.
+    client.cancel(gpa, id, 0x010c); // H3_REQUEST_CANCELLED
+    try pumpH3(gpa, client, server, 8);
+
+    // The server was told to stop writing, and told the client had stopped reading.
+    const sender = &server.transport.streams.get(.init(id)).?.send.?;
+    try testing.expectEqual(@as(?u64, 0x010c), sender.stop_sending_code);
+    const receiver = &server.transport.streams.get(.init(id)).?.recv.?;
+    try testing.expectEqual(@as(?u64, 0x010c), receiver.reset_code);
+
+    // And locally the exchange is gone rather than merely quiet.
+    try testing.expect(!client.requests.contains(id));
+}
+
+test "http3: the reset code reaches the application" {
+    // The distinction §4.1.1 draws is only usable if the code survives the trip:
+    // H3_REQUEST_REJECTED licenses a retry, H3_REQUEST_CANCELLED does not.
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    var buf: [8]qpack.FieldLine = undefined;
+    const id = try client.request(gpa, requestFields("GET", "https", "h", "/gone", &.{}, &buf), true);
+    try pumpH3(gpa, client, server, 8);
+    while (server.nextEvent()) |_| {}
+    while (client.nextEvent()) |_| {}
+
+    // The server refuses it without processing.
+    server.cancel(gpa, id, 0x010b); // H3_REQUEST_REJECTED
+    try pumpH3(gpa, client, server, 8);
+
+    var saw: ?u64 = null;
+    while (client.nextEvent()) |event| switch (event) {
+        .stream_reset => |e| {
+            try testing.expectEqual(id, e.stream);
+            saw = e.code;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(?u64, 0x010b), saw);
+}
+
+test "http3: cancelling twice, or after the end, does nothing" {
+    // A cancel racing the last of a response is ordinary. It must not fail, and it
+    // must not produce a second reset — §13.3 of RFC 9000 requires a RESET_STREAM's
+    // content not to change once sent.
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    // Left open: a request whose FIN has been acknowledged has a *terminal* sending
+    // part, and §3.3 of RFC 9000 forbids RESET_STREAM from there — so that case
+    // exercises the refusal in the transport rather than the idempotence here.
+    var buf: [8]qpack.FieldLine = undefined;
+    const id = try client.request(gpa, requestFields("GET", "https", "h", "/twice", &.{}, &buf), false);
+    try pumpH3(gpa, client, server, 8);
+
+    client.cancel(gpa, id, 0x010c);
+    const first = client.transport.streams.get(.init(id)).?.send.?.reset_code;
+    client.cancel(gpa, id, 0x0101); // a different code, deliberately
+    const second = client.transport.streams.get(.init(id)).?.send.?.reset_code;
+    try testing.expectEqual(first, second);
+    try testing.expectEqual(@as(?u64, 0x010c), second);
+}
+
+test "http3: GOAWAY cleans up the streams it disowns" {
+    // §5.2: "Upon sending a GOAWAY frame, the endpoint SHOULD explicitly cancel any
+    // requests ... with identifiers greater than or equal to the one indicated, in
+    // order to clean up transport state for the affected streams." Announcing the
+    // line and leaving the streams open keeps state on both ends for exchanges
+    // neither intends to finish.
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    // Two requests in flight.
+    var buf: [8]qpack.FieldLine = undefined;
+    const first = try client.request(gpa, requestFields("GET", "https", "h", "/a", &.{}, &buf), true);
+    const second = try client.request(gpa, requestFields("GET", "https", "h", "/b", &.{}, &buf), true);
+    try pumpH3(gpa, client, server, 8);
+    try testing.expect(server.requests.contains(first));
+    try testing.expect(server.requests.contains(second));
+
+    // The line falls between them.
+    try server.goaway(gpa, second);
+    try testing.expect(server.requests.contains(first));
+    try testing.expect(!server.requests.contains(second));
+
+    try pumpH3(gpa, client, server, 8);
+    // The client learns why, with the code that lets it retry elsewhere.
+    var saw: ?u64 = null;
+    while (client.nextEvent()) |event| switch (event) {
+        .stream_reset => |e| if (e.stream == second) {
+            saw = e.code;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(?u64, 0x010b), saw);
 }
