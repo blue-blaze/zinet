@@ -349,6 +349,27 @@ pub const Local = struct {
         return sequence;
     }
 
+    /// The ID and stateless reset token issued under `sequence`, or null if it was
+    /// never issued or has since been retired.
+    ///
+    /// This exists so the frame that announces an issued ID can be built from the
+    /// one record of it rather than from a copy kept alongside: a NEW_CONNECTION_ID
+    /// that has to be retransmitted must carry the same ID and token as the packet
+    /// that was lost, and two copies of that are two chances to disagree.
+    pub fn issued(self: *const Local, sequence: u64) ?struct {
+        id: ConnectionId,
+        token: [stateless_reset_token_len]u8,
+    } {
+        for (self.entries[0..self.len]) |entry| {
+            if (entry.sequence != sequence) continue;
+            // Sequence zero is the handshake ID, which has no token of its own —
+            // it was never announced in a frame, so there is nothing to rebuild.
+            const token = entry.token orelse return null;
+            return .{ .id = entry.id, .token = token };
+        }
+        return null;
+    }
+
     /// Apply a RETIRE_CONNECTION_ID frame (§19.16).
     pub fn retire(self: *Local, sequence: u64) Error!void {
         // §19.16: retiring something never issued. Not reordering — a sequence

@@ -133,6 +133,10 @@ pub const Error = error{
     StatelessReset,
     /// The connection is closed and will not send or receive again.
     ConnectionClosed,
+    /// §5.1.1: the peer's `active_connection_id_limit` leaves no room to issue
+    /// another connection ID. Not a protocol violation — it is the peer's stated
+    /// limit being respected — but the caller asked for something impossible.
+    ConnectionIdLimitError,
 } || Allocator.Error;
 // Allocation failure is included rather than folded into a protocol error, for the
 // reason stream.zig gives: telling the peer PROTOCOL_VIOLATION because malloc
@@ -425,6 +429,11 @@ const SentMeta = struct {
     /// Stream IDs whose RESET_STREAM rode in this packet.
     resets: [max_credit_frames_per_packet]u64 = undefined,
     reset_count: u8 = 0,
+    /// Sequence numbers of NEW_CONNECTION_ID frames in this packet, to be announced
+    /// again if it is lost (§13.3). The frame carries its own sequence number, so
+    /// resending it is resending the same frame, which is what §13.3 asks for.
+    new_cids: [max_credit_frames_per_packet]u64 = undefined,
+    new_cid_count: usize = 0,
     /// Whether this packet carried a NEW_TOKEN. §13.3: retransmitted if lost,
     /// since a client that never receives it simply validates its address the slow
     /// way next time — no harm, but no benefit either, and the frame is cheap.
@@ -547,6 +556,18 @@ pub const Connection = struct {
     new_token_sent: bool = false,
     /// How many NEW_TOKEN frames have gone out, for tests.
     new_tokens_sent: u64 = 0,
+
+    // ── §5.1.1 spare connection IDs ─────────────────────────────────────────
+    /// Sequence numbers of IDs this endpoint has issued but not yet announced,
+    /// or announced in a packet since declared lost.
+    ///
+    /// Only the sequence number is held: the ID and its stateless reset token live
+    /// in `local`, and §13.3 requires a retransmission to carry the same ones, so
+    /// keeping a second copy here would be a second chance to disagree.
+    new_cids: [cid_mod.max_stored]u64 = undefined,
+    new_cid_count: usize = 0,
+    /// How many NEW_CONNECTION_ID frames have gone out, for tests.
+    new_cids_sent: u64 = 0,
     spaces: [Level.count]Space = .{ .{}, .{}, .{} },
 
     /// Ours, the peer's, and the bookkeeping §7.3 checks against.
@@ -975,6 +996,42 @@ pub const Connection = struct {
         self.pending_stream_data = true;
     }
 
+    /// §5.1.1: issue a spare connection ID and announce it to the peer.
+    ///
+    /// The ID and its stateless reset token come from the caller for the same
+    /// reason a NEW_TOKEN does: whoever routes packets to this connection has to
+    /// recognise the new ID, and this layer does not route. Handing it in means the
+    /// caller can register the route first, so an ID is never announced before
+    /// packets addressed to it can arrive somewhere useful.
+    ///
+    /// Returns the sequence number, or `error.ConnectionIdLimitError` when the
+    /// peer's `active_connection_id_limit` leaves no room.
+    pub fn issueConnectionId(
+        self: *Connection,
+        id: ConnectionId,
+        token: [cid_mod.stateless_reset_token_len]u8,
+    ) Error!u64 {
+        if (self.new_cid_count == self.new_cids.len) return error.ConnectionIdLimitError;
+        const sequence = self.local.issue(id, token) catch |err| switch (err) {
+            error.ConnectionIdLimitError => return error.ConnectionIdLimitError,
+            // §19.15: an endpoint using zero-length connection IDs must not issue
+            // any. Reaching this means the caller asked for something its own
+            // handshake ruled out.
+            error.ProtocolViolation => return error.ProtocolViolation,
+            // Neither belongs to issuing: one is about retiring something never
+            // issued, the other about running out of the *peer's* IDs.
+            error.ConnectionIdNotIssued, error.ConnectionIdExhausted => unreachable,
+        };
+        self.new_cids[self.new_cid_count] = sequence;
+        self.new_cid_count += 1;
+        return sequence;
+    }
+
+    /// Whether the peer's `active_connection_id_limit` leaves room for another.
+    pub fn canIssueConnectionId(self: *const Connection) bool {
+        return self.local.canIssue() and self.new_cid_count < self.new_cids.len;
+    }
+
     /// §8.1.3: give the client a token for a future connection.
     ///
     /// Server only. The token is minted by the caller because it must encode the
@@ -1115,6 +1172,16 @@ pub const Connection = struct {
             if (self.streams.get(.init(id))) |st| {
                 if (st.recv) |*receiver| receiver.rearmStopSending();
             }
+        }
+        for (meta.new_cids[0..meta.new_cid_count]) |sequence| {
+            // Whether the ID is still ours to announce is decided where the frame
+            // is built, not here. Testing it in both places would mean either test
+            // could be deleted without any visible effect, and this is the weaker
+            // of the two: an ID retired while still queued — never announced at
+            // all — is only caught there.
+            if (self.new_cid_count == self.new_cids.len) break;
+            self.new_cids[self.new_cid_count] = sequence;
+            self.new_cid_count += 1;
         }
         if (meta.carried_new_token) self.new_token_sent = false;
         if (meta.carried_handshake_done) self.handshake_done_pending = true;
@@ -2023,6 +2090,9 @@ pub const Connection = struct {
         // Retirements owed for the peer's connection IDs need 1-RTT.
         if (level == .one_rtt and self.remote.pendingRetire().len > 0) return true;
 
+        // A connection ID issued but not yet announced (§19.15).
+        if (level == .one_rtt and self.new_cid_count > 0) return true;
+
         // A NEW_TOKEN owed to the client (§19.7).
         if (level == .one_rtt and self.owesNewToken()) return true;
 
@@ -2376,6 +2446,47 @@ pub const Connection = struct {
                 self.path_response_count = rest;
                 self.path_responses_sent += sent;
             }
+        }
+
+        // §19.15: announce the IDs we have issued, before stream data rather than
+        // after it. The two are the same bookkeeping as the retire loop further
+        // down, and it is tempting to put them together — but a connection with
+        // data always queued would then never announce anything, and a peer that
+        // needs a spare ID before it can migrate would wait for a quiet moment
+        // that never comes. Retiring can wait, because nothing on the peer's side
+        // is blocked on it; being told about an ID is what unblocks the peer.
+        if (level == .one_rtt and !terminal) {
+            var kept: usize = 0;
+            for (self.new_cids[0..self.new_cid_count]) |sequence| {
+                const record = self.local.issued(sequence) orelse continue; // retired meanwhile
+                if (meta.new_cid_count == meta.new_cids.len) {
+                    self.new_cids[kept] = sequence;
+                    kept += 1;
+                    continue;
+                }
+                const f: frame.Frame = .{
+                    .new_connection_id = .{
+                        .sequence = sequence,
+                        // §5.1.2: we are not asking the peer to stop using anything, so
+                        // nothing is retired. Rotating our own IDs is a separate policy
+                        // and would say so here.
+                        .retire_prior_to = 0,
+                        .id = record.id.slice(),
+                        .reset_token = &record.token,
+                    },
+                };
+                if (len + frame.encodedLen(f) > dest.len) {
+                    self.new_cids[kept] = sequence;
+                    kept += 1;
+                    continue;
+                }
+                len += frame.encode(dest[len..], f);
+                meta.new_cids[meta.new_cid_count] = sequence;
+                meta.new_cid_count += 1;
+                meta.ack_eliciting = true;
+                self.new_cids_sent += 1;
+            }
+            self.new_cid_count = kept;
         }
 
         if (level == .one_rtt and self.established and !terminal) {
@@ -5494,4 +5605,204 @@ test "connection: a NEW_TOKEN token skips the Retry on the next connection" {
     try srv.receive(gpa, buf[0..first]);
     try exchange(gpa, &cl, &srv, 12);
     try testing.expect(cl.isEstablished() and srv.isEstablished());
+}
+
+// ── NEW_CONNECTION_ID (§5.1.1, §19.15) ───────────────────────────────────────
+
+test "connection: an issued connection ID is announced and the peer stores it" {
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xc1);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    const before = cl.remote.count();
+    const spare = testCid(&.{ 0xd0, 0xd1, 0xd2, 0xd3 });
+    const token: [cid_mod.stateless_reset_token_len]u8 = @splat(0x5c);
+    const sequence = try srv.issueConnectionId(spare, token);
+    try testing.expectEqual(@as(u64, 1), sequence);
+    try testing.expect(srv.new_cid_count == 1);
+
+    try exchange(gpa, cl, srv, 8);
+    try testing.expectEqual(@as(u64, 1), srv.new_cids_sent);
+    try testing.expectEqual(@as(usize, 0), srv.new_cid_count);
+
+    // The client holds it now, and the stateless reset token came with it — which
+    // is the part that cannot be recovered later if it is wrong.
+    try testing.expectEqual(before + 1, cl.remote.count());
+    try testing.expect(cl.remote.matchesResetToken(&token));
+}
+
+test "connection: an announced ID is one the peer can address us by" {
+    // The point of issuing: a packet sent to the spare ID must reach the same
+    // connection. Without this the frame is a courtesy the peer cannot use.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xc2);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    const spare = testCid(&.{ 0xe0, 0xe1, 0xe2, 0xe3 });
+    _ = try srv.issueConnectionId(spare, @splat(0x6c));
+    try exchange(gpa, cl, srv, 8);
+
+    try testing.expect(srv.local.accepts(&spare));
+    // And the handshake ID still works: issuing does not retire anything, because
+    // we sent `retire_prior_to = 0`.
+    try testing.expect(srv.local.accepts(&srv.local.initialId()));
+}
+
+test "connection: a lost NEW_CONNECTION_ID is announced again" {
+    // §13.3, through the real loss path rather than by hand: the packet carrying
+    // the announcement goes unacknowledged while three newer ones are confirmed,
+    // which is what §6.1.1 calls lost. Setting the queue directly would have
+    // tested that a second send works, not that a loss causes one.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xc3);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    // A stream the server may write on, to have something to fill later packets.
+    const id = try cl.openStream(gpa, true);
+    _ = try cl.write(gpa, id, "hi");
+    try exchange(gpa, cl, srv, 8);
+    srv.consume(gpa, id, srv.read(id).len);
+
+    var out: [max_datagram]u8 = undefined;
+    while (try srv.send(gpa, &out) > 0) {} // quiescent, so the numbering is ours
+
+    const first_pn = srv.spaceFor(.one_rtt).next_pn;
+    _ = try srv.issueConnectionId(testCid(&.{ 0xf0, 0xf1, 0xf2, 0xf3 }), @splat(0x7c));
+    try testing.expect(try srv.send(gpa, &out) > 0);
+    try testing.expectEqual(@as(usize, 0), srv.new_cid_count);
+    try testing.expectEqual(@as(u64, 1), srv.new_cids_sent);
+
+    // Three more packets, so the announcement's is three below the newest —
+    // exactly §6.1.1's packet threshold.
+    for ([_][]const u8{ "aaaa", "bbbb", "cccc" }) |chunk| {
+        _ = try srv.write(gpa, id, chunk);
+        try testing.expect(try srv.send(gpa, &out) > 0);
+    }
+    try testing.expectEqual(first_pn + 4, srv.spaceFor(.one_rtt).next_pn);
+
+    // The client acknowledges only the newest.
+    var frames: [64]u8 = undefined;
+    const frames_len = frame.encode(&frames, .{ .ack = .{
+        .largest = first_pn + 3,
+        .delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges = &.{},
+        .ecn = null,
+    } });
+    try injectOneRtt(gpa, cl, srv, frames[0..frames_len]);
+
+    // The loss put the announcement back in the queue by itself.
+    try testing.expectEqual(@as(usize, 1), srv.new_cid_count);
+    try testing.expect(srv.hasSomethingToSend(.one_rtt));
+    try testing.expect(try srv.send(gpa, &out) > 0);
+    try testing.expectEqual(@as(u64, 2), srv.new_cids_sent);
+    // The same sequence number, because the frame carries it: resending the frame
+    // is resending the information, which is what §13.3 asks for.
+    try testing.expect(srv.local.issued(1) != null);
+}
+
+test "connection: announcements that do not fit wait for the next packet" {
+    // Reached through `writeFrames` rather than `send`, because `send` cannot
+    // produce it: a datagram has a 1200-byte floor and the most IDs the peer's
+    // limit permits fit in a few hundred bytes. The rule still has to hold — the
+    // limits are parameters, and a peer that never hears about an ID it was never
+    // told about cannot ask for it — so it is tested where it is decidable.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xc5);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    var issued: usize = 0;
+    while (srv.canIssueConnectionId()) {
+        const b: u8 = @intCast(0x50 + issued);
+        _ = try srv.issueConnectionId(testCid(&.{ b, b, b, b, b, b, b, b }), @splat(b));
+        issued += 1;
+    }
+    try testing.expect(issued >= 2);
+
+    // Room for one announcement and not two: 1 type byte + 2 varints + 1 length
+    // + 8 bytes of ID + a 16-byte token is 29, and an ACK may precede it.
+    var payload: [64]u8 = undefined;
+    var meta: SentMeta = .{ .number = 0 };
+    const written = srv.writeFrames(&payload, .one_rtt, 0, &meta);
+    try testing.expect(written > 0);
+
+    // Some went out, the rest are still queued rather than gone.
+    try testing.expect(srv.new_cids_sent > 0);
+    try testing.expect(srv.new_cid_count > 0);
+    try testing.expectEqual(issued, srv.new_cid_count + @as(usize, @intCast(srv.new_cids_sent)));
+
+    // Nothing was lost: a full-size packet carries the remainder.
+    var out: [max_datagram]u8 = undefined;
+    _ = try srv.send(gpa, &out);
+    try testing.expectEqual(@as(usize, 0), srv.new_cid_count);
+    try testing.expectEqual(issued, @as(usize, @intCast(srv.new_cids_sent)));
+}
+
+test "connection: issuing stops at the peer's active_connection_id_limit" {
+    // §5.1.1: the limit is the peer's, and exceeding it is a
+    // CONNECTION_ID_LIMIT_ERROR on its side — so the refusal has to happen here.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xc4);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    var issued: usize = 0;
+    while (srv.canIssueConnectionId()) {
+        const b: u8 = @intCast(0x40 + issued);
+        _ = try srv.issueConnectionId(testCid(&.{ b, b, b, b }), @splat(b));
+        issued += 1;
+        try testing.expect(issued <= cid_mod.max_stored);
+    }
+    try testing.expect(issued > 0);
+    try testing.expectError(
+        error.ConnectionIdLimitError,
+        srv.issueConnectionId(testCid(&.{ 9, 9, 9, 9 }), @splat(0x99)),
+    );
+
+    // All of them reach the client, across as many packets as it takes.
+    try exchange(gpa, cl, srv, 12);
+    try testing.expectEqual(@as(usize, 0), srv.new_cid_count);
+    try testing.expectEqual(issued, @as(usize, @intCast(srv.new_cids_sent)));
+}
+
+test "connection: an ID retired before it was announced is not announced" {
+    // The peer can retire a sequence number it has only just heard of, or one it
+    // infers; either way an ID can leave the queue between being issued and being
+    // sent. Announcing it then would contradict our own bookkeeping — we would be
+    // offering an ID we no longer accept.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xc6);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    const sequence = try srv.issueConnectionId(testCid(&.{ 0xa8, 0xa9, 0xaa, 0xab }), @splat(0x8c));
+    try testing.expectEqual(@as(usize, 1), srv.new_cid_count);
+
+    // Retired before a single packet carried it.
+    var frames: [16]u8 = undefined;
+    const frames_len = frame.encode(&frames, .{ .retire_connection_id = sequence });
+    try injectOneRtt(gpa, cl, srv, frames[0..frames_len]);
+    try testing.expect(srv.local.issued(sequence) == null);
+
+    var out: [max_datagram]u8 = undefined;
+    while (try srv.send(gpa, &out) > 0) {}
+    try testing.expectEqual(@as(u64, 0), srv.new_cids_sent);
+    try testing.expectEqual(@as(usize, 0), srv.new_cid_count);
 }
