@@ -89,6 +89,10 @@ const Entry = struct {
     address: Io.net.IpAddress,
     /// Our connection ID, which is also the key this entry is found by.
     local_cid: ConnectionId,
+    /// Whether a NEW_TOKEN has been minted for this connection. One is enough:
+    /// §8.1.3 lets a server send several, but each is a credential and the client
+    /// only needs one to skip validation next time.
+    token_offered: bool = false,
     /// Set when the connection has failed or drained and the entry is awaiting
     /// removal. Kept a moment longer than it is useful so that `receive` can
     /// answer §10.2.1's re-sends of CONNECTION_CLOSE.
@@ -206,6 +210,7 @@ pub const Handler = struct {
                 entry.finished = true;
             };
             try self.dispatchEvents(entry);
+            self.offerToken(entry, from);
             try self.pump(ctx, entry);
             self.sweep();
             return;
@@ -334,6 +339,35 @@ pub const Handler = struct {
             }
         }
         _ = self;
+    }
+
+    /// §8.1.3: once the handshake is confirmed, give the client a token it can
+    /// replay on a future connection to skip address validation.
+    ///
+    /// Minted here rather than in the connection because it must encode the
+    /// client's address (§8.1.4), and the address is something only this layer
+    /// knows — the connection is handed datagrams, not peers. The same division
+    /// that puts `acceptor.zig` outside the connection.
+    fn offerToken(self: *Handler, entry: *Entry, from: Io.net.IpAddress) void {
+        if (entry.token_offered) return;
+        if (!entry.conn.transport.handshake_confirmed) return;
+
+        var address_buf: [quic.acceptor.max_address_len]u8 = undefined;
+        const address = encodeAddress(&address_buf, from);
+        var token_buf: [quic.acceptor.max_token_len]u8 = undefined;
+        const token = quic.acceptor.mintToken(
+            &token_buf,
+            self.options.token_key,
+            .new_token,
+            self.nowMillis(),
+            address,
+            // §8.1.4: a NEW_TOKEN token must carry nothing an observer could use to
+            // link it to the connection that issued it. No connection ID goes in,
+            // which is exactly what distinguishes this from a Retry token.
+            null,
+        ) catch return;
+        entry.conn.transport.queueNewToken(token) catch return;
+        entry.token_offered = true;
     }
 
     /// Everything the connection wants on the wire.

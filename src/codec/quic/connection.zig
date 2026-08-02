@@ -425,6 +425,10 @@ const SentMeta = struct {
     /// Stream IDs whose RESET_STREAM rode in this packet.
     resets: [max_credit_frames_per_packet]u64 = undefined,
     reset_count: u8 = 0,
+    /// Whether this packet carried a NEW_TOKEN. §13.3: retransmitted if lost,
+    /// since a client that never receives it simply validates its address the slow
+    /// way next time — no harm, but no benefit either, and the frame is cheap.
+    carried_new_token: bool = false,
     /// Stream IDs whose STOP_SENDING rode in this packet. §13.3 requires
     /// retransmission if it is lost — the opposite of PATH_RESPONSE, and the
     /// reason is that nothing else will remind the peer.
@@ -529,6 +533,20 @@ pub const Connection = struct {
     path_response_count: usize = 0,
     /// How many responses have been sent, for tests.
     path_responses_sent: u64 = 0,
+
+    // ── §8.1.3 address validation for future connections ────────────────────
+    /// A token to hand the client in a NEW_TOKEN frame, so its *next* connection
+    /// can skip address validation.
+    ///
+    /// Minted by the layer that owns the socket and queued here, because building
+    /// one requires the client's address and this layer never sees an address —
+    /// it is handed datagrams, not connections. That division is why
+    /// `acceptor.zig` exists, and this keeps to it.
+    new_token_buf: [max_token_len]u8 = undefined,
+    new_token_len: usize = 0,
+    new_token_sent: bool = false,
+    /// How many NEW_TOKEN frames have gone out, for tests.
+    new_tokens_sent: u64 = 0,
     spaces: [Level.count]Space = .{ .{}, .{}, .{} },
 
     /// Ours, the peer's, and the bookkeeping §7.3 checks against.
@@ -957,6 +975,34 @@ pub const Connection = struct {
         self.pending_stream_data = true;
     }
 
+    /// §8.1.3: give the client a token for a future connection.
+    ///
+    /// Server only. The token is minted by the caller because it must encode the
+    /// client's address (§8.1.4 requires that a NEW_TOKEN token let the server
+    /// verify the address has not changed), and an address is something this layer
+    /// is never told.
+    ///
+    /// Queued rather than sent: §8.1.3 has the frame go out after the handshake is
+    /// confirmed, and the caller should not have to know when that is.
+    pub fn queueNewToken(self: *Connection, token: []const u8) Error!void {
+        assert(self.role == .server);
+        if (token.len == 0 or token.len > max_token_len) return error.BufferTooSmall;
+        @memcpy(self.new_token_buf[0..token.len], token);
+        self.new_token_len = token.len;
+        self.new_token_sent = false;
+        return;
+    }
+
+    /// Whether a NEW_TOKEN frame is owed. Public so the layer that mints tokens
+    /// can avoid minting a second one while the first is still in flight.
+    pub fn owesNewToken(self: *const Connection) bool {
+        if (self.new_token_len == 0) return false;
+        if (self.new_token_sent) return false;
+        // §8.1.3: after the handshake is confirmed. Before that the client has no
+        // use for it, and 1-RTT keys may not exist to carry it.
+        return self.handshake_confirmed;
+    }
+
     /// §3.5: tell the peer to stop sending on `id`.
     ///
     /// For an application that has lost interest in what is arriving — HTTP/3
@@ -1070,6 +1116,7 @@ pub const Connection = struct {
                 if (st.recv) |*receiver| receiver.rearmStopSending();
             }
         }
+        if (meta.carried_new_token) self.new_token_sent = false;
         if (meta.carried_handshake_done) self.handshake_done_pending = true;
         if (meta.carried_max_data) self.rearm_max_data = true;
         if (meta.carried_max_streams[0]) self.rearm_max_streams[0] = true;
@@ -1976,6 +2023,9 @@ pub const Connection = struct {
         // Retirements owed for the peer's connection IDs need 1-RTT.
         if (level == .one_rtt and self.remote.pendingRetire().len > 0) return true;
 
+        // A NEW_TOKEN owed to the client (§19.7).
+        if (level == .one_rtt and self.owesNewToken()) return true;
+
         // A STOP_SENDING owed to the peer. Here as well as in `writeFrames`, for
         // the reason stated below it.
         if (level == .one_rtt and self.owesStopSending()) return true;
@@ -2271,6 +2321,20 @@ pub const Connection = struct {
                 meta.crypto_len = take;
                 meta.ack_eliciting = true;
                 sp.crypto_sent += take;
+            }
+        }
+
+        // §19.7: NEW_TOKEN, the other frame only a server sends and only once. Next
+        // to HANDSHAKE_DONE because they travel together in practice — the
+        // handshake being confirmed is what makes both of them due.
+        if (level == .one_rtt and self.owesNewToken() and !terminal) {
+            const f: frame.Frame = .{ .new_token = self.new_token_buf[0..self.new_token_len] };
+            if (len + frame.encodedLen(f) <= dest.len) {
+                len += frame.encode(dest[len..], f);
+                self.new_token_sent = true;
+                self.new_tokens_sent += 1;
+                meta.carried_new_token = true;
+                meta.ack_eliciting = true;
             }
         }
 
@@ -5318,4 +5382,116 @@ test "connection: STOP_SENDING is not asked for once the size is known" {
 
     try srv.stopSending(id, 3);
     try testing.expect(!srv.owesStopSending());
+}
+
+// ── NEW_TOKEN (§8.1.3, §19.7) ────────────────────────────────────────────────
+
+test "connection: a queued NEW_TOKEN reaches the client and is reported" {
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xa1);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    try testing.expect(srv.handshake_confirmed);
+    try srv.queueNewToken("a-token-for-next-time");
+    try testing.expect(srv.owesNewToken());
+    try exchange(gpa, cl, srv, 8);
+
+    try testing.expectEqual(@as(u64, 1), srv.new_tokens_sent);
+    var saw: []const u8 = &.{};
+    while (cl.nextEvent()) |event| switch (event) {
+        .new_token => |token| saw = token,
+        else => {},
+    };
+    try testing.expectEqualStrings("a-token-for-next-time", saw);
+}
+
+test "connection: NEW_TOKEN waits for the handshake to be confirmed" {
+    // §8.1.3. Before confirmation the client has no use for it, and the 1-RTT keys
+    // that would carry it may not exist.
+    const gpa = testing.allocator;
+    initServerIdentity();
+    const dcid = testCid(&.{ 4, 4, 4, 4, 4, 4, 4, 4 });
+    var srv = try Connection.initServer(
+        testServerOptions(testCid(&.{ 5, 5, 5, 5 }), dcid, testCid(&.{ 6, 6, 6, 6 })),
+        @splat(0xa2),
+    );
+    defer srv.deinit(gpa);
+
+    try srv.queueNewToken("too-early");
+    try testing.expect(!srv.owesNewToken());
+    try testing.expect(!srv.handshake_confirmed);
+}
+
+test "connection: a lost NEW_TOKEN is sent again" {
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xa3);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    try srv.queueNewToken("token");
+    var out: [max_datagram]u8 = undefined;
+    const n = try srv.send(gpa, &out);
+    try testing.expect(n > 0);
+    try testing.expect(!srv.owesNewToken());
+
+    // §13.3: declared lost, so it goes again.
+    srv.new_token_sent = false;
+    try testing.expect(srv.owesNewToken());
+    const again = try srv.send(gpa, &out);
+    try testing.expect(again > 0);
+    try testing.expectEqual(@as(u64, 2), srv.new_tokens_sent);
+}
+
+test "connection: a NEW_TOKEN token skips the Retry on the next connection" {
+    // The point of the whole feature, and the only test that shows it: a token
+    // issued on one connection is accepted on a *different* one, and the server
+    // that would otherwise have demanded a Retry accepts immediately.
+    const gpa = testing.allocator;
+    const acceptor = @import("acceptor.zig");
+    const policy: acceptor.Policy = .{ .key = .init(@splat(0xa4)), .require_validation = true };
+    const address = "\x0a\x00\x00\x05\x1f\x40";
+
+    // Issued during an earlier connection.
+    var token_buf: [acceptor.max_token_len]u8 = undefined;
+    const token = try acceptor.mintToken(&token_buf, policy.key, .new_token, 1_000, address, null);
+
+    // A fresh connection attempt carrying it.
+    initServerIdentity();
+    const odcid = testCid(&.{ 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7 });
+    var options = testOptions(testCid(&.{ 7, 7, 7, 7 }), odcid);
+    options.token = token;
+    var cl = try Connection.initClient(options, @splat(0xa5));
+    defer cl.deinit(gpa);
+    try cl.start(gpa);
+
+    var buf: [max_datagram]u8 = undefined;
+    const first = try cl.send(gpa, &buf);
+    const parsed = try packet.parse(buf[0..first], 8);
+
+    // Without the token this policy demands a Retry. With it, the server accepts.
+    switch (acceptor.classify(policy, parsed.packet.protected, address, 1_100)) {
+        .accept => |a| {
+            try testing.expect(!a.after_retry);
+            // A NEW_TOKEN token carries no connection ID (§8.1.4), so §7.3's
+            // original is whatever the client addressed — which is correct, since
+            // no Retry intervened.
+            try testing.expect(a.original_destination.eql(&odcid));
+        },
+        else => return error.ExpectedAcceptWithoutRetry,
+    }
+
+    // And the round trip completes, which is what the client gains: one fewer.
+    var srv = try Connection.initServer(
+        testServerOptions(testCid(&.{ 8, 8, 8, 8 }), odcid, testCid(&.{ 7, 7, 7, 7 })),
+        @splat(0xa6),
+    );
+    defer srv.deinit(gpa);
+    try srv.receive(gpa, buf[0..first]);
+    try exchange(gpa, &cl, &srv, 12);
+    try testing.expect(cl.isEstablished() and srv.isEstablished());
 }
