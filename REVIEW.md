@@ -161,6 +161,104 @@ Two self-check tests assert the harness actually observes what the targets
 compare, because a fuzz target that sees nothing passes everything. One of them
 immediately caught a mistake in the corpus itself.
 
+## Shapes, not instances
+
+By the time the QUIC sending sides were finished, the same few mistakes had been
+made often enough to be worth naming. What follows is each shape, its symptom, the
+instances, and — where one exists — the check that turns it from something to
+remember into something the build enforces. That last column is the point: a shape
+that has recurred seven times will recur again, and a reviewer's attention is not a
+control.
+
+### A rule implemented twice
+
+**Symptom: break one copy and the whole suite still passes.** Two statements of one
+rule are not redundancy, because they drift, and the drift is silent — each copy
+looks correct in isolation. Worse, they are usually *not* equivalent, so which one
+survives a refactor decides behaviour.
+
+Instances: ACK's `-2` in range decoding; HANDSHAKE_DONE's `hasSomethingToSend`
+clause; STOP_SENDING's "size already known" test, written once where the request is
+recorded and once where the frame is sent; NEW_CONNECTION_ID's "still ours to
+announce" test; and the filter picking an entry's owning connection ID, written in
+both `sweep` and teardown, where the second copy's absence is a double free rather
+than a miscount.
+
+Twice the two copies were unequal and the *weaker* one was the one that had a test.
+STOP_SENDING's interesting case is a request made before the FIN arrives and rendered
+pointless by it, which only the send-time check catches. So the resolution is not
+"delete a duplicate" but "decide where the question is asked" — at the moment the
+answer is needed — and remove the other.
+
+No mechanical check. What works is the mutation habit: break one copy on purpose and
+require that a named test fails.
+
+### A key cut and never put in the lock
+
+**Symptom: a function, complete and sometimes unit-tested, that nothing calls.** The
+rule is written down; the code path that owes it never asks.
+
+Instances, in order: `Send.owesReset`, so a received STOP_SENDING got an event and no
+RESET_STREAM, leaving the peer's stream open forever; `acceptor.mintToken` for
+`.new_token`, so the token machinery existed and no token was ever issued;
+`cid.Local.issue`, so no spare connection ID was ever announced; `Frame.isProbing`,
+documented against §9.1 and never consulted, so migration detection did not exist;
+and PATH_RESPONSE, which was *blocked* by a comment confusing "answer a challenge"
+with "migrate to a path".
+
+This shape has a mechanical check, and it found something worse than an unused
+function. In Zig a function body is analysed only when something reaches it, so
+**never called and never compiled are the same condition**. `IdleCloser.init` called
+an `EnumSet` constructor that does not exist in this version and shipped anyway,
+because its only caller was `addReadTimeout` and nothing called that. `refAllDecls`
+was already present and did not help: it is one level deep, and referencing a
+re-exported type analyses none of its methods. `refAllDeep` in `root.zig` recurses,
+and was verified by restoring the broken call with the new test disabled — the build
+still fails.
+
+The check tells you a declaration compiles, not that anything uses it. The remaining
+question is per case: wire it, test it, or say why it has no caller. `cid.Remote.rotate`
+and `retireActive` now say: rotating the ID we send to is what a migrating client does,
+and client-initiated migration is not implemented.
+
+### A rule stated where nothing consults it
+
+Close to the above and worth separating, because the remedy is the opposite. A
+predicate that states a fact authoritatively while the real decision is made
+elsewhere is worse than no predicate: the next reader believes it is the source of
+truth. `Frame.carriesHeaderBlock` named the set {HEADERS, PUSH_PROMISE, CONTINUATION}
+while the routing switch decided, and `Assembler.guard` enforced the sequence. It was
+deleted rather than wired, because the routing switch has to enumerate frame types
+anyway.
+
+### Returned by value with a pointer into itself
+
+**Symptom: a value that is correct where it is built and wrong one assignment later.**
+If a struct's field points at something constructed alongside it, returning it by
+value copies the pointer and drops the target.
+
+Instances: QUIC transport parameters, where the encoded slice pointed into a buffer
+that died with the constructor's frame; and the HTTP/3 server's listen initializer.
+`EventLoopGroup` and `backend.Runtime` must be initialised in place for the same
+reason.
+
+No clean mechanical check was found. Scanning for structs holding both a fixed buffer
+and a slice produces mostly false positives, because function parameter lists look the
+same to a regex, and the true cases are about what the slice *points at* rather than
+its type. The rule that does work is structural: **a type with a field pointing into
+itself takes `init(*Self)` and offers no by-value constructor**, so the mistake cannot
+be expressed.
+
+### One name, two jobs
+
+**Symptom: the rule is hard to state without saying "except when".** Instances:
+`destination` used for both the connection ID we are addressed by and the one the
+client originally chose, which §7.3 requires be kept apart; and a single key-phase
+field for both directions, when the endpoint that starts a rotation writes in the new
+generation a round trip before its peer follows. Both were resolved by splitting the
+name, and in both cases the split made a rule that had been awkward to write become
+obvious.
+
 ## Fuzz findings
 
 All three were the same bug class: a decode failure and the accumulating

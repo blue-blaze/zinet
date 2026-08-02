@@ -140,15 +140,6 @@ pub const FrameType = enum(u8) {
             _ => "UNKNOWN",
         };
     }
-
-    /// Whether a header block continues past this frame, i.e. whether a
-    /// `CONTINUATION` may follow it.
-    pub fn carriesHeaderBlock(frame_type: FrameType) bool {
-        return switch (frame_type) {
-            .headers, .push_promise, .continuation => true,
-            else => false,
-        };
-    }
 };
 
 /// The flags byte. One bit position means different things in different frames —

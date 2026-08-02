@@ -191,6 +191,12 @@ pub const Remote = struct {
     ///
     /// Returns the sequence number now in use, or null if nothing unused is
     /// available — the caller must then not migrate rather than reuse.
+    /// Switch to another connection ID the peer issued (§5.1.2).
+    ///
+    /// Has no caller in the library, and that is a statement about scope rather than
+    /// an oversight: rotating the ID we send to is what a *migrating* client does
+    /// (§9.5 forbids reusing one across local addresses), and client-initiated
+    /// migration is not implemented. See HTTP3.md.
     pub fn rotate(self: *Remote) ?u64 {
         const current = self.entries[self.active_index].sequence;
         for (self.entries[0..self.len], 0..) |entry, i| {
@@ -203,6 +209,9 @@ pub const Remote = struct {
 
     /// Retire the ID in use and move to another, then owe the peer a
     /// RETIRE_CONNECTION_ID for it.
+    /// Retire the ID currently in use and move to the next (§19.16).
+    ///
+    /// Also without a caller, for the same reason as `rotate`.
     pub fn retireActive(self: *Remote) Error!u64 {
         const sequence = self.entries[self.active_index].sequence;
         if (self.len == 1) return error.ConnectionIdExhausted;
