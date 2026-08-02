@@ -87,8 +87,22 @@ const Entry = struct {
     conn: Connection,
     mux: multiplex.Multiplexer,
     address: Io.net.IpAddress,
-    /// Our connection ID, which is also the key this entry is found by.
+    /// Our connection ID from the handshake. Also `cid_keys[0]`, the key this
+    /// entry is owned by.
     local_cid: ConnectionId,
+    /// Every key in the routing table that reaches this entry: the handshake ID
+    /// first, then each spare issued under §5.1.1. A short-header packet carries
+    /// only a connection ID, so a spare the client starts using has to be a key
+    /// here or its packets go nowhere.
+    ///
+    /// The first is the *owning* key. Deletion walks this list rather than the
+    /// table, which is what keeps one entry from being freed once per key it
+    /// answers to.
+    cid_keys: [quic.cid.max_stored]u64 = undefined,
+    cid_key_count: usize = 0,
+    /// How many spares have been issued, so the endpoint stops at what the peer
+    /// said it would hold.
+    spares_issued: usize = 0,
     /// Whether a NEW_TOKEN has been minted for this connection. One is enough:
     /// §8.1.3 lets a server send several, but each is a credential and the client
     /// only needs one to skip validation next time.
@@ -103,6 +117,15 @@ const Entry = struct {
         self.conn.deinit(gpa);
     }
 };
+
+/// How many spare connection IDs to give each client (§5.1.1).
+///
+/// Two, not as many as the peer will hold: one lets a client move to a new path
+/// with an ID an observer cannot link to the old one, and the second covers the
+/// first being retired while a third is still being announced. Filling the peer's
+/// limit costs a routing-table slot each and buys nothing this endpoint needs,
+/// since it never asks the client to retire anything.
+const spare_connection_ids = 2;
 
 /// The endpoint handler: every datagram, every timer, every connection.
 pub const Handler = struct {
@@ -119,15 +142,19 @@ pub const Handler = struct {
     cid_counter: u64 = 0,
     seed: [32]u8,
     accepted: usize = 0,
+    /// Spare connection IDs issued across all connections. Observable for the same
+    /// reason `accepted` is: it is how a test can tell the announcements happened
+    /// without reaching into a connection that another task owns.
+    spares_total: usize = 0,
 
     pub const handler_name = "http3-server";
 
     pub fn deinit(self: *Handler, gpa: Allocator) void {
         assert(gpa.ptr == self.gpa.ptr);
-        var it = self.connections.valueIterator();
+        var it = self.entries();
         while (it.next()) |entry| {
-            entry.*.deinit(gpa);
-            gpa.destroy(entry.*);
+            entry.deinit(gpa);
+            gpa.destroy(entry);
         }
         self.connections.deinit(gpa);
     }
@@ -211,6 +238,7 @@ pub const Handler = struct {
             };
             try self.dispatchEvents(entry);
             self.offerToken(entry, from);
+            self.offerSpareCids(entry);
             try self.pump(ctx, entry);
             self.sweep();
             return;
@@ -306,7 +334,9 @@ pub const Handler = struct {
                 errdefer entry.conn.deinit(self.gpa);
                 entry.mux = .init(self.gpa, self.io, &entry.conn, self.options.streams);
 
-                try self.connections.put(self.gpa, cidKey(local_cid), entry);
+                entry.cid_keys[0] = cidKey(local_cid);
+                entry.cid_key_count = 1;
+                try self.connections.put(self.gpa, entry.cid_keys[0], entry);
                 self.accepted += 1;
 
                 entry.conn.setTime(self.now());
@@ -370,6 +400,55 @@ pub const Handler = struct {
         entry.token_offered = true;
     }
 
+    /// §5.1.1: give the client spare connection IDs, and route them here.
+    ///
+    /// Order matters: the route is registered *before* the ID is announced. The
+    /// reverse would leave a window in which the client uses an ID this endpoint
+    /// cannot resolve, and a short-header packet carries nothing else to route by,
+    /// so those packets would be dropped as unknown.
+    fn offerSpareCids(self: *Handler, entry: *Entry) void {
+        // §8.1.3's condition applies here too: before the handshake is confirmed the
+        // client cannot use a spare, and the frame would only compete with the
+        // handshake for space.
+        if (!entry.conn.transport.handshake_confirmed) return;
+
+        while (entry.spares_issued < spare_connection_ids) {
+            if (!entry.conn.transport.canIssueConnectionId()) return;
+            if (entry.cid_key_count == entry.cid_keys.len) return;
+
+            const spare = self.nextConnectionId();
+            const key = cidKey(spare);
+            // A collision would make one entry unreachable, which is worse than not
+            // issuing: the IDs are derived from a counter mixed with a secret, so
+            // this is vanishingly unlikely rather than impossible.
+            if (self.connections.contains(key)) return;
+
+            // The stateless reset token must be unguessable and tied to nothing an
+            // observer can see, since §10.3 makes possession of it sufficient to
+            // end the connection.
+            var token: [quic.cid.stateless_reset_token_len]u8 = undefined;
+            var mac: std.crypto.auth.hmac.sha2.HmacSha256 = .init(&self.seed);
+            mac.update("zinet stateless reset");
+            mac.update(spare.slice());
+            var digest: [32]u8 = undefined;
+            mac.final(&digest);
+            @memcpy(&token, digest[0..token.len]);
+
+            self.connections.put(self.gpa, key, entry) catch return;
+            _ = entry.conn.transport.issueConnectionId(spare, token) catch {
+                // Announcing failed, so the route must not survive it — an ID the
+                // client was never told about is not one it can use, and leaving the
+                // key behind would keep the entry alive past its last real ID.
+                _ = self.connections.remove(key);
+                return;
+            };
+            entry.cid_keys[entry.cid_key_count] = key;
+            entry.cid_key_count += 1;
+            entry.spares_issued += 1;
+            self.spares_total += 1;
+        }
+    }
+
     /// Everything the connection wants on the wire.
     fn pump(self: *Handler, ctx: *pipeline_mod.HandlerContext, entry: *Entry) !void {
         entry.mux.needs_flush = false;
@@ -404,23 +483,59 @@ pub const Handler = struct {
     /// Remove connections that have finished. Separate from marking them so that
     /// a `finished` connection can still answer packets during the same call —
     /// §10.2.1 requires answering with CONNECTION_CLOSE again.
+    /// Walk the entries once each, rather than once per key they answer to.
+    ///
+    /// A connection with spare IDs appears in the table several times, and every
+    /// caller that wants entries rather than routes needs the same filter. Written
+    /// once because the two callers that need it — sweeping and teardown — both
+    /// free what they find, and a missing filter there is a double free rather than
+    /// a miscount.
+    const EntryIterator = struct {
+        inner: std.AutoHashMapUnmanaged(u64, *Entry).Iterator,
+
+        fn next(self: *EntryIterator) ?*Entry {
+            while (self.inner.next()) |kv| {
+                const entry = kv.value_ptr.*;
+                assert(entry.cid_key_count > 0);
+                if (kv.key_ptr.* != entry.cid_keys[0]) continue;
+                return entry;
+            }
+            return null;
+        }
+    };
+
+    fn entries(self: *Handler) EntryIterator {
+        return .{ .inner = self.connections.iterator() };
+    }
+
+    /// Remove an entry from the routing table under every key it answers to, then
+    /// free it.
+    ///
+    /// The only place an entry is freed. An entry reachable by several connection
+    /// IDs would otherwise be freed once per key, and the second free is a
+    /// use-after-free — so the loop over keys and the single `destroy` belong in
+    /// one routine rather than repeated at each call site.
+    fn removeEntry(self: *Handler, entry: *Entry) void {
+        assert(entry.cid_key_count > 0);
+        for (entry.cid_keys[0..entry.cid_key_count]) |key| {
+            _ = self.connections.remove(key);
+        }
+        entry.deinit(self.gpa);
+        self.gpa.destroy(entry);
+    }
+
     fn sweep(self: *Handler) void {
-        var done: [32]u64 = undefined;
+        var done: [32]*Entry = undefined;
         var found: usize = 0;
-        var it = self.connections.iterator();
-        while (it.next()) |kv| {
-            const entry = kv.value_ptr.*;
+        var it = self.entries();
+        while (it.next()) |entry| {
             if (!entry.finished) continue;
             if (entry.conn.transport.lifecycle() != .drained) continue;
             if (found == done.len) break;
-            done[found] = kv.key_ptr.*;
+            done[found] = entry;
             found += 1;
         }
-        for (done[0..found]) |key| {
-            const kv = self.connections.fetchRemove(key) orelse continue;
-            kv.value.deinit(self.gpa);
-            self.gpa.destroy(kv.value);
-        }
+        for (done[0..found]) |entry| self.removeEntry(entry);
     }
 
     fn lookup(self: *Handler, destination: ConnectionId) ?*Entry {
@@ -544,6 +659,18 @@ pub const Server = struct {
     /// tests and for anything that wants to know the endpoint is being used.
     pub fn acceptedCount(self: *const Server) usize {
         return self.handler.accepted;
+    }
+
+    /// How many spare connection IDs have been issued and routed (§5.1.1).
+    pub fn spareIdsIssued(self: *const Server) usize {
+        return self.handler.spares_total;
+    }
+
+    /// How many keys the routing table holds. More than one per connection once
+    /// spares are issued, which is the point: a short-header packet carries only a
+    /// connection ID, so every ID a client may use has to be a key here.
+    pub fn routeCount(self: *const Server) usize {
+        return self.handler.connections.count();
     }
 };
 
@@ -734,4 +861,12 @@ test "http3 server: our own client fetches from it over a real UDP socket" {
     try testing.expectEqualStrings("served over h3", recorder.body[0..recorder.body_len]);
     try testing.expectEqual(@as(usize, 1), log.requests);
     try testing.expectEqualStrings("/served", log.last_path[0..log.last_path_len]);
+
+    // §5.1.1: the spares were issued and routed. Safe to read here without racing
+    // the server's task: a complete response cannot have arrived before the
+    // handshake was confirmed, and confirming it is what triggers the issuing.
+    try testing.expectEqual(@as(usize, spare_connection_ids), server.spareIdsIssued());
+    // One connection, three ways to address it. If a spare were announced without
+    // being routed, the client's first packet using it would be dropped as unknown.
+    try testing.expectEqual(@as(usize, 1 + spare_connection_ids), server.routeCount());
 }
