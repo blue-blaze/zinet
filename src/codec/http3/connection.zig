@@ -514,7 +514,16 @@ pub const Connection = struct {
             // rely on when retrying elsewhere.
             if (self.local_goaway_id) |limit| {
                 if (id >= limit) {
-                    self.transport.resetStream(id, 0x010c) catch {}; // H3_REQUEST_REJECTED
+                    // §4.1.1: *rejected*, not cancelled. The distinction is the
+                    // client's licence to retry: a rejected request "can be
+                    // treated as though it had never been sent at all", while
+                    // H3_REQUEST_CANCELLED (0x010c) says nothing about whether
+                    // the server acted on it. Nothing here has been processed —
+                    // the stream is refused before any state is created — so
+                    // §4.1.1's stronger promise is the one to make, and §5.2
+                    // depends on it: the GOAWAY identifier is only a promise the
+                    // client can rely on if requests above it are rejected.
+                    self.transport.resetStream(id, 0x010b) catch {}; // H3_REQUEST_REJECTED
                     return;
                 }
             }
@@ -1782,6 +1791,13 @@ test "http3 server: a request already in flight when GOAWAY is sent is reset, no
     };
     // And it is still up: refusing a request is not failing the connection.
     try testing.expect(server.close_code == null);
+
+    // §4.1.1: the code says *rejected*, which is what licenses the client to retry
+    // as though the request had never been sent. H3_REQUEST_CANCELLED would look
+    // right and promise less, so the value is asserted rather than the fact that
+    // some reset happened.
+    const receiver = &client.transport.streams.get(.init(id)).?.recv.?;
+    try testing.expectEqual(@as(?u64, 0x010b), receiver.reset_code);
 }
 
 test "http3 server: MAX_PUSH_ID is accepted and never acted on" {
