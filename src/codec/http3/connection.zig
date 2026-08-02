@@ -83,6 +83,17 @@ const Request = struct {
     /// Whether any DATA frame has arrived, which is what turns the next
     /// HEADERS into trailers.
     saw_data: bool = false,
+    /// §4.4: this stream carries a CONNECT tunnel, so only DATA may follow.
+    ///
+    /// Set on a server when the CONNECT request arrives, and on a client when a 2xx
+    /// answers a CONNECT it sent — those are the two moments §4.4 calls the method
+    /// "completed". A non-2xx answer is a refusal, not a tunnel, and the stream
+    /// stays an ordinary exchange.
+    tunnel: bool = false,
+    /// Client side only: a CONNECT went out on this stream, so a 2xx makes it a
+    /// tunnel. Distinct from `tunnel` because the request is sent a round trip
+    /// before the answer that decides.
+    sent_connect: bool = false,
     /// Decoded sections in arrival order, waiting for `takeSection`.
     sections: std.ArrayList(qpack.FieldSection) = .empty,
     /// Body bytes waiting for the application.
@@ -377,8 +388,17 @@ pub const Connection = struct {
         _ = try self.transport.write(gpa, id, encoded.items);
         if (fin) try self.transport.finishStream(id);
 
-        // Track it so the response has somewhere to land.
-        try self.requests.put(gpa, id, .{});
+        // Track it so the response has somewhere to land. §4.4: remember whether
+        // this was a CONNECT, because a 2xx answer to one turns the stream into a
+        // tunnel where only DATA is permitted — and by then the request is gone.
+        var sent_connect = false;
+        for (fields) |field| {
+            if (std.mem.eql(u8, field.name, ":method")) {
+                sent_connect = std.mem.eql(u8, field.value, "CONNECT");
+                break;
+            }
+        }
+        try self.requests.put(gpa, id, .{ .sent_connect = sent_connect });
         return id;
     }
 
@@ -656,6 +676,19 @@ pub const Connection = struct {
         f: frame.Frame,
         stream_done: bool,
     ) !void {
+        // §4.4: "Once the CONNECT method has completed, only DATA frames are
+        // permitted to be sent on the stream ... Receipt of any other known frame
+        // type MUST be treated as a connection error of type H3_FRAME_UNEXPECTED."
+        // Unknown types stay ignorable — §9 makes that a separate rule, and an
+        // extension may define its own frames for a tunnel.
+        //
+        // Without this a tunnel accepts trailers, which means a peer can put field
+        // semantics into a byte stream a proxy is relaying verbatim.
+        if (req.tunnel) switch (f) {
+            .data, .unknown => {},
+            else => return self.fail(0x0105), // H3_FRAME_UNEXPECTED
+        };
+
         switch (f) {
             .headers => |section_bytes| {
                 if (req.state == .trailers_received) return self.fail(0x0105);
@@ -685,6 +718,15 @@ pub const Connection = struct {
                     req.state = .trailers_received;
                 } else {
                     req.state = .headers_received;
+                    // §4.4's "completed", from each side's point of view.
+                    switch (self.role) {
+                        .server => if (isConnectSection(&section)) {
+                            req.tunnel = true;
+                        },
+                        .client => if (req.sent_connect and isSuccessSection(&section)) {
+                            req.tunnel = true;
+                        },
+                    }
                 }
                 try req.sections.append(gpa, section);
                 try self.events.append(gpa, .{ .headers = .{
@@ -883,6 +925,30 @@ pub const Connection = struct {
         return err;
     }
 };
+
+/// Whether a validated request section is a CONNECT, extended or not (§4.4,
+/// RFC 9220 §4). Both are tunnels; the extended form merely also carries a scheme
+/// and path so the target can be named.
+fn isConnectSection(section: *const qpack.FieldSection) bool {
+    for (section.fields.items) |field| {
+        if (std.mem.eql(u8, field.name, ":method")) {
+            return std.mem.eql(u8, field.value, "CONNECT");
+        }
+    }
+    return false;
+}
+
+/// Whether a validated response section carries a 2xx status, which is what §4.4
+/// makes the signal that a tunnel is open. The section has already been validated,
+/// so `:status` is present and three digits.
+fn isSuccessSection(section: *const qpack.FieldSection) bool {
+    for (section.fields.items) |field| {
+        if (std.mem.eql(u8, field.name, ":status")) {
+            return field.value[0] == '2';
+        }
+    }
+    return false;
+}
 
 fn matches(maybe: ?u64, id: u64) bool {
     return maybe != null and maybe.? == id;
@@ -1539,6 +1605,12 @@ fn pumpH3(gpa: Allocator, a: *Connection, b: *Connection, rounds: usize) !void {
     return error.DidNotSettle;
 }
 
+/// Pump until one side fails the connection, for tests whose subject *is* the
+/// failure. `pumpH3` propagates it, which is right everywhere else.
+fn pumpUntilFailure(gpa: Allocator, a: *Connection, b: *Connection, rounds: usize) void {
+    pumpH3(gpa, a, b, rounds) catch {};
+}
+
 pub const TestPair = struct { client: Connection, server: Connection };
 
 pub fn testPairForMultiplex(gpa: Allocator) !TestPair {
@@ -2034,4 +2106,128 @@ test "http3: GOAWAY cleans up the streams it disowns" {
         else => {},
     };
     try testing.expectEqual(@as(?u64, 0x010b), saw);
+}
+
+// ── CONNECT tunnels (§4.4) ────────────────────────────────────────────────────
+
+test "http3 server: a CONNECT tunnel carries DATA and nothing else" {
+    // §4.4: "Once the CONNECT method has completed, only DATA frames are permitted
+    // to be sent on the stream ... Receipt of any other known frame type MUST be
+    // treated as a connection error of type H3_FRAME_UNEXPECTED." Without the rule a
+    // tunnel accepts trailers, which puts field semantics into a byte stream a proxy
+    // relays verbatim.
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    // A CONNECT: authority and nothing else (§4.3.1).
+    const connect = [_]qpack.FieldLine{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    };
+    const id = try client.request(gpa, &connect, false);
+    try pumpH3(gpa, client, server, 8);
+
+    // Accepted, and recognised as a tunnel.
+    try testing.expect(server.requests.contains(id));
+    try testing.expect(server.requests.get(id).?.tunnel);
+    try testing.expect(server.close_code == null);
+
+    // Tunnel bytes are fine.
+    try client.writeBody(gpa, id, "tunnelled", false);
+    try pumpH3(gpa, client, server, 8);
+    try testing.expect(server.close_code == null);
+
+    // A reserved frame type still is: §7.2.8 permits them "on any stream where
+    // frames are allowed", for padding, and §9 requires unknown types be ignored.
+    // A tunnel that refuses one would break a peer padding its own traffic.
+    var grease: [16]u8 = undefined;
+    const grease_len = frame.writeFrameHeader(&grease, 0x21, 0); // 0x1f * 0 + 0x21
+    _ = try client.transport.write(gpa, id, grease[0..grease_len]);
+    try pumpH3(gpa, client, server, 8);
+    try testing.expect(server.close_code == null);
+
+    // A HEADERS frame is not.
+    const trailers = [_]qpack.FieldLine{.{ .name = "x-late", .value = "1" }};
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(gpa);
+    try qpack.encodeSection(gpa, &encoded, &trailers);
+    var header: [16]u8 = undefined;
+    const header_len = frame.writeFrameHeader(
+        &header,
+        @backingInt(frame.FrameType.headers),
+        encoded.items.len,
+    );
+    _ = try client.transport.write(gpa, id, header[0..header_len]);
+    _ = try client.transport.write(gpa, id, encoded.items);
+    pumpUntilFailure(gpa, client, server, 8);
+
+    try testing.expectEqual(@as(?u64, 0x0105), server.close_code); // H3_FRAME_UNEXPECTED
+}
+
+test "http3 client: a refused CONNECT is not a tunnel" {
+    // §4.4 makes a 2xx the signal that the tunnel is open. A refusal is an ordinary
+    // response, and treating it as a tunnel would reject the trailers that any
+    // ordinary response may carry — the distinction is not decoration.
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    const connect = [_]qpack.FieldLine{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    };
+    const id = try client.request(gpa, &connect, false);
+    try pumpH3(gpa, client, server, 8);
+    try testing.expect(client.requests.get(id).?.sent_connect);
+
+    // The proxy declines.
+    const refusal = [_]qpack.FieldLine{.{ .name = ":status", .value = "502" }};
+    try server.respond(gpa, id, &refusal, false);
+    try server.writeBody(gpa, id, "no tunnel", false);
+    try pumpH3(gpa, client, server, 8);
+
+    try testing.expect(!client.requests.get(id).?.tunnel);
+
+    // So trailers are still legal on it.
+    const trailers = [_]qpack.FieldLine{.{ .name = "x-reason", .value = "refused" }};
+    try server.respond(gpa, id, &trailers, true);
+    try pumpH3(gpa, client, server, 8);
+    try testing.expect(client.close_code == null);
+}
+
+test "http3 client: a 2xx to CONNECT makes the stream a tunnel" {
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    const connect = [_]qpack.FieldLine{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    };
+    const id = try client.request(gpa, &connect, false);
+    try pumpH3(gpa, client, server, 8);
+
+    const accepted = [_]qpack.FieldLine{.{ .name = ":status", .value = "200" }};
+    try server.respond(gpa, id, &accepted, false);
+    try pumpH3(gpa, client, server, 8);
+    try testing.expect(client.requests.get(id).?.tunnel);
+
+    // Now a HEADERS frame from the proxy is a connection error.
+    const trailers = [_]qpack.FieldLine{.{ .name = "x-late", .value = "1" }};
+    try server.respond(gpa, id, &trailers, true);
+    pumpUntilFailure(gpa, client, server, 8);
+    try testing.expectEqual(@as(?u64, 0x0105), client.close_code);
 }
