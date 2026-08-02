@@ -36,6 +36,11 @@ pub const Error = error{
     /// through a giant switch; the code is what the peer needs, and it is
     /// preserved in `close_code`.
     H3Error,
+    /// RFC 8441 §3: an extended CONNECT was asked for before the peer advertised
+    /// SETTINGS_ENABLE_CONNECT_PROTOCOL. Named separately from `StreamStateError`
+    /// because the remedy differs: this one is answered by waiting, or by not
+    /// using the extension at all against this peer.
+    ExtendedConnectNotEnabled,
 } || quic.connection.Error || frame.Error || qpack.Error;
 
 /// What this connection reports upward. IDs only — see the module comment.
@@ -126,6 +131,12 @@ pub const Options = struct {
     /// Our SETTINGS_MAX_FIELD_SECTION_SIZE: the largest decoded field section
     /// we will accept (RFC 9114 §4.2.2).
     max_field_section_size: u64 = 64 * 1024,
+    /// RFC 9220 §3: advertise SETTINGS_ENABLE_CONNECT_PROTOCOL. Off by default and
+    /// the application's decision, because it is a promise about what this endpoint
+    /// will *serve* — a server announcing it and then refusing every extended
+    /// CONNECT has told its peers something untrue. Sending it as a client has no
+    /// effect (RFC 8441 §3), so it is only meaningful on a server.
+    enable_connect_protocol: bool = false,
 };
 
 pub const ServerOptions = struct {
@@ -141,6 +152,8 @@ pub const ServerOptions = struct {
     peer_cid: quic.packet.ConnectionId,
     after_retry: bool = false,
     max_field_section_size: u64 = 64 * 1024,
+    /// RFC 9220 §3, as in `Options`.
+    enable_connect_protocol: bool = false,
 };
 
 pub const Connection = struct {
@@ -187,6 +200,8 @@ pub const Connection = struct {
     /// The H3_* code this endpoint closed with, if it closed. What `Error.H3Error`
     /// points at.
     close_code: ?u64 = null,
+    /// Whether we advertise RFC 9220's SETTINGS_ENABLE_CONNECT_PROTOCOL.
+    enable_connect_protocol: bool = false,
 
     pub fn init(options: Options, seed: [64]u8) !Connection {
         return .{
@@ -203,6 +218,7 @@ pub const Connection = struct {
                 .token = options.token,
             }, seed),
             .max_field_section_size = options.max_field_section_size,
+            .enable_connect_protocol = options.enable_connect_protocol,
         };
     }
 
@@ -224,6 +240,7 @@ pub const Connection = struct {
                 .after_retry = options.after_retry,
             }, seed),
             .max_field_section_size = options.max_field_section_size,
+            .enable_connect_protocol = options.enable_connect_protocol,
         };
     }
 
@@ -341,9 +358,22 @@ pub const Connection = struct {
         // field-section bound; QPACK capacity and blocked streams stay at
         // their defaults of zero by *omission* — §7.2.4.2 makes omitted and
         // default indistinguishable, so sending zeros would say nothing.
-        len += frame.writeSettings(buf[len..], &.{
-            .{ .id = frame.Setting.max_field_section_size, .value = self.max_field_section_size },
-        });
+        var advertised: [2]frame.Setting = undefined;
+        advertised[0] = .{
+            .id = frame.Setting.max_field_section_size,
+            .value = self.max_field_section_size,
+        };
+        var advertised_len: usize = 1;
+        // RFC 9220 §3. Sent only when true, for the same reason the QPACK zeros are
+        // omitted: the registered default is 0, and §7.2.4.2 makes an omitted
+        // setting and its default indistinguishable. Sending 0 explicitly would be
+        // bytes that say nothing — and RFC 8441 §3 forbids ever following a 1 with a
+        // 0, which cannot arise here because HTTP/3 sends SETTINGS exactly once.
+        if (self.enable_connect_protocol) {
+            advertised[advertised_len] = .{ .id = frame.Setting.enable_connect_protocol, .value = 1 };
+            advertised_len += 1;
+        }
+        len += frame.writeSettings(buf[len..], advertised[0..advertised_len]);
         _ = try self.transport.write(gpa, control, buf[0..len]);
 
         var type_buf: [8]u8 = undefined;
@@ -368,6 +398,16 @@ pub const Connection = struct {
         fin: bool,
     ) !u64 {
         if (!self.h3_ready) return error.StreamStateError;
+        // RFC 8441 §3: an extended CONNECT may be sent only once the peer has said
+        // it understands one. Refused locally rather than sent hopefully, because a
+        // peer without the extension does not merely decline it — `:protocol` is an
+        // undefined pseudo-field there, so §4.3 makes the whole request malformed
+        // and the stream is spent for nothing.
+        for (fields) |field| {
+            if (!std.mem.eql(u8, field.name, ":protocol")) continue;
+            const peer = self.peer_settings orelse return error.ExtendedConnectNotEnabled;
+            if (!peer.enable_connect_protocol) return error.ExtendedConnectNotEnabled;
+        }
         // §5.2: once GOAWAY names an ID, requests at or above it would be
         // ignored; refusing locally is kinder than sending into a void.
         if (self.goaway_id != null) return error.StreamStateError;
@@ -395,7 +435,6 @@ pub const Connection = struct {
         for (fields) |field| {
             if (std.mem.eql(u8, field.name, ":method")) {
                 sent_connect = std.mem.eql(u8, field.value, "CONNECT");
-                break;
             }
         }
         try self.requests.put(gpa, id, .{ .sent_connect = sent_connect });
@@ -705,7 +744,11 @@ pub const Connection = struct {
                 // confusion §4.3 exists to forbid.
                 const valid = switch (self.role) {
                     .client => validResponseSection(&section, is_trailers),
-                    .server => validRequestSection(&section, is_trailers),
+                    .server => validRequestSection(
+                        &section,
+                        is_trailers,
+                        self.enable_connect_protocol,
+                    ),
                 };
                 if (!valid) {
                     // The errdefer above frees the section — `fail` returns an
@@ -1007,7 +1050,11 @@ fn validResponseSection(section: *const qpack.FieldSection, is_trailers: bool) b
 /// anything that could be read two ways is rejected rather than guessed at. That
 /// is what keeps request smuggling out — the same reason the HTTP/1.1 decoder in
 /// this repository is a flat state machine.
-fn validRequestSection(section: *const qpack.FieldSection, is_trailers: bool) bool {
+fn validRequestSection(
+    section: *const qpack.FieldSection,
+    is_trailers: bool,
+    connect_protocol: bool,
+) bool {
     var seen_regular = false;
     var seen: struct {
         method: bool = false,
@@ -1044,9 +1091,13 @@ fn validRequestSection(section: *const qpack.FieldSection, is_trailers: bool) bo
                 seen.path = true;
                 path = field.value;
             } else if (std.mem.eql(u8, field.name, ":protocol")) {
-                // RFC 9220's extended CONNECT. Accepted as a name so that a
-                // client using it gets a clean rejection later rather than a
-                // malformed-message error now.
+                // RFC 9220's extended CONNECT. §4.3 permits a pseudo-field this
+                // document does not define only when "an extension could negotiate
+                // a modification of this restriction" — so it is defined here
+                // exactly when we advertised the setting, and malformed otherwise.
+                // RFC 8441 §3 relies on that: it is why a client must wait for the
+                // setting rather than try and see.
+                if (!connect_protocol) return false;
                 if (seen.protocol) return false;
                 seen.protocol = true;
             } else {
@@ -1623,6 +1674,12 @@ pub fn pumpForMultiplex(gpa: Allocator, a: *Connection, b: *Connection, rounds: 
 }
 
 fn testPair(gpa: Allocator) !TestPair {
+    return testPairWith(gpa, false);
+}
+
+/// `connect_protocol` makes the server advertise RFC 9220's setting, which is the
+/// only difference the extension makes to a connection's setup.
+fn testPairWith(gpa: Allocator, connect_protocol: bool) !TestPair {
     h3_identity = quic.server.testIdentity();
     const client_cid = quic.packet.ConnectionId.init(&.{ 0xc0, 0xc1, 0xc2, 0xc3 }) catch unreachable;
     const server_cid = quic.packet.ConnectionId.init(&.{ 0x50, 0x51, 0x52, 0x53 }) catch unreachable;
@@ -1643,6 +1700,7 @@ fn testPair(gpa: Allocator) !TestPair {
         .destination = dcid,
         .original_destination = dcid,
         .peer_cid = client_cid,
+        .enable_connect_protocol = connect_protocol,
     }, @splat(0x72));
     errdefer server.deinit(gpa);
     try client.start(gpa);
@@ -1742,7 +1800,15 @@ test "http3 server: a malformed request is rejected rather than served" {
 test "http3 server: request validation follows §4.3.1, including CONNECT" {
     const gpa = testing.allocator;
 
-    const cases = [_]struct { fields: []const qpack.FieldLine, valid: bool, note: []const u8 }{
+    const cases = [_]struct {
+        fields: []const qpack.FieldLine,
+        valid: bool,
+        note: []const u8,
+        /// Whether RFC 9220's setting was advertised. `:protocol` is only a defined
+        /// pseudo-field when it was (§4.3), so the same fields are valid or
+        /// malformed depending on this.
+        connect_protocol: bool = false,
+    }{
         .{ .fields = &.{
             .{ .name = ":method", .value = "GET" },
             .{ .name = ":scheme", .value = "https" },
@@ -1795,7 +1861,16 @@ test "http3 server: request validation follows §4.3.1, including CONNECT" {
             .{ .name = ":scheme", .value = "https" },
             .{ .name = ":path", .value = "/chat" },
             .{ .name = ":authority", .value = "h:443" },
-        }, .valid = true, .note = "extended CONNECT reinstates both" },
+        }, .valid = true, .note = "extended CONNECT reinstates both", .connect_protocol = true },
+        // The same request, unnegotiated: §4.3 makes an undefined pseudo-field
+        // malformed, which is the mechanism RFC 8441 §3 counts on.
+        .{ .fields = &.{
+            .{ .name = ":method", .value = "CONNECT" },
+            .{ .name = ":protocol", .value = "websocket" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "/chat" },
+            .{ .name = ":authority", .value = "h.test" },
+        }, .valid = false, .note = ":protocol without the setting is malformed" },
         .{ .fields = &.{
             .{ .name = ":method", .value = "GET" },
             .{ .name = ":scheme", .value = "https" },
@@ -1841,7 +1916,7 @@ test "http3 server: request validation follows §4.3.1, including CONNECT" {
                 .value = try gpa.dupe(u8, field.value),
             });
         }
-        const got = validRequestSection(&section, false);
+        const got = validRequestSection(&section, false, case.connect_protocol);
         if (got != case.valid) {
             std.debug.print("case failed: {s}\n", .{case.note});
             return error.ValidationDisagrees;
@@ -1855,12 +1930,12 @@ test "http3 server: request validation follows §4.3.1, including CONNECT" {
         .name = try gpa.dupe(u8, "x-checksum"),
         .value = try gpa.dupe(u8, "abc"),
     });
-    try testing.expect(validRequestSection(&trailers, true));
+    try testing.expect(validRequestSection(&trailers, true, false));
     try trailers.fields.append(gpa, .{
         .name = try gpa.dupe(u8, ":method"),
         .value = try gpa.dupe(u8, "GET"),
     });
-    try testing.expect(!validRequestSection(&trailers, true));
+    try testing.expect(!validRequestSection(&trailers, true, false));
 }
 
 test "http3 server: GOAWAY names a stream ID and refuses requests at or above it" {
@@ -2230,4 +2305,117 @@ test "http3 client: a 2xx to CONNECT makes the stream a tunnel" {
     try server.respond(gpa, id, &trailers, true);
     pumpUntilFailure(gpa, client, server, 8);
     try testing.expectEqual(@as(?u64, 0x0105), client.close_code);
+}
+
+// ── Extended CONNECT (RFC 9220) ───────────────────────────────────────────────
+
+test "http3: extended CONNECT needs the peer's permission first" {
+    // RFC 8441 §3, carried into HTTP/3 by RFC 9220 §3: the setting exists because
+    // `:protocol` and the new reading of `:authority` change the meaning of an
+    // existing message shape, and §9 of RFC 9114 requires that be negotiated. A
+    // client that guesses does not get a polite refusal — §4.3 makes its request
+    // malformed, so the stream is spent.
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa); // the server does not advertise it
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    try testing.expect(!client.peerSettings().?.enable_connect_protocol);
+
+    const upgrade = [_]qpack.FieldLine{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/chat" },
+        .{ .name = ":authority", .value = "example.test" },
+    };
+    try testing.expectError(
+        error.ExtendedConnectNotEnabled,
+        client.request(gpa, &upgrade, false),
+    );
+
+    // An ordinary CONNECT is unaffected: it needs no extension.
+    const plain = [_]qpack.FieldLine{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    };
+    _ = try client.request(gpa, &plain, false);
+}
+
+test "http3: an advertised setting makes extended CONNECT usable end to end" {
+    const gpa = testing.allocator;
+    var pair = try testPairWith(gpa, true);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    try testing.expect(client.peerSettings().?.enable_connect_protocol);
+    // RFC 8441 §3: "Receipt of this parameter by a server does not have any
+    // impact." So the client's side of the connection never advertises it.
+    try testing.expect(!server.peerSettings().?.enable_connect_protocol);
+
+    const upgrade = [_]qpack.FieldLine{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/chat" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = "sec-websocket-version", .value = "13" },
+    };
+    const id = try client.request(gpa, &upgrade, false);
+    try pumpH3(gpa, client, server, 8);
+
+    // Accepted as a request, and §4.4's tunnel rules apply to it — the extended
+    // form is still CONNECT.
+    try testing.expect(server.close_code == null);
+    try testing.expect(server.requests.get(id).?.tunnel);
+
+    var section = server.takeSection(id) orelse return error.NoSection;
+    defer section.deinit(gpa);
+    var saw_protocol = false;
+    for (section.fields.items) |field| {
+        if (std.mem.eql(u8, field.name, ":protocol")) {
+            try testing.expectEqualStrings("websocket", field.value);
+            saw_protocol = true;
+        }
+    }
+    try testing.expect(saw_protocol);
+}
+
+test "http3: a setting value other than 0 or 1 is a settings error" {
+    // RFC 8441 §3: "The value of the parameter MUST be 0 or 1." The rule lives in
+    // `SettingsIterator`, alongside §7.2.4's other payload rules, so this drives it
+    // there — the connection inherits the wire code from the iterator's error, which
+    // `frame.errorCode` maps to H3_SETTINGS_ERROR.
+    var buf: [32]u8 = undefined;
+    var len = quic.varint.encode(&buf, frame.Setting.enable_connect_protocol);
+    len += quic.varint.encode(buf[len..], 2);
+    var it = frame.SettingsIterator.init(buf[0..len]);
+    try testing.expectError(error.SettingsError, it.next());
+    try testing.expectEqual(@as(u64, 0x0109), frame.errorCode(error.SettingsError));
+
+    // 0 and 1 both pass, and 0 means the extension stays off.
+    for ([_]u64{ 0, 1 }) |value| {
+        var ok_len = quic.varint.encode(&buf, frame.Setting.enable_connect_protocol);
+        ok_len += quic.varint.encode(buf[ok_len..], value);
+        var ok_it = frame.SettingsIterator.init(buf[0..ok_len]);
+        var settings: frame.Settings = .{};
+        settings.apply((try ok_it.next()).?);
+        try testing.expectEqual(value == 1, settings.enable_connect_protocol);
+    }
+
+    // And the identifier is inside the duplicate mask: at 0x08 it sat one bit
+    // outside the `u8` it used to be, so a repeat would have gone unnoticed.
+    var dup_len = quic.varint.encode(&buf, frame.Setting.enable_connect_protocol);
+    dup_len += quic.varint.encode(buf[dup_len..], 1);
+    dup_len += quic.varint.encode(buf[dup_len..], frame.Setting.enable_connect_protocol);
+    dup_len += quic.varint.encode(buf[dup_len..], 1);
+    var dup_it = frame.SettingsIterator.init(buf[0..dup_len]);
+    _ = try dup_it.next();
+    try testing.expectError(error.SettingsError, dup_it.next());
 }

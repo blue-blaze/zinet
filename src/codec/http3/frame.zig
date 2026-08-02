@@ -118,6 +118,9 @@ pub const Setting = struct {
     pub const qpack_max_table_capacity = 0x01;
     pub const max_field_section_size = 0x06;
     pub const qpack_blocked_streams = 0x07;
+    /// RFC 9220 §3: SETTINGS_ENABLE_CONNECT_PROTOCOL, the same value as in
+    /// HTTP/2, registered separately for HTTP/3 as Appendix A.3 requires.
+    pub const enable_connect_protocol = 0x08;
 
     /// §11.2.2: grease for settings uses the same 0x1f * N + 0x21 formula.
     pub fn isGrease(id: u64) bool {
@@ -151,12 +154,20 @@ pub const Settings = struct {
     qpack_blocked_streams: u64 = 0,
     /// §7.2.4.2 gives this an unlimited default.
     max_field_section_size: u64 = std.math.maxInt(u64),
+    /// RFC 9220's registry entry gives this a default of 0, which is what makes
+    /// the extension safe to negotiate with a setting at all: §9 requires that an
+    /// omitted setting leave the extension disabled.
+    enable_connect_protocol: bool = false,
 
     pub fn apply(self: *Settings, setting: Setting) void {
         switch (setting.id) {
             Setting.qpack_max_table_capacity => self.qpack_max_table_capacity = setting.value,
             Setting.qpack_blocked_streams => self.qpack_blocked_streams = setting.value,
             Setting.max_field_section_size => self.max_field_section_size = setting.value,
+            // RFC 8441 §3: "The value of the parameter MUST be 0 or 1." A value
+            // outside that never reaches here — `SettingsIterator.next` refuses it,
+            // which is also where §7.2.4's other payload rules live.
+            Setting.enable_connect_protocol => self.enable_connect_protocol = setting.value == 1,
             // §9: unknown settings must be ignored. This is where grease lands
             // too, and deliberately through the same path — grease works only
             // because it is indistinguishable from a real future extension.
@@ -191,8 +202,10 @@ pub const Frame = union(enum) {
 pub const SettingsIterator = struct {
     rest: []const u8,
     /// Duplicate detection for the identifiers we interpret; unknown ones are
-    /// the peer's business. Bit positions follow the Setting.* constants.
-    seen: u8 = 0,
+    /// the peer's business. Bit positions follow the Setting.* constants, so the
+    /// width has to cover the largest one we read — 0x08 (RFC 9220) sat one bit
+    /// outside a `u8` and would have slipped through unnoticed.
+    seen: u16 = 0,
 
     pub fn init(payload: []const u8) SettingsIterator {
         return .{ .rest = payload };
@@ -207,11 +220,18 @@ pub const SettingsIterator = struct {
         // Setting.isForbidden for why this is an error rather than ignorable.
         if (Setting.isForbidden(id)) return error.SettingsError;
 
+        // RFC 8441 §3, carried into HTTP/3 by RFC 9220 §3: "The value of the
+        // parameter MUST be 0 or 1." Enforced here rather than by the caller so the
+        // rule has one home — and because a value a setting's own definition
+        // forbids is precisely "an error in the payload of a SETTINGS frame"
+        // (§8.1), which is the code this iterator's error already carries.
+        if (id == Setting.enable_connect_protocol and value > 1) return error.SettingsError;
+
         // §7.2.4: "The same setting identifier MUST NOT occur more than once".
         // Only tracked for identifiers small enough to matter to us — a full
         // map for arbitrary u64 identifiers would let a peer size our memory.
-        if (id < 8) {
-            const bit = @as(u8, 1) << @intCast(id);
+        if (id < 16) {
+            const bit = @as(u16, 1) << @intCast(id);
             if (self.seen & bit != 0) return error.SettingsError;
             self.seen |= bit;
         }
