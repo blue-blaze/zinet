@@ -164,6 +164,12 @@ pub const max_token_len = 512;
 /// rather than refused: the error code is what the connection acts on.
 pub const max_reason_len = 256;
 
+/// PATH_CHALLENGE frames that may be awaiting a response at once (§8.2.1 permits
+/// a peer to send several). Small on purpose: a legitimate peer sends one or two,
+/// and the queue exists so that a flood costs the peer retransmissions rather
+/// than costing us memory.
+pub const max_path_responses = 4;
+
 /// What the connection tells its caller. Every slice borrows storage inside the
 /// connection and is valid until the next call to `receive` or `send` — the same
 /// contract as an `Event` in the pipeline, and stated because the alternative is
@@ -505,6 +511,19 @@ pub const Connection = struct {
     /// How many key updates have happened, for tests and for anything that wants
     /// to see the mechanism working.
     key_updates: u64 = 0,
+
+    // ── §8.2 path validation ────────────────────────────────────────────────
+    /// PATH_CHALLENGE payloads owed a response, oldest first.
+    ///
+    /// A queue rather than one slot because §8.2.2 pairs each challenge with its
+    /// own response, and a peer may send several — §8.2.1 explicitly allows
+    /// multiple to guard against loss. Bounded, like everything else a peer can
+    /// cause to accumulate: past this many, further challenges are dropped, which
+    /// costs the peer a retransmission and costs us nothing.
+    path_responses: [max_path_responses][8]u8 = undefined,
+    path_response_count: usize = 0,
+    /// How many responses have been sent, for tests.
+    path_responses_sent: u64 = 0,
     spaces: [Level.count]Space = .{ .{}, .{}, .{} },
 
     /// Ours, the peer's, and the bookkeeping §7.3 checks against.
@@ -1451,12 +1470,31 @@ pub const Connection = struct {
                 // before extending credit (§4.2) — so there is nothing to do but
                 // acknowledge the packet, which happens above.
                 .data_blocked, .streams_blocked_bidi, .streams_blocked_uni => {},
-                // §19.17 and §19.18 belong with path validation, which is
-                // connection migration's business. Refused rather than ignored:
-                // answering a PATH_CHALLENGE without validating the path is worse
-                // than not answering, and silently dropping it would make
-                // migration fail in a way no log explains.
-                .path_challenge, .path_response => return error.ProtocolViolation,
+                // §8.2.2: answering a PATH_CHALLENGE is unconditional. This used
+                // to be a PROTOCOL_VIOLATION here, with a comment claiming that
+                // answering an unvalidated path was worse than not answering —
+                // which conflated two separate things. Responding to a challenge
+                // says only "this datagram reached me"; *migrating* to a new path
+                // is what needs validation, and that decision is elsewhere. §9.1
+                // makes PATH_CHALLENGE a probing frame precisely so it can be
+                // used at any time, including as a liveness check on the path
+                // already in use, so refusing it closed connections with peers
+                // doing nothing wrong.
+                .path_challenge => |data| {
+                    // Dropped when the queue is full: §8.2.2 requires one response
+                    // per challenge, and a peer that sends more than we can hold
+                    // will send more challenges, which is its own concern.
+                    if (self.path_response_count < max_path_responses) {
+                        self.path_responses[self.path_response_count] = data.*;
+                        self.path_response_count += 1;
+                    }
+                },
+                // §19.18: a response whose data matches no challenge we sent *may*
+                // be a PROTOCOL_VIOLATION. Discarded instead, and deliberately:
+                // this endpoint sends no PATH_CHALLENGE, so every response is
+                // unmatched, and treating that as fatal would hand anyone who can
+                // inject one packet a way to close the connection.
+                .path_response => {},
             }
         }
     }
@@ -1836,7 +1874,16 @@ pub const Connection = struct {
         // that a server may be unable to expand a datagram, and the
         // anti-amplification limit is the constraint that wins — padding to 1200
         // by exceeding the budget would defeat the rule the padding serves.
-        const needs_padding = wants[@backingInt(Level.initial)] and limit >= min_initial_datagram;
+        //
+        // §8.2.2 adds a second reason to pad: a datagram carrying a PATH_RESPONSE
+        // must also reach 1200 bytes, because that is what proves the path can
+        // carry a full-size datagram *in both directions*. The same
+        // anti-amplification exception applies, and §8.2.2 anticipates it — it is
+        // expected when the challenge itself arrived unexpanded.
+        const carries_path_response = self.path_response_count > 0 and
+            wants[@backingInt(Level.one_rtt)];
+        const needs_padding = (wants[@backingInt(Level.initial)] or carries_path_response) and
+            limit >= min_initial_datagram;
 
         var len: usize = 0;
         for ([_]Level{ .initial, .handshake, .one_rtt }) |level| {
@@ -1871,6 +1918,11 @@ pub const Connection = struct {
 
         // Retirements owed for the peer's connection IDs need 1-RTT.
         if (level == .one_rtt and self.remote.pendingRetire().len > 0) return true;
+
+        // A PATH_RESPONSE owed to the peer (§8.2.2). Here as well as in
+        // `writeFrames`, because a writer that would emit a frame nobody asks for
+        // is the defect shape this repository has hit six times.
+        if (level == .one_rtt and self.path_response_count > 0) return true;
 
         // HANDSHAKE_DONE, which the server owes the client (§19.20). This has to
         // be here as well as in `writeFrames`, and the two disagreeing is the
@@ -2173,6 +2225,31 @@ pub const Connection = struct {
                 self.handshake_done_sent = true;
                 meta.carried_handshake_done = true;
                 meta.ack_eliciting = true;
+            }
+        }
+
+        // §8.2.2: "An endpoint MUST NOT delay transmission of a packet containing
+        // a PATH_RESPONSE frame unless constrained by congestion control." So it
+        // goes before stream data, and it goes out even before the handshake is
+        // established — a path can be probed at any time.
+        if (level == .one_rtt and !terminal) {
+            var sent: usize = 0;
+            while (sent < self.path_response_count) {
+                const f: frame.Frame = .{ .path_response = &self.path_responses[sent] };
+                if (len + frame.encodedLen(f) > dest.len) break;
+                len += frame.encode(dest[len..], f);
+                sent += 1;
+                meta.ack_eliciting = true;
+            }
+            if (sent > 0) {
+                // §13.3: "Responses to path validation using PATH_RESPONSE frames
+                // are sent just once." Losing one is the peer's problem to notice
+                // — it sends another challenge — so these are dropped rather than
+                // re-armed on loss, unlike every other frame here.
+                const rest = self.path_response_count - sent;
+                for (0..rest) |i| self.path_responses[i] = self.path_responses[sent + i];
+                self.path_response_count = rest;
+                self.path_responses_sent += sent;
             }
         }
 
@@ -4856,4 +4933,175 @@ test "connection: the AEAD usage limit triggers a rotation without being asked" 
     try testing.expectEqual(@as(u64, 1), srv.key_updates);
     // The new generation starts its own count, which is the point of rotating.
     try testing.expect(cl.spaceFor(.one_rtt).send.?.packets_protected < limit / 2);
+}
+
+// ── Path validation (§8.2) ───────────────────────────────────────────────────
+
+/// Send `frames` to `conn` in a 1-RTT packet, as a peer would. Returns the
+/// datagram length so a test can check what came back.
+fn injectOneRtt(gpa: Allocator, from: *Connection, to: *Connection, frames: []const u8) !void {
+    var buf: [max_datagram]u8 = undefined;
+    const sp = from.spaceFor(.one_rtt);
+    var keys = sp.send.?;
+    const pn = sp.next_pn;
+    sp.next_pn += 1;
+
+    const destination = from.remote.active();
+    buf[0] = packet.fixed_bit | 0x03; // four-byte packet number
+    if (from.send_key_phase == 1) buf[0] |= packet.key_phase_bit;
+    var cursor: usize = 1;
+    @memcpy(buf[cursor..][0..destination.len], destination.slice());
+    cursor += destination.len;
+    const pn_offset = cursor;
+    std.mem.writeInt(u32, buf[cursor..][0..4], @intCast(pn), .big);
+    cursor += 4;
+
+    const header = buf[0..cursor];
+    const sealed = try keys.seal(buf[cursor..], pn, header, frames);
+    sp.send = keys;
+    crypto.protectHeader(buf[0 .. cursor + sealed], pn_offset, 4, &keys.header);
+    try to.receive(gpa, buf[0 .. cursor + sealed]);
+}
+
+test "connection: a PATH_CHALLENGE is answered rather than treated as an error" {
+    // §8.2.2 makes this unconditional, and §9.1 makes PATH_CHALLENGE usable at any
+    // time — including as a liveness check on the path already in use. Refusing it
+    // closed connections with peers doing nothing wrong, which is what this
+    // replaces.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0x81);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    const data: [8]u8 = .{ 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04 };
+    var frames: [16]u8 = undefined;
+    const frames_len = frame.encode(&frames, .{ .path_challenge = &data });
+    try injectOneRtt(gpa, cl, srv, frames[0..frames_len]);
+
+    // Still up — which is the whole point — and a response is owed.
+    try testing.expect(srv.lifecycle() == .active);
+    try testing.expectEqual(@as(usize, 1), srv.path_response_count);
+
+    // The response goes out, echoing the data exactly (§19.18).
+    var out: [max_datagram]u8 = undefined;
+    const n = try srv.send(gpa, &out);
+    try testing.expect(n > 0);
+    try testing.expectEqual(@as(u64, 1), srv.path_responses_sent);
+    try testing.expectEqual(@as(usize, 0), srv.path_response_count);
+
+    // §8.2.2: the datagram carrying it must be expanded to 1200 bytes, because
+    // that is what proves the path carries a full-size datagram in both
+    // directions. Checking the length is checking the rule.
+    try testing.expect(n >= min_initial_datagram);
+
+    // And the client can read it: the echoed data is what it sent.
+    try cl.receive(gpa, out[0..n]);
+    try testing.expect(cl.lifecycle() == .active);
+}
+
+test "connection: a PATH_RESPONSE alone is enough to make a packet go out" {
+    // The rule `hasSomethingToSend` has to know, and it needs its own test: a
+    // PATH_CHALLENGE is ack-eliciting, so in the ordinary case an ACK is owed at
+    // the same moment and carries the response out incidentally. Removing the
+    // clause from `hasSomethingToSend` left every other test here passing.
+    //
+    // What makes it matter is the case where the queue is not emptied in one
+    // packet — responses that did not fit need a packet of their own, and nothing
+    // else may be owed by then.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0x85);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    // Drain everything the server owes, so that a response is the only thing left.
+    var out: [max_datagram]u8 = undefined;
+    while (true) {
+        const n = try srv.send(gpa, &out);
+        if (n == 0) break;
+    }
+    try testing.expectEqual(@as(usize, 0), try srv.send(gpa, &out));
+
+    // A response queued directly, bypassing the receive path that would also
+    // leave an ACK owed.
+    srv.path_responses[0] = @splat(0x5a);
+    srv.path_response_count = 1;
+
+    const n = try srv.send(gpa, &out);
+    try testing.expect(n > 0);
+    try testing.expectEqual(@as(u64, 1), srv.path_responses_sent);
+    // §8.2.2's expansion applies here too.
+    try testing.expect(n >= min_initial_datagram);
+}
+
+test "connection: several challenges each get their own response" {
+    // §8.2.2: one response per challenge, and §8.2.1 lets a peer send several to
+    // guard against loss. Answering only the last would leave the peer's earlier
+    // validation attempts unanswered.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0x82);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    var frames: [64]u8 = undefined;
+    var frames_len: usize = 0;
+    for ([_]u8{ 1, 2, 3 }) |tag| {
+        const data: [8]u8 = @splat(tag);
+        frames_len += frame.encode(frames[frames_len..], .{ .path_challenge = &data });
+    }
+    try injectOneRtt(gpa, cl, srv, frames[0..frames_len]);
+    try testing.expectEqual(@as(usize, 3), srv.path_response_count);
+
+    var out: [max_datagram]u8 = undefined;
+    const n = try srv.send(gpa, &out);
+    try testing.expect(n > 0);
+    try testing.expectEqual(@as(u64, 3), srv.path_responses_sent);
+}
+
+test "connection: more challenges than the bound are dropped, not accumulated" {
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0x83);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    var frames: [256]u8 = undefined;
+    var frames_len: usize = 0;
+    for (0..max_path_responses + 6) |i| {
+        const data: [8]u8 = @splat(@intCast(i));
+        frames_len += frame.encode(frames[frames_len..], .{ .path_challenge = &data });
+    }
+    try injectOneRtt(gpa, cl, srv, frames[0..frames_len]);
+
+    // Bounded, and still up: a peer that floods challenges gets fewer responses,
+    // not a closed connection and not unbounded state.
+    try testing.expectEqual(@as(usize, max_path_responses), srv.path_response_count);
+    try testing.expect(srv.lifecycle() == .active);
+}
+
+test "connection: an unmatched PATH_RESPONSE is discarded rather than fatal" {
+    // §19.18 permits PROTOCOL_VIOLATION here, and taking that option would hand
+    // anyone able to inject one packet a way to close the connection. This
+    // endpoint sends no challenges, so every response is unmatched.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0x84);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    const data: [8]u8 = @splat(0x77);
+    var frames: [16]u8 = undefined;
+    const frames_len = frame.encode(&frames, .{ .path_response = &data });
+    try injectOneRtt(gpa, cl, srv, frames[0..frames_len]);
+
+    try testing.expect(srv.lifecycle() == .active);
+    // And the connection still works afterwards.
+    try roundTrip(gpa, srv, cl, "still fine");
 }
