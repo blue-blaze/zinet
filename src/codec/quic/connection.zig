@@ -425,6 +425,11 @@ const SentMeta = struct {
     /// Stream IDs whose RESET_STREAM rode in this packet.
     resets: [max_credit_frames_per_packet]u64 = undefined,
     reset_count: u8 = 0,
+    /// Stream IDs whose STOP_SENDING rode in this packet. §13.3 requires
+    /// retransmission if it is lost — the opposite of PATH_RESPONSE, and the
+    /// reason is that nothing else will remind the peer.
+    stops: [max_credit_frames_per_packet]u64 = undefined,
+    stop_count: u8 = 0,
     /// RETIRE_CONNECTION_ID sequence numbers carried.
     retires: [cid_mod.max_stored]u64 = undefined,
     retire_count: u8 = 0,
@@ -952,6 +957,20 @@ pub const Connection = struct {
         self.pending_stream_data = true;
     }
 
+    /// §3.5: tell the peer to stop sending on `id`.
+    ///
+    /// For an application that has lost interest in what is arriving — HTTP/3
+    /// cancelling a request is the case that matters, and RFC 9114 §4.1 pairs this
+    /// with a RESET_STREAM in the other direction. The stream keeps receiving
+    /// until the peer complies, because until its RESET_STREAM arrives it may not
+    /// have heard and its data is still legitimate.
+    pub fn stopSending(self: *Connection, id: u64, code: u64) Error!void {
+        const s = self.streams.get(.init(id)) orelse return error.ProtocolViolation;
+        const receiver = &(s.recv orelse return error.ProtocolViolation);
+        receiver.requestStopSending(code);
+        self.pending_stream_data = true;
+    }
+
     /// Readable bytes on a stream. They stay in the stream's buffer until
     /// `consume`, which is what releases flow control credit — a reader that never
     /// consumes stalls the peer, which is the honest outcome.
@@ -1045,6 +1064,11 @@ pub const Connection = struct {
         }
         for (meta.retires[0..meta.retire_count]) |sequence| {
             self.remote.requeueRetire(sequence);
+        }
+        for (meta.stops[0..meta.stop_count]) |id| {
+            if (self.streams.get(.init(id))) |st| {
+                if (st.recv) |*receiver| receiver.rearmStopSending();
+            }
         }
         if (meta.carried_handshake_done) self.handshake_done_pending = true;
         if (meta.carried_max_data) self.rearm_max_data = true;
@@ -1447,6 +1471,29 @@ pub const Connection = struct {
                         .init(sf.id),
                         sf.error_code,
                     ));
+                    // §3.5, and §2.4 states it plainly: STOP_SENDING "triggers an
+                    // automatic RESET_STREAM". Sending it here rather than leaving
+                    // it to the application, because a peer that has said it will
+                    // read no more has closed the stream as far as the protocol is
+                    // concerned — an application that declined to reset would
+                    // leave the stream open forever from the peer's point of view,
+                    // and every byte it wrote would be discarded on arrival.
+                    //
+                    // `Send.owesReset` decides whether the state permits it, which
+                    // is where the Ready/Send/Data Sent distinction lives.
+                    if (self.streams.get(.init(sf.id))) |st| {
+                        if (st.send) |*sender| {
+                            if (sender.owesReset()) {
+                                // The peer's code is reused: it is the reason the
+                                // stream is being abandoned, and inventing our own
+                                // would tell the peer less than it already knows.
+                                self.resetStream(sf.id, sf.error_code) catch {};
+                            }
+                        }
+                    }
+                    // Reported as well as acted on: an application may want to stop
+                    // producing the data whose transmission has just become
+                    // pointless.
                     try self.events.append(gpa, .{ .stream_stop_sending = .{
                         .id = sf.id,
                         .code = sf.error_code,
@@ -1661,6 +1708,16 @@ pub const Connection = struct {
 
     /// §6.4's holding period, and §6.5's minimum interval between rotations: both
     /// are "three times the PTO", so both come from here.
+    /// Whether any stream owes the peer a STOP_SENDING.
+    fn owesStopSending(self: *Connection) bool {
+        var it = self.streams.map.iterator();
+        while (it.next()) |entry| {
+            const receiver = &(entry.value_ptr.recv orelse continue);
+            if (receiver.owesStopSending()) return true;
+        }
+        return false;
+    }
+
     fn retirementDelay(self: *const Connection) u64 {
         return self.rtt.probeTimeout(.application) *| 3;
     }
@@ -1918,6 +1975,10 @@ pub const Connection = struct {
 
         // Retirements owed for the peer's connection IDs need 1-RTT.
         if (level == .one_rtt and self.remote.pendingRetire().len > 0) return true;
+
+        // A STOP_SENDING owed to the peer. Here as well as in `writeFrames`, for
+        // the reason stated below it.
+        if (level == .one_rtt and self.owesStopSending()) return true;
 
         // A PATH_RESPONSE owed to the peer (§8.2.2). Here as well as in
         // `writeFrames`, because a writer that would emit a frame nobody asks for
@@ -2412,6 +2473,28 @@ pub const Connection = struct {
             sender.fin_sent = true;
             meta.resets[meta.reset_count] = entry.key_ptr.*;
             meta.reset_count += 1;
+            meta.ack_eliciting = true;
+        }
+
+        // §19.5: STOP_SENDING, the mirror of the resets above — that loop is this
+        // endpoint abandoning what it writes, this one is it abandoning what it
+        // reads. Before stream data for the same reason: it is small, and delaying
+        // it means more bytes arrive that nobody wants.
+        var stop_it = self.streams.map.iterator();
+        while (stop_it.next()) |entry| {
+            const s = entry.value_ptr;
+            const receiver = &(s.recv orelse continue);
+            if (!receiver.owesStopSending()) continue;
+            const f: frame.Frame = .{ .stop_sending = .{
+                .id = entry.key_ptr.*,
+                .error_code = receiver.stop_sending_request.?,
+            } };
+            if (meta.stop_count == meta.stops.len) break;
+            if (len + frame.encodedLen(f) > dest.len) break;
+            len += frame.encode(dest[len..], f);
+            receiver.stop_sending_sent = true;
+            meta.stops[meta.stop_count] = entry.key_ptr.*;
+            meta.stop_count += 1;
             meta.ack_eliciting = true;
         }
 
@@ -5104,4 +5187,135 @@ test "connection: an unmatched PATH_RESPONSE is discarded rather than fatal" {
     try testing.expect(srv.lifecycle() == .active);
     // And the connection still works afterwards.
     try roundTrip(gpa, srv, cl, "still fine");
+}
+
+// ── STOP_SENDING (§19.5, §3.5) ───────────────────────────────────────────────
+
+test "connection: STOP_SENDING reaches the peer and stops it writing" {
+    // The whole exchange §3.5 describes: a reader says it wants no more, and the
+    // writer's obligation is to reset rather than to keep writing into a void.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0x91);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    // The client writes; the server reads and then loses interest.
+    const id = try cl.openStream(gpa, true);
+    _ = try cl.write(gpa, id, "first part");
+    try exchange(gpa, cl, srv, 8);
+    try testing.expectEqualStrings("first part", srv.read(id));
+    srv.consume(gpa, id, "first part".len);
+
+    try srv.stopSending(id, 0x1234);
+    try exchange(gpa, cl, srv, 8);
+
+    // The client was told, and complied: §2.4's "automatic RESET_STREAM".
+    var saw_stop = false;
+    while (cl.nextEvent()) |event| switch (event) {
+        .stream_stop_sending => |e| {
+            try testing.expectEqual(id, e.id);
+            try testing.expectEqual(@as(u64, 0x1234), e.code);
+            saw_stop = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw_stop);
+
+    // The reset went out, carrying the peer's own code back — which tells it
+    // nothing it did not already know, and inventing a different one would tell it
+    // less.
+    const sender = &cl.streams.get(.init(id)).?.send.?;
+    try testing.expectEqual(@as(?u64, 0x1234), sender.reset_code);
+    // Either state is correct: `.reset_sent` once the frame is written, and
+    // `.reset_recvd` once the peer acknowledges it — which it does here, since the
+    // exchange runs to quiescence.
+    try testing.expect(sender.state == .reset_sent or sender.state == .reset_recvd);
+
+    // And the server saw the reset, so the stream is over in that direction.
+    const receiver = &srv.streams.get(.init(id)).?.recv.?;
+    try testing.expectEqual(@as(?u64, 0x1234), receiver.reset_code);
+}
+
+test "connection: a STOP_SENDING alone is enough to make a packet go out" {
+    // Same rule as PATH_RESPONSE, and worth its own test for the same reason: in
+    // the ordinary case an ACK is owed at the same moment and would carry the
+    // frame out incidentally.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0x92);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    const id = try cl.openStream(gpa, true);
+    _ = try cl.write(gpa, id, "data");
+    try exchange(gpa, cl, srv, 8);
+    srv.consume(gpa, id, srv.read(id).len);
+
+    // Drain everything the server owes.
+    var out: [max_datagram]u8 = undefined;
+    while (true) {
+        const n = try srv.send(gpa, &out);
+        if (n == 0) break;
+    }
+    try testing.expectEqual(@as(usize, 0), try srv.send(gpa, &out));
+
+    try srv.stopSending(id, 7);
+    const n = try srv.send(gpa, &out);
+    try testing.expect(n > 0);
+    try testing.expect(!srv.owesStopSending());
+}
+
+test "connection: a lost STOP_SENDING is sent again" {
+    // §13.3, and the opposite of PATH_RESPONSE: nothing else will remind the peer,
+    // so losing this frame silently would leave a stream producing data forever
+    // that the reader has already abandoned.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0x93);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    const id = try cl.openStream(gpa, true);
+    _ = try cl.write(gpa, id, "data");
+    try exchange(gpa, cl, srv, 8);
+    srv.consume(gpa, id, srv.read(id).len);
+
+    try srv.stopSending(id, 9);
+    var out: [max_datagram]u8 = undefined;
+    const n = try srv.send(gpa, &out);
+    try testing.expect(n > 0);
+    // Sent, so nothing more is owed — until the packet is declared lost.
+    try testing.expect(!srv.owesStopSending());
+
+    // Declare it lost the way recovery would, by re-arming from the metadata.
+    const receiver = &srv.streams.get(.init(id)).?.recv.?;
+    receiver.rearmStopSending();
+    try testing.expect(srv.owesStopSending());
+    const again = try srv.send(gpa, &out);
+    try testing.expect(again > 0);
+}
+
+test "connection: STOP_SENDING is not asked for once the size is known" {
+    // A stream whose FIN has arrived has nothing left to suppress, so the frame
+    // would say nothing. Checking this matters because the request can be made at
+    // any time, including just after the last byte arrived.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0x94);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    const id = try cl.openStream(gpa, true);
+    _ = try cl.write(gpa, id, "all of it");
+    try cl.finishStream(id);
+    try exchange(gpa, cl, srv, 8);
+    srv.consume(gpa, id, srv.read(id).len);
+
+    try srv.stopSending(id, 3);
+    try testing.expect(!srv.owesStopSending());
 }

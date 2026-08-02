@@ -322,6 +322,17 @@ pub const Recv = struct {
     /// The application error code from a RESET_STREAM, if one arrived.
     reset_code: ?u64 = null,
     buffer: Reassembler = .{},
+    /// §19.5: the application has asked us to tell the peer to stop sending, and
+    /// the frame has not gone out yet. On the *receiving* half, because
+    /// STOP_SENDING travels from whoever is reading to whoever is writing.
+    ///
+    /// Distinct from `reset_code`, which is the peer telling *us* it has stopped.
+    /// The two look alike and mean opposite things.
+    stop_sending_request: ?u64 = null,
+    /// Whether the request has been put in a packet. It is still remembered after
+    /// that, because §13.3 requires retransmission if the packet is lost — unlike
+    /// PATH_RESPONSE, which is sent exactly once.
+    stop_sending_sent: bool = false,
 
     pub fn init(initial_max_data: u64) Recv {
         return .{ .max_data = initial_max_data };
@@ -421,6 +432,39 @@ pub const Recv = struct {
         }
 
         return self.flowControlUsed() - before;
+    }
+
+    /// §3.5: ask the peer to stop sending on this stream.
+    ///
+    /// A request rather than a state change: the stream keeps receiving until the
+    /// peer's RESET_STREAM arrives, because until then the peer may not have heard
+    /// and its data is still legitimate. §3.5 is explicit that STOP_SENDING is
+    /// advisory in exactly this sense.
+    pub fn requestStopSending(self: *Recv, code: u64) void {
+        if (self.stop_sending_request != null) return;
+        self.stop_sending_request = code;
+        self.stop_sending_sent = false;
+    }
+
+    /// Whether a STOP_SENDING frame is owed to the peer.
+    ///
+    /// The "size is known" test lives here and only here. It is tempting to also
+    /// refuse the request in `requestStopSending`, and that version was written
+    /// first — but it is both redundant and the weaker of the two, because the
+    /// interesting case is a request made *before* the FIN arrives and rendered
+    /// pointless by it. One test, at the moment the answer is needed, covers both
+    /// orderings; two tests meant removing either one changed nothing observable.
+    pub fn owesStopSending(self: *const Recv) bool {
+        if (self.stop_sending_request == null) return false;
+        if (self.stop_sending_sent) return false;
+        // Nothing left to suppress: the data this would have stopped has already
+        // arrived, so the frame would say nothing.
+        return self.final_size == null;
+    }
+
+    /// Re-arm after the packet carrying it was lost (§13.3).
+    pub fn rearmStopSending(self: *Recv) void {
+        if (self.stop_sending_request != null) self.stop_sending_sent = false;
     }
 
     /// Apply a RESET_STREAM frame (§19.4). Returns the new connection-level credit
