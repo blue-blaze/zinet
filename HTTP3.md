@@ -280,7 +280,7 @@ exercise it is worse than one that is honestly absent.
 ## Numbers
 
 The QUIC and HTTP/3 stack is roughly 21,000 lines across the two directories,
-carrying 268 of the repository's 743 tests plus six of its 21 fuzz targets. All of
+carrying 273 of the repository's 748 tests plus six of its 21 fuzz targets. All of
 it runs under the leak-checking allocator, on threads and on fibers, on Linux and
 macOS, in Debug, ReleaseSafe and ReleaseFast — and against aioquic in CI on every
 push, in both directions.
