@@ -609,6 +609,31 @@ pub const Connection = struct {
     /// Set when a validation was abandoned (§8.2.4), so the caller can revert to
     /// the last address it knew was good (§9.3.2).
     path_validation_failed: bool = false,
+
+    // ── §9.3 responding to migration ────────────────────────────────────────
+    /// Which path the peer is currently believed to be on.
+    ///
+    /// An opaque number, not an address: this layer is handed datagrams and has no
+    /// business interpreting addresses. All it needs is to tell one path from
+    /// another, and the caller that owns the socket decides what a path *is*.
+    ///
+    /// Null until the first packet arrives. The first observation is adoption, not
+    /// migration — there is nowhere to have migrated from — and without that
+    /// distinction every connection would report a migration on its first packet
+    /// after the handshake and probe a path it had just been talking on.
+    peer_path: ?u64 = null,
+    /// The largest packet number seen in a non-probing packet. §9.3: only the
+    /// highest-numbered non-probing packet moves the path, so that reordering
+    /// cannot drag a connection back to an address the peer has left.
+    largest_non_probing_pn: ?u64 = null,
+    /// How many times the peer has been observed to migrate, for tests and for the
+    /// caller to notice.
+    migrations: u64 = 0,
+    /// Whether the validation in flight, if it succeeds, should reset congestion
+    /// state (§9.4). Set when a migration starts one; cleared when the caller says
+    /// the move was port-only, which §9.4 lets an endpoint treat as the same path
+    /// for this purpose because it is usually a NAT rebinding rather than a new one.
+    reset_congestion_on_validation: bool = false,
     spaces: [Level.count]Space = .{ .{}, .{}, .{} },
 
     /// Ours, the peer's, and the bookkeeping §7.3 checks against.
@@ -1090,6 +1115,15 @@ pub const Connection = struct {
         return true;
     }
 
+    /// §9.4: say that the peer's move changed only its port, so congestion state
+    /// and the RTT estimate survive validation.
+    ///
+    /// Only the caller can know this — it holds the addresses. Called after a
+    /// migration is reported and before the validation completes.
+    pub fn migrationChangedPortOnly(self: *Connection) void {
+        self.reset_congestion_on_validation = false;
+    }
+
     /// Whether a challenge is owed. Separate from `validating != null` because a
     /// validation in progress spends most of its life waiting for an answer.
     fn owesPathChallenge(self: *const Connection) bool {
@@ -1318,7 +1352,22 @@ pub const Connection = struct {
     /// Packets that cannot be decrypted are dropped silently, not reported:
     /// RFC 9001 §5.3 requires it, because an off-path attacker who could kill a
     /// connection with one forged packet would need no other capability.
+    /// Receive a datagram that arrived on the path this connection already uses.
+    ///
+    /// The single-path case: an in-process peer, a client with one socket, a test.
+    /// Delegating with the current path means this entry point can never be mistaken
+    /// for a migration, which is why it is safe to be the default.
     pub fn receive(self: *Connection, gpa: Allocator, datagram: []const u8) !void {
+        return self.receiveOn(gpa, datagram, self.peer_path orelse 0);
+    }
+
+    /// Receive a datagram that arrived on `path` (§9.3).
+    ///
+    /// `path` is whatever the caller uses to distinguish one 4-tuple from another;
+    /// this layer only ever compares it for equality. A caller that serves many
+    /// peers on one socket must use this rather than `receive`, or a peer that moves
+    /// will go unnoticed.
+    pub fn receiveOn(self: *Connection, gpa: Allocator, datagram: []const u8, path: u64) !void {
         switch (self.state) {
             .active => {},
             .closing => {
@@ -1388,7 +1437,7 @@ pub const Connection = struct {
                     return error.VersionNegotiationFailed;
                 },
                 .retry => |retry| if (self.role == .client) try self.handleRetry(gpa, retry, slice),
-                .protected => |protected| try self.handleProtected(gpa, protected, slice),
+                .protected => |protected| try self.handleProtected(gpa, protected, slice, path),
             }
         }
     }
@@ -1459,6 +1508,7 @@ pub const Connection = struct {
         gpa: Allocator,
         protected: packet.Protected,
         slice: []const u8,
+        path: u64,
     ) !void {
         if (!protected.version.isSupported()) return;
 
@@ -1579,7 +1629,42 @@ pub const Connection = struct {
         // anti-amplification limit; a token is the shortcut.
         if (self.role == .server and level != .initial) self.address_validated = true;
 
-        try self.handleFrames(gpa, level, plain[0..plain_len]);
+        var non_probing = false;
+        try self.handleFrames(gpa, level, plain[0..plain_len], &non_probing);
+        if (non_probing) self.notePeerPath(level, pn, path);
+    }
+
+    /// §9.3: a non-probing packet from a new address means the peer has moved.
+    ///
+    /// Only the highest-numbered such packet counts, or a reordered packet from the
+    /// address the peer has just left would drag the connection back to it.
+    fn notePeerPath(self: *Connection, level: Level, pn: u64, path: u64) void {
+        if (level != .one_rtt) return;
+        if (self.largest_non_probing_pn) |largest| {
+            if (pn <= largest) return;
+        }
+        self.largest_non_probing_pn = pn;
+        const current = self.peer_path orelse {
+            self.peer_path = path;
+            return;
+        };
+        if (path == current) return;
+
+        // §9: addresses do not change during the handshake, and §21.2 says a packet
+        // from a different path may simply be discarded then. Migrating on one would
+        // let an off-path attacker who injects a single packet redirect a handshake.
+        if (!self.handshake_confirmed) return;
+        // §9.6: only clients migrate in this version. A server address that appears
+        // to change is not a migration, and the client discards such packets.
+        if (self.role != .server) return;
+
+        self.peer_path = path;
+        self.migrations += 1;
+        self.reset_congestion_on_validation = true;
+        // §9.3: validation of the new address is a MUST, not an option — it is what
+        // keeps this endpoint from being used to flood a victim whose address a peer
+        // spoofed (§9.3.1). Already underway is good enough.
+        _ = self.beginPathValidation();
     }
 
     fn handleFrames(
@@ -1587,6 +1672,10 @@ pub const Connection = struct {
         gpa: Allocator,
         level: Level,
         payload: []const u8,
+        /// Set when the packet contains any frame that is not one of §9.1's probing
+        /// frames. Reported rather than remembered, because it describes this packet
+        /// and nothing beyond it.
+        non_probing: *bool,
     ) !void {
         const frame_space: frame.Space = switch (level) {
             .initial => .initial,
@@ -1597,6 +1686,7 @@ pub const Connection = struct {
         var rest = payload;
         while (rest.len > 0) {
             const f = frame.parse(&rest) catch return error.ProtocolViolation;
+            if (!f.isProbing()) non_probing.* = true;
 
             // §12.4: not bookkeeping. This is what stops application data from
             // riding in an unauthenticated Initial packet.
@@ -1774,6 +1864,18 @@ pub const Connection = struct {
                         if (std.mem.eql(u8, &v.data, data)) {
                             self.validating = null;
                             self.path_validated = true;
+                            if (self.reset_congestion_on_validation) {
+                                // §9.4: on confirming the peer owns its new address,
+                                // reset the controller and the RTT estimator. The new
+                                // path's capacity is not the old one's, and carrying
+                                // the old window over means sending too fast until it
+                                // adapts. §9.4 permits keeping them when only the
+                                // port changed — the caller knows that, this layer
+                                // does not, so the caller says.
+                                self.congestion = .init(max_datagram);
+                                self.rtt = .{};
+                                self.reset_congestion_on_validation = false;
+                            }
                         }
                     }
                     // §19.18 makes an unmatched response a PROTOCOL_VIOLATION at
@@ -5351,6 +5453,16 @@ test "connection: the AEAD usage limit triggers a rotation without being asked" 
 /// Send `frames` to `conn` in a 1-RTT packet, as a peer would. Returns the
 /// datagram length so a test can check what came back.
 fn injectOneRtt(gpa: Allocator, from: *Connection, to: *Connection, frames: []const u8) !void {
+    return injectOneRttOn(gpa, from, to, frames, to.peer_path orelse 0);
+}
+
+fn injectOneRttOn(
+    gpa: Allocator,
+    from: *Connection,
+    to: *Connection,
+    frames: []const u8,
+    path: u64,
+) !void {
     var buf: [max_datagram]u8 = undefined;
     const sp = from.spaceFor(.one_rtt);
     var keys = sp.send.?;
@@ -5371,7 +5483,7 @@ fn injectOneRtt(gpa: Allocator, from: *Connection, to: *Connection, frames: []co
     const sealed = try keys.seal(buf[cursor..], pn, header, frames);
     sp.send = keys;
     crypto.protectHeader(buf[0 .. cursor + sealed], pn_offset, 4, &keys.header);
-    try to.receive(gpa, buf[0 .. cursor + sealed]);
+    try to.receiveOn(gpa, buf[0 .. cursor + sealed], path);
 }
 
 test "connection: a PATH_CHALLENGE is answered rather than treated as an error" {
@@ -6073,4 +6185,159 @@ test "connection: a lost challenge is sent again" {
     try testing.expect(try srv.send(gpa, &out) > 0);
     try testing.expectEqual(@as(u32, 2), srv.validating.?.sent);
     try testing.expectEqualSlices(u8, &data, &srv.validating.?.data);
+}
+
+// ── Responding to migration (§9.3, §9.4) ─────────────────────────────────────
+
+test "connection: a non-probing packet from a new path is a migration" {
+    // §9.3, and the whole point: the server notices, starts validating the new
+    // address, and does not simply start sending there on trust.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xe1);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    // Settle, so the path is adopted and the numbering is ours.
+    var out: [max_datagram]u8 = undefined;
+    while (try srv.send(gpa, &out) > 0) {}
+    try testing.expect(srv.peer_path != null);
+    try testing.expectEqual(@as(u64, 0), srv.migrations);
+
+    // A PING is non-probing, so it moves the path.
+    var frames: [8]u8 = undefined;
+    const frames_len = frame.encode(&frames, .ping);
+    try injectOneRttOn(gpa, cl, srv, frames[0..frames_len], 0x9999);
+
+    try testing.expectEqual(@as(u64, 1), srv.migrations);
+    try testing.expectEqual(@as(?u64, 0x9999), srv.peer_path);
+    // §9.3: validation is a MUST, so it is already underway rather than pending a
+    // decision by the caller.
+    try testing.expect(srv.validating != null);
+}
+
+test "connection: a probing packet from a new path is not a migration" {
+    // §9.1 exists precisely so that a peer can test a path without claiming it.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xe2);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    var out: [max_datagram]u8 = undefined;
+    while (try srv.send(gpa, &out) > 0) {}
+    const path_before = srv.peer_path;
+
+    var frames: [16]u8 = undefined;
+    const data: [8]u8 = @splat(0x33);
+    const frames_len = frame.encode(&frames, .{ .path_challenge = &data });
+    try injectOneRttOn(gpa, cl, srv, frames[0..frames_len], 0x8888);
+
+    try testing.expectEqual(@as(u64, 0), srv.migrations);
+    try testing.expectEqual(path_before, srv.peer_path);
+    // The challenge is still answered, on the path it arrived on (§8.2.2).
+    try testing.expect(srv.path_response_count > 0);
+}
+
+test "connection: a reordered packet does not drag the path backwards" {
+    // §9.3: only the highest-numbered non-probing packet moves the address. Without
+    // this, a delayed packet from the address a peer has left would send the
+    // connection back to it — and an attacker who can replay one packet could keep
+    // it there.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xe3);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    var out: [max_datagram]u8 = undefined;
+    while (try srv.send(gpa, &out) > 0) {}
+
+    var frames: [8]u8 = undefined;
+    const frames_len = frame.encode(&frames, .ping);
+
+    // Two packets, the newer arriving first: the second is older, so it is ignored
+    // for the purpose of moving the path even though it is processed.
+    const pn_before = cl.spaceFor(.one_rtt).next_pn;
+    cl.spaceFor(.one_rtt).next_pn = pn_before + 5;
+    try injectOneRttOn(gpa, cl, srv, frames[0..frames_len], 0x7777);
+    try testing.expectEqual(@as(?u64, 0x7777), srv.peer_path);
+
+    cl.spaceFor(.one_rtt).next_pn = pn_before;
+    try injectOneRttOn(gpa, cl, srv, frames[0..frames_len], 0x6666);
+    try testing.expectEqual(@as(?u64, 0x7777), srv.peer_path);
+    try testing.expectEqual(@as(u64, 1), srv.migrations);
+}
+
+test "connection: migration is ignored before the handshake is confirmed" {
+    // §9 forbids migration before confirmation, and §21.2 permits discarding such a
+    // packet. Acting on one would let an off-path attacker redirect a handshake with
+    // a single injected packet.
+    const gpa = testing.allocator;
+    initServerIdentity();
+    const dcid = testCid(&.{ 7, 7, 7, 7, 7, 7, 7, 7 });
+    var srv = try Connection.initServer(
+        testServerOptions(testCid(&.{ 1, 1, 1, 1 }), dcid, testCid(&.{ 2, 2, 2, 2 })),
+        @splat(0xe4),
+    );
+    defer srv.deinit(gpa);
+
+    try testing.expect(!srv.handshake_confirmed);
+    srv.notePeerPath(.one_rtt, 1, 0x1111);
+    srv.notePeerPath(.one_rtt, 2, 0x2222);
+    try testing.expectEqual(@as(u64, 0), srv.migrations);
+    try testing.expect(srv.validating == null);
+}
+
+test "connection: a confirmed migration resets congestion state" {
+    // §9.4: the new path's capacity is not the old one's, so the controller and the
+    // RTT estimate start again — unless the caller says only the port changed.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xe5);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    var out: [max_datagram]u8 = undefined;
+    while (try srv.send(gpa, &out) > 0) {}
+    try testing.expect(srv.rtt.smoothed != null); // the handshake produced samples
+
+    var frames: [8]u8 = undefined;
+    const frames_len = frame.encode(&frames, .ping);
+    try injectOneRttOn(gpa, cl, srv, frames[0..frames_len], 0x5555);
+    try testing.expect(srv.reset_congestion_on_validation);
+
+    try exchange(gpa, cl, srv, 8);
+    try testing.expect(srv.path_validated);
+    try testing.expect(srv.rtt.smoothed == null);
+    try testing.expect(!srv.reset_congestion_on_validation);
+}
+
+test "connection: a port-only move keeps the congestion state" {
+    // §9.4 permits it, because a port change is usually a NAT rebinding rather than
+    // a different network. Only the caller can tell, so only the caller may say.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xe6);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    var out: [max_datagram]u8 = undefined;
+    while (try srv.send(gpa, &out) > 0) {}
+    const smoothed = srv.rtt.smoothed;
+    try testing.expect(smoothed != null);
+
+    var frames: [8]u8 = undefined;
+    const frames_len = frame.encode(&frames, .ping);
+    try injectOneRttOn(gpa, cl, srv, frames[0..frames_len], 0x4444);
+    srv.migrationChangedPortOnly();
+
+    try exchange(gpa, cl, srv, 8);
+    try testing.expect(srv.path_validated);
+    try testing.expectEqual(smoothed, srv.rtt.smoothed);
 }

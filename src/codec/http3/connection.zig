@@ -251,6 +251,15 @@ pub const Connection = struct {
         try self.drainTransport(gpa);
     }
 
+    /// The same, for a datagram that arrived on a particular path (§9.3).
+    ///
+    /// An endpoint serving many peers on one socket must use this, or a peer that
+    /// moves goes unnoticed; see `quic.connection.Connection.receiveOn`.
+    pub fn receiveOn(self: *Connection, gpa: Allocator, datagram: []const u8, path: u64) !void {
+        self.transport.receiveOn(gpa, datagram, path) catch |err| return err;
+        try self.drainTransport(gpa);
+    }
+
     /// Translate whatever the transport has surfaced without feeding it a
     /// datagram first — for callers (and tests) that drive the transport
     /// directly.

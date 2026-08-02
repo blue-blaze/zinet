@@ -103,6 +103,12 @@ const Entry = struct {
     /// How many spares have been issued, so the endpoint stops at what the peer
     /// said it would hold.
     spares_issued: usize = 0,
+    /// The last address whose path validation succeeded, or the handshake's.
+    ///
+    /// §9.3.2 requires reverting to it when validating a new address fails, which is
+    /// what keeps an on-path attacker's spurious migration from killing the
+    /// connection instead of merely being ignored.
+    validated_address: Io.net.IpAddress,
     /// Whether a NEW_TOKEN has been minted for this connection. One is enough:
     /// §8.1.3 lets a server send several, but each is a credential and the client
     /// only needs one to skip validation next time.
@@ -142,6 +148,14 @@ pub const Handler = struct {
     cid_counter: u64 = 0,
     seed: [32]u8,
     accepted: usize = 0,
+    /// How many times a connection's address has been rewritten because its peer
+    /// migrated (§9.3).
+    ///
+    /// Observable because the interesting assertion is that it stays at zero: an
+    /// endpoint that takes the address from every datagram lets anyone able to spoof
+    /// a source address redirect a connection's whole output at a victim, and the
+    /// symptom of that defect is this number rising during ordinary traffic.
+    address_moves: usize = 0,
     /// Spare connection IDs issued across all connections. Observable for the same
     /// reason `accepted` is: it is how a test can tell the announcements happened
     /// without reaching into a connection that another task owns.
@@ -227,15 +241,23 @@ pub const Handler = struct {
         };
 
         if (self.lookup(destination)) |entry| {
-            // §9: the address is taken from the packet rather than checked
-            // against the stored one, which is what lets a NAT rebinding survive.
-            // Confirming a *deliberate* migration would need PATH_CHALLENGE, which
-            // this does not do — see the module comment.
-            entry.address = from;
+            // §9.3: the address moves only when the connection says the peer has
+            // migrated — a non-probing packet from a new path, carrying the highest
+            // packet number seen. Taking the address from every datagram, as this
+            // did before, means anyone able to spoof a source address can redirect
+            // the connection's whole output at a victim (§9.3.1).
+            const migrations_before = entry.conn.transport.migrations;
             entry.conn.setTime(self.now());
-            entry.conn.receive(self.gpa, bytes) catch {
+            entry.conn.receiveOn(self.gpa, bytes, pathKey(from)) catch {
                 entry.finished = true;
             };
+            if (entry.conn.transport.migrations != migrations_before) {
+                // §9.3.2: keep the address that was working, to revert to if
+                // validating the new one fails.
+                entry.validated_address = entry.address;
+                entry.address = from;
+                self.address_moves += 1;
+            }
             try self.dispatchEvents(entry);
             self.offerToken(entry, from);
             self.offerSpareCids(entry);
@@ -329,6 +351,7 @@ pub const Handler = struct {
                     }, seed),
                     .mux = undefined,
                     .address = from,
+                    .validated_address = from,
                     .local_cid = local_cid,
                 };
                 errdefer entry.conn.deinit(self.gpa);
@@ -572,6 +595,20 @@ pub const Handler = struct {
 /// hash undefined padding. This is only safe because the endpoint issues IDs of
 /// one length — which it must anyway, since a short header does not carry the
 /// length (§5.1).
+/// A path, as this endpoint counts them: the peer's address and port together.
+///
+/// §9.3 needs only to tell one path from another, so a hash is enough and the
+/// connection layer never sees an address. The port is included because a NAT
+/// rebinding that changes only the port is still a path change (§9.4 treats it
+/// specially when resetting congestion state, but it is a change).
+fn pathKey(address: Io.net.IpAddress) u64 {
+    var buf: [quic.acceptor.max_address_len]u8 = undefined;
+    const encoded = encodeAddress(&buf, address);
+    var key: u64 = 0xcbf2_9ce4_8422_2325;
+    for (encoded) |byte| key = (key ^ byte) *% 0x100_0000_01b3;
+    return key;
+}
+
 fn cidKey(cid: ConnectionId) u64 {
     var key: u64 = cid.len;
     for (cid.slice()) |byte| key = key *% 31 +% byte;
@@ -664,6 +701,11 @@ pub const Server = struct {
     /// How many spare connection IDs have been issued and routed (§5.1.1).
     pub fn spareIdsIssued(self: *const Server) usize {
         return self.handler.spares_total;
+    }
+
+    /// How many times a peer's address has been acted on as a migration (§9.3).
+    pub fn addressMoves(self: *const Server) usize {
+        return self.handler.address_moves;
     }
 
     /// How many keys the routing table holds. More than one per connection once
@@ -869,4 +911,9 @@ test "http3 server: our own client fetches from it over a real UDP socket" {
     // One connection, three ways to address it. If a spare were announced without
     // being routed, the client's first packet using it would be dropped as unknown.
     try testing.expectEqual(@as(usize, 1 + spare_connection_ids), server.routeCount());
+
+    // §9.3: the client never moved, so its address was never rewritten. Zero rather
+    // than "the right value", because the defect this guards against is rewriting the
+    // address from whatever a datagram claims — which an attacker chooses.
+    try testing.expectEqual(@as(usize, 0), server.addressMoves());
 }
