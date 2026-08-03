@@ -65,10 +65,21 @@ review's findings and every defect it, the fuzzer and cross-implementation testi
 turned up are written down in [REVIEW.md](REVIEW.md).
 
 Not done: TLS 1.2 (a peer that cannot do 1.3 is refused), session resumption and
-0-RTT, client certificates, QUIC connection migration and stateless reset. Each is
-listed with its reason in [TLS.md](TLS.md) and [HTTP3.md](HTTP3.md) rather than
-left to be discovered. [HTTP2.md](HTTP2.md) is the HTTP/2 implementation record,
+0-RTT, client certificates, and **sending** a QUIC stateless reset — answering one is
+implemented, and checked before a datagram is parsed as §10.3 requires, but an
+endpoint that has lost its state can only produce a recognisable reset from a key
+that survives a restart, which is an operational input this layer does not yet take.
+Each is listed with its reason in [TLS.md](TLS.md) and [HTTP3.md](HTTP3.md) rather
+than left to be discovered. [HTTP2.md](HTTP2.md) is the HTTP/2 implementation record,
 including the one framework decision it forced.
+
+**QUIC connection migration used to be on that list and is not any more**, which is
+worth saying plainly rather than quietly editing: a peer that moves is now detected by
+§9.3's three conditions together — a non-probing frame, a new path, and the highest
+packet number seen — the new address is validated before anything is sent to it, and
+§9.4's congestion and RTT reset follows. Three named pieces are still absent, each for
+a stated reason: §9.3.3's probe of the *old* path, `preferred_address` (§9.6), and
+§9.2 client-initiated migration. The row in [HTTP3.md](HTTP3.md) says which and why.
 
 ### Blocked upstream
 
