@@ -38,7 +38,7 @@ handshake written here, because Netty binds Quiche and the standard library has 
 TLS server; see [HTTP3.md](HTTP3.md) and [TLS.md](TLS.md) — Redis RESP2/RESP3,
 datagram (UDP) endpoints, a DNS resolver, TLS 1.3 on both sides of a connection, a
 bounded client connection pool, and `EmbeddedChannel` for testing pipelines without
-sockets. 754 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
+sockets. 758 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
 all under a leak-checking allocator, plus twenty-one fuzz targets. The same suite
 also runs **on fibers** rather than threads — see [Choosing an `Io`](#choosing-an-io).
 

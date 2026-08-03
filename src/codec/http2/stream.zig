@@ -129,6 +129,15 @@ pub const Stream = struct {
     /// for as trailers on its own request — which is exactly what happened before
     /// the two-sided test above existed to catch it.
     remote_headers_seen: bool = false,
+    /// §8.5: this stream carries a CONNECT tunnel, so only DATA and the stream
+    /// management frames may follow. Set on a server when the CONNECT request
+    /// arrives and on a client when a 2xx answers one — the two moments after which
+    /// the *peer* may only send tunnel bytes. A refusal is an ordinary response, so
+    /// a client only marks it on success.
+    tunnel: bool = false,
+    /// Client side only: a CONNECT went out here, so a 2xx makes it a tunnel. Kept
+    /// apart from `tunnel` because the request precedes the answer that decides.
+    sent_connect: bool = false,
 
     pub fn deinit(stream: *Stream, gpa: Allocator) void {
         stream.pending.deinit(gpa);

@@ -41,9 +41,38 @@ pub const Request = struct {
     authority: ?[]const u8,
 
     pub fn isConnect(request: Request) bool {
-        return std.mem.eql(u8, request.method, "CONNECT");
+        return connectMethod(request.method);
     }
 };
+
+/// Whether a method names a tunnel (§8.5). One function so that the connection
+/// layer, which sequences frames before anything is validated, and `Request`,
+/// which sees a validated message, cannot disagree about what a CONNECT is.
+pub fn connectMethod(method: []const u8) bool {
+    return std.mem.eql(u8, method, "CONNECT");
+}
+
+/// Whether a decoded request field list is a CONNECT, from the raw fields. The
+/// connection layer needs this before validation has happened: §8.5's rule is about
+/// which *frames* may follow, so it has to be known while frames are being
+/// sequenced.
+pub fn isConnectRequest(fields: []const hpack.Field) bool {
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, ":method")) return connectMethod(field.value);
+    }
+    return false;
+}
+
+/// Whether a decoded response field list carries a 2xx, which §8.5 makes the signal
+/// that the tunnel is open. A refusal is an ordinary response and not a tunnel.
+pub fn isSuccessResponse(fields: []const hpack.Field) bool {
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, ":status")) {
+            return field.value.len == 3 and field.value[0] == '2';
+        }
+    }
+    return false;
+}
 
 /// The response pseudo-header of §8.3.2.
 pub const Response = struct {
@@ -161,7 +190,7 @@ pub fn validateRequest(fields: []const hpack.Field) Error!Request {
 
     // §8.5: CONNECT names an authority and nothing else. Any other method needs the
     // full triple.
-    if (std.mem.eql(u8, method, "CONNECT")) {
+    if (connectMethod(method)) {
         if (collector.scheme != null or collector.path != null) return error.MalformedMessage;
         if (collector.authority == null) return error.MalformedMessage;
         return .{

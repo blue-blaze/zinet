@@ -211,6 +211,21 @@ matching case-sensitively.
 
 Both are stream errors per §8.1.1: the message is malformed, not the connection.
 
+**A CONNECT tunnel carries DATA and nothing else** (§8.5). The construction rules — no
+`:scheme`, no `:path`, an `:authority` naming host and port — were checked here from the
+start; which *frames* may follow was not, and that half is a MUST too: "Frame types
+other than DATA or stream management frames (RST_STREAM, WINDOW_UPDATE, and PRIORITY)
+MUST NOT be sent on a connected stream and MUST be treated as a stream error if
+received." Until it was added, a tunnel accepted a second HEADERS block as trailers like
+any other exchange, which lets a peer put field semantics into a byte stream a proxy
+relays verbatim. `connection.zig` tracks it per stream, because §8.5 is about frame
+sequencing and that happens before anything is validated: a server marks the tunnel when
+the CONNECT arrives, a client when a 2xx answers one — a refusal is an ordinary response
+that may carry trailers like any other. The same rule in HTTP/3 is a *connection* error
+(§4.4 of RFC 9114); here §8.5 says stream error, and §5.4 permits the generic code where
+no type is named. The proxying itself is absent, as it is in HTTP/3: opening a TCP
+connection to the authority and relaying is an application, not a codec.
+
 ### `codec.zig` — the entry points
 
 `addServerCodec` and `addClientCodec`. One handler nearest the socket, owning the

@@ -38,6 +38,7 @@ const frame = @import("frame.zig");
 const headers_mod = @import("headers.zig");
 const hpack = @import("hpack.zig");
 const limits = @import("limits.zig");
+const semantics = @import("semantics.zig");
 const stream_mod = @import("stream.zig");
 
 pub const Error = error{
@@ -640,6 +641,21 @@ pub const Connection = struct {
         }
 
         const trailers = stream.remote_headers_seen;
+
+        // §8.5: "Frame types other than DATA or stream management frames
+        // (RST_STREAM, WINDOW_UPDATE, and PRIORITY) MUST NOT be sent on a connected
+        // stream and MUST be treated as a stream error if received." A tunnel
+        // therefore has no trailer section — and accepting one means a peer can put
+        // field semantics into a byte stream a proxy relays verbatim.
+        //
+        // A stream error rather than a connection error, which is where HTTP/2 and
+        // HTTP/3 differ on the same rule: §4.4 of RFC 9114 makes it a connection
+        // error. §5.4 permits the generic code where the RFC names no type.
+        if (stream.tunnel) {
+            try connection.resetStream(gpa, id, .protocol_error);
+            return null;
+        }
+
         // §8.1: a stream carries at most one trailer block, and it must end the
         // stream. Anything else is a second request on the same stream.
         if (trailers and !complete.end_stream) {
@@ -651,6 +667,18 @@ pub const Connection = struct {
             return connection.streamFailure(gpa, id, err);
         };
         stream.remote_headers_seen = true;
+
+        // §8.5's "connected stream", from each side's point of view.
+        if (!trailers) switch (connection.role) {
+            .server => if (semantics.isConnectRequest(connection.fields.items)) {
+                stream.tunnel = true;
+            },
+            .client => if (stream.sent_connect and
+                semantics.isSuccessResponse(connection.fields.items))
+            {
+                stream.tunnel = true;
+            },
+        };
 
         const event: Inbound = .{ .headers = .{
             .stream_id = id,
@@ -668,6 +696,15 @@ pub const Connection = struct {
         gpa: Allocator,
         complete: headers_mod.Complete,
     ) Error!?Inbound {
+        // §8.5 permits only DATA, RST_STREAM, WINDOW_UPDATE and PRIORITY on a
+        // connected stream. PUSH_PROMISE arrives on the *associated* stream, so a
+        // tunnel is a place a peer could try to open one from.
+        if (connection.registry.get(complete.stream_id)) |associated| {
+            if (associated.tunnel) {
+                try connection.resetStream(gpa, complete.stream_id, .protocol_error);
+                return null;
+            }
+        }
         const promised = connection.registry.openRemote(gpa, complete.promised_stream_id) catch |err| {
             return connection.streamFailure(gpa, complete.promised_stream_id, err);
         };
@@ -875,6 +912,14 @@ pub const Connection = struct {
         var flags: frame.Flags = .{ .bits = frame.Flags.end_headers };
         if (end_stream) flags = flags.with(frame.Flags.end_stream);
         try connection.emitHeaderBlock(gpa, stream_id, block.readableSlice(), flags);
+
+        // §8.5: remember an outgoing CONNECT so a 2xx answer can be recognised as
+        // opening a tunnel. Only a client's requests matter here; a server's own
+        // 2xx is what *makes* the tunnel, and it already marked the stream when the
+        // request arrived.
+        if (connection.role == .client and !stream.remote_headers_seen) {
+            if (semantics.isConnectRequest(fields)) stream.sent_connect = true;
+        }
 
         stream.onHeaders(.local, end_stream) catch {};
         if (stream.state.isClosed()) connection.registry.remove(gpa, stream_id);
@@ -1808,4 +1853,176 @@ test "connection: a response with no body still ends its stream" {
     try testing.expect(end.data.end_stream);
     try testing.expect(pair.server.registry.get(1) == null);
     try testing.expect(pair.client.registry.get(1) == null);
+}
+
+// ── CONNECT tunnels (§8.5) ────────────────────────────────────────────────────
+
+test "connection: §8.5 a CONNECT tunnel carries DATA and nothing else" {
+    // §8.5: "Frame types other than DATA or stream management frames (RST_STREAM,
+    // WINDOW_UPDATE, and PRIORITY) MUST NOT be sent on a connected stream and MUST
+    // be treated as a stream error if received." The shape of a CONNECT request was
+    // already checked (semantics.zig); which frames may follow it was not, so a
+    // tunnel accepted trailers like any other exchange — field semantics inserted
+    // into a byte stream a proxy relays verbatim.
+    const gpa = testing.allocator;
+    var pair: Pair = try .init(gpa, .{}, .{});
+    defer pair.deinit();
+    _ = try pair.settle();
+
+    const id = pair.client.nextStreamId();
+    // §8.5: authority and nothing else, and the stream stays open.
+    try pair.client.sendHeaders(gpa, id, &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    }, false);
+    try pair.transfer();
+
+    const request = (try pair.pollServer()).?;
+    try expectField(fieldsOf(request), ":method", "CONNECT");
+    try testing.expect(pair.server.registry.get(id).?.tunnel);
+
+    // Tunnel bytes are what the stream is for.
+    var transitions: [8]Connection.Writability = undefined;
+    _ = try pair.client.sendData(gpa, id, "tunnelled", false);
+    _ = try pair.client.flush(gpa, &transitions);
+    try pair.transfer();
+    const body = (try pair.pollServer()).?;
+    try testing.expect(body == .data);
+    try testing.expect(pair.server.out.readableLen() == 0);
+
+    // A HEADERS frame is not, even one that ends the stream — which is exactly the
+    // shape §8.1 would otherwise accept as a trailer section.
+    try pair.client.sendHeaders(gpa, id, &.{
+        .{ .name = "x-late", .value = "1" },
+    }, true);
+    try pair.transfer();
+    _ = try pair.pollServer();
+
+    // The server answered with RST_STREAM(PROTOCOL_ERROR) rather than closing the
+    // connection: §8.5 makes this a stream error, unlike RFC 9114 §4.4.
+    const header: frame.Header = .parse(pair.server.out.readableSlice()[0..frame.header_len]);
+    try testing.expectEqual(frame.FrameType.rst_stream, header.frame_type);
+    const code = std.mem.readInt(u32, pair.server.out.readableSlice()[frame.header_len..][0..4], .big);
+    try testing.expectEqual(@backingInt(frame.ErrorCode.protocol_error), code);
+}
+
+test "connection: §8.5 a refused CONNECT is an ordinary exchange" {
+    // The 2xx is what §8.5 makes the signal that a tunnel is open. A refusal is an
+    // ordinary response, and treating it as a tunnel would reject the trailers any
+    // response may carry.
+    const gpa = testing.allocator;
+    var pair: Pair = try .init(gpa, .{}, .{});
+    defer pair.deinit();
+    _ = try pair.settle();
+
+    const id = pair.client.nextStreamId();
+    try pair.client.sendHeaders(gpa, id, &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    }, false);
+    try pair.transfer();
+    _ = try pair.pollServer();
+    try testing.expect(pair.client.registry.get(id).?.sent_connect);
+
+    // The proxy declines.
+    try pair.server.sendHeaders(gpa, id, &.{
+        .{ .name = ":status", .value = "502" },
+    }, false);
+    try pair.transfer();
+    _ = try pair.pollClient();
+    try testing.expect(!pair.client.registry.get(id).?.tunnel);
+
+    // So trailers on it are still legal, and the client does not reset the stream.
+    try pair.server.sendHeaders(gpa, id, &.{
+        .{ .name = "x-reason", .value = "refused" },
+    }, true);
+    try pair.transfer();
+    const trailers = (try pair.pollClient()).?;
+    try testing.expect(trailers.headers.trailers);
+    try testing.expect(pair.client.out.readableLen() == 0);
+}
+
+test "connection: §8.5 a 2xx to CONNECT makes the client's stream a tunnel" {
+    const gpa = testing.allocator;
+    var pair: Pair = try .init(gpa, .{}, .{});
+    defer pair.deinit();
+    _ = try pair.settle();
+
+    const id = pair.client.nextStreamId();
+    try pair.client.sendHeaders(gpa, id, &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    }, false);
+    try pair.transfer();
+    _ = try pair.pollServer();
+
+    try pair.server.sendHeaders(gpa, id, &.{
+        .{ .name = ":status", .value = "200" },
+    }, false);
+    try pair.transfer();
+    _ = try pair.pollClient();
+    try testing.expect(pair.client.registry.get(id).?.tunnel);
+
+    // Now a HEADERS frame from the proxy is a stream error.
+    try pair.server.sendHeaders(gpa, id, &.{
+        .{ .name = "x-late", .value = "1" },
+    }, true);
+    try pair.transfer();
+    _ = try pair.pollClient();
+    const header: frame.Header = .parse(pair.client.out.readableSlice()[0..frame.header_len]);
+    try testing.expectEqual(frame.FrameType.rst_stream, header.frame_type);
+}
+
+test "connection: §8.5 no PUSH_PROMISE on a connected stream" {
+    // §8.5 lists what may be sent on a connected stream, and PUSH_PROMISE is not in
+    // it. Reached only when pushes are enabled, since a client that refuses them
+    // rejects the frame earlier (§8.4) — so this is the case where the tunnel rule is
+    // the thing standing between a peer and a stream reserved off a tunnel.
+    const gpa = testing.allocator;
+    var pair: Pair = try .init(gpa, .{ .enable_push = true }, .{});
+    defer pair.deinit();
+    _ = try pair.settle();
+
+    const id = pair.client.nextStreamId();
+    try pair.client.sendHeaders(gpa, id, &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.test:443" },
+    }, false);
+    try pair.transfer();
+    _ = try pair.pollServer();
+    try pair.server.sendHeaders(gpa, id, &.{.{ .name = ":status", .value = "200" }}, false);
+    try pair.transfer();
+    _ = try pair.pollClient();
+    try testing.expect(pair.client.registry.get(id).?.tunnel);
+    pair.client.out.clear();
+
+    // A push promised off the tunnel stream. Hand-built because nothing here sends
+    // pushes — the decision not to is in HTTP2.md.
+    var block: Buffer = .empty;
+    defer block.deinit(gpa);
+    try pair.server.encoder.encode(&block, gpa, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/pushed" },
+        .{ .name = ":authority", .value = "example.test" },
+    });
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    var promised: [4]u8 = undefined;
+    std.mem.writeInt(u32, &promised, 2, .big); // a server-initiated identifier
+    try payload.appendSlice(gpa, &promised);
+    try payload.appendSlice(gpa, block.readableSlice());
+    try frame.writeFrame(
+        &pair.to_client,
+        gpa,
+        .push_promise,
+        .{ .bits = frame.Flags.end_headers },
+        id,
+        payload.items,
+    );
+
+    const event = try pair.pollClient();
+    try testing.expect(event == null); // not delivered to the application
+    const header: frame.Header = .parse(pair.client.out.readableSlice()[0..frame.header_len]);
+    try testing.expectEqual(frame.FrameType.rst_stream, header.frame_type);
 }
