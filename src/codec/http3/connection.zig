@@ -711,6 +711,14 @@ pub const Connection = struct {
             }
         }
 
+        // §7.1: "When a stream terminates cleanly, if the last frame on the stream was
+        // truncated, this MUST be treated as a connection error of type
+        // H3_FRAME_ERROR." Up to here a half-arrived frame means "wait for more"; a
+        // clean end is what turns it into a promise the peer broke. Checked before
+        // the end is reported, because the alternative is telling the application a
+        // message finished when its sender never finished sending it.
+        if (req.fin_seen and req.parser.midFrame()) return self.failFrame(error.FrameError);
+
         // A FIN that arrives on its own, after the last frame was already consumed.
         // Nothing reported the end in that case, because the loop above only learns
         // "finished" while it holds an item — and `read` returns nothing here.
@@ -2496,4 +2504,157 @@ test "http3: a FIN that arrives on its own still ends the request" {
         .body => |e| try testing.expect(!e.fin),
         else => {},
     };
+}
+
+test "http3: a truncated frame at a clean stream end is a frame error" {
+    // §7.1: "When a stream terminates cleanly, if the last frame on the stream was
+    // truncated, this MUST be treated as a connection error of type H3_FRAME_ERROR."
+    // A stream that ends mid-frame is not a short read to wait on — the peer has
+    // promised bytes it will never send, and treating that as an ordinary end would
+    // hand the application a message the sender never finished.
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    var fields: [8]qpack.FieldLine = undefined;
+    const request = requestFields("POST", "https", "example.test", "/cut", &.{}, &fields);
+    const id = try client.request(gpa, request, false);
+    try pumpH3(gpa, client, server, 8);
+    while (server.nextEvent()) |event| switch (event) {
+        .headers => |e| {
+            var section = server.takeSection(e.stream) orelse continue;
+            section.deinit(gpa);
+        },
+        else => {},
+    };
+
+    // A DATA frame that claims eight bytes and delivers three, then a clean end.
+    var header: [16]u8 = undefined;
+    const header_len = frame.writeFrameHeader(&header, @backingInt(frame.FrameType.data), 8);
+    _ = try client.transport.write(gpa, id, header[0..header_len]);
+    _ = try client.transport.write(gpa, id, "abc");
+    try client.transport.finishStream(id);
+    pumpUntilFailure(gpa, client, server, 8);
+
+    try testing.expectEqual(@as(?u64, 0x0106), server.close_code); // H3_FRAME_ERROR
+}
+
+test "http3: a frame header cut in half at a clean end is a frame error too" {
+    // §7.1 covers a truncated *header*, not only a truncated payload: a two-byte type
+    // varint with one byte delivered leaves the parser holding half a promise. This is
+    // the case `midFrame` needs `header_len` for — the state alone still reads "between
+    // frames", since no type has been decoded yet.
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    var fields: [8]qpack.FieldLine = undefined;
+    const request = requestFields("POST", "https", "example.test", "/half", &.{}, &fields);
+    const id = try client.request(gpa, request, false);
+    try pumpH3(gpa, client, server, 8);
+    while (server.nextEvent()) |event| switch (event) {
+        .headers => |e| {
+            var section = server.takeSection(e.stream) orelse continue;
+            section.deinit(gpa);
+        },
+        else => {},
+    };
+
+    // 0x4242 is a two-byte varint; only its first byte goes out.
+    var header: [16]u8 = undefined;
+    const header_len = frame.writeFrameHeader(&header, 0x4242, 0);
+    try testing.expect(header_len > 1);
+    _ = try client.transport.write(gpa, id, header[0..1]);
+    try client.transport.finishStream(id);
+    pumpUntilFailure(gpa, client, server, 8);
+
+    try testing.expectEqual(@as(?u64, 0x0106), server.close_code); // H3_FRAME_ERROR
+}
+
+test "http3: a frame delivered in pieces before a clean end is not truncated" {
+    // The false positive the first version of `midFrame` had: the parser keeps the
+    // completed frame's payload in its accumulation buffer, because the item it just
+    // returned borrows it. A peer whose HEADERS frame arrived in two QUIC packets and
+    // then ended the stream is delivering legally, and must not be told otherwise.
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(gpa);
+    try qpack.encodeSection(gpa, &encoded, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = ":path", .value = "/split" },
+    });
+    var header: [16]u8 = undefined;
+    const header_len = frame.writeFrameHeader(
+        &header,
+        @backingInt(frame.FrameType.headers),
+        encoded.items.len,
+    );
+    const id = try client.transport.openStream(gpa, true);
+    _ = try client.transport.write(gpa, id, header[0..header_len]);
+    // The payload in two deliveries, each pumped, so the parser has to accumulate.
+    _ = try client.transport.write(gpa, id, encoded.items[0 .. encoded.items.len / 2]);
+    try pumpH3(gpa, client, server, 4);
+    _ = try client.transport.write(gpa, id, encoded.items[encoded.items.len / 2 ..]);
+    try pumpH3(gpa, client, server, 4);
+    try client.transport.finishStream(id);
+    try pumpH3(gpa, client, server, 8);
+
+    try testing.expect(server.close_code == null);
+}
+
+test "http3: a stream ending between frames is not a frame error" {
+    // The other side of §7.1, and the one that keeps the check from being a blanket
+    // refusal: a stream may end at a frame boundary, and that is the ordinary case.
+    // A `midFrame` that answered "yes" too eagerly would fail every request.
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    var fields: [8]qpack.FieldLine = undefined;
+    const request = requestFields("POST", "https", "example.test", "/whole", &.{}, &fields);
+    const id = try client.request(gpa, request, false);
+    try client.writeBody(gpa, id, "complete", false);
+    // Separately, so the FIN arrives with the buffer already drained — the path the
+    // previous commit added, now also carrying the §7.1 check.
+    try pumpH3(gpa, client, server, 8);
+    try client.transport.finishStream(id);
+    try pumpH3(gpa, client, server, 8);
+
+    try testing.expect(server.close_code == null);
+    var ended = false;
+    while (server.nextEvent()) |event| switch (event) {
+        .headers => |e| {
+            var section = server.takeSection(e.stream) orelse continue;
+            section.deinit(gpa);
+            if (e.fin) ended = true;
+        },
+        .body => |e| {
+            const chunk = server.readBody(e.stream);
+            server.consumeBody(e.stream, chunk.len);
+            if (e.fin) ended = true;
+        },
+        else => {},
+    };
+    try testing.expect(ended);
 }

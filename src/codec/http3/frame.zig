@@ -272,6 +272,23 @@ pub const Parser = struct {
         self.* = undefined;
     }
 
+    /// Whether the parser is part-way through a frame: a payload with bytes still
+    /// outstanding, or a header varint split across deliveries.
+    ///
+    /// §7.1 needs this at the moment a stream ends cleanly, where "part-way" stops
+    /// being "wait for more" and becomes H3_FRAME_ERROR — the peer promised bytes it
+    /// will never send. Answered here rather than by the caller inspecting these
+    /// fields, so the definition of "between frames" has one home.
+    ///
+    /// `buffer` is deliberately *not* consulted. It still holds the last completed
+    /// frame's payload after that frame was returned — the item borrows it, so it is
+    /// cleared only when the next frame's length is read. Treating a non-empty buffer
+    /// as "part-way" would report H3_FRAME_ERROR for a peer whose frame merely arrived
+    /// in two pieces before a clean end, which is a legal delivery and not an error.
+    pub fn midFrame(self: *const Parser) bool {
+        return self.state != .type or self.header_len != 0;
+    }
+
     /// One parsed result: a whole frame, or a piece of a DATA payload.
     pub const Item = union(enum) {
         frame: Frame,

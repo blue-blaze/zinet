@@ -325,6 +325,23 @@ for the target existing.
   frame; the fuzz target's whole-versus-fragmented comparison found the same bytes
   ending the stream in one delivery and not in the other. Now a `Request` records
   whether the end was reported, and a lone FIN reports it exactly once.
+- F7 FIXED (**major**) §7.1 was unimplemented: "When a stream terminates cleanly, if the
+  last frame on the stream was truncated, this MUST be treated as a connection error of
+  type H3_FRAME_ERROR." A stream ending mid-frame was simply the end. Worse after F5,
+  which made that end *reportable*: the application was told a message had finished when
+  its sender had promised bytes it never sent. Found by reading §7.1 next to the code F5
+  had just changed, and confirmed by a test before it was fixed. `frame.Parser.midFrame`
+  now answers "between frames or not" in one place, and the check runs where a clean end
+  is concluded.
+
+  The mutation self-check earned its keep twice on this one. Reducing `midFrame` to
+  `state != .type` passed the suite, which exposed that a truncated frame *header* — a
+  two-byte type varint with one byte delivered — had no test. And writing the predicate
+  in the first place got it wrong in the other direction: it also treated a non-empty
+  accumulation buffer as "part-way through", when that buffer deliberately still holds
+  the *completed* frame's payload, because the item just returned borrows it. A peer
+  whose HEADERS frame arrived in two QUIC packets before a clean end would have been
+  told H3_FRAME_ERROR for a legal delivery. Both directions now have a test.
 - F6 FIXED (**test infrastructure, and it invalidated thirteen tests**) The
   `stress: … over random inputs` loops fed uniformly random bytes to a
   `std.testing.Smith`. That is not what a `Smith` consumes: it takes eight bytes per
