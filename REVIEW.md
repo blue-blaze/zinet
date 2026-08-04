@@ -221,6 +221,22 @@ question is per case: wire it, test it, or say why it has no caller. `cid.Remote
 and `retireActive` now say: rotating the ID we send to is what a migrating client does,
 and client-initiated migration is not implemented.
 
+A mechanical sweep for the shape, run again after the HTTP/3 work: count every
+occurrence of each `pub fn`'s name in production code, in tests, and in the examples,
+and subtract its definitions. Eight functions had none anywhere. Seven are now
+exercised or gone — `Buffer.readByte`, `dns.Message.questionSlice`,
+`EmbeddedChannel.clearOutbound` and `closeCount`, and `http2.Codec.ping` and `goAway`
+have tests; `websocket.Frame.isText` was deleted, because `text()` answers the same
+question and returns the payload with it. `tls.Connection.protocolVersion` is exercised
+by the https-client example, which now *asserts* the version rather than printing it.
+The one that remains, `quic.cid.Remote.retireActive`, is waiting on §9.2
+client-initiated migration and says so in its own comment.
+
+The sweep has a known blind spot worth writing down: a name that appears in a comment
+counts as a use. `http2.Codec.ping` was missed for exactly that reason and only turned
+up while reading the code next to `goAway`. The floor it produces is real; the list it
+produces is not complete.
+
 ### A rule stated where nothing consults it
 
 Close to the above and worth separating, because the remedy is the opposite. A

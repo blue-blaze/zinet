@@ -745,3 +745,17 @@ test "Buffer: an impossible growth request fails instead of overflowing" {
     // The buffer is untouched by the failed requests.
     try testing.expectEqualStrings("abcdef", buffer.readableSlice());
 }
+
+test "buffer: readByte takes one byte and reports the end" {
+    const gpa = testing.allocator;
+    var buffer: Buffer = .empty;
+    defer buffer.deinit(gpa);
+    try buffer.writeBytes(gpa, "hi");
+
+    try testing.expectEqual(@as(u8, 'h'), try buffer.readByte());
+    try testing.expectEqual(@as(usize, 1), buffer.readableLen());
+    try testing.expectEqual(@as(u8, 'i'), try buffer.readByte());
+    // Past the end is an error rather than a wrap or a zero, which is what makes it
+    // usable in a decoder that has not checked the length first.
+    try testing.expectError(error.EndOfBuffer, buffer.readByte());
+}

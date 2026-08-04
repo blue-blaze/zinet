@@ -612,3 +612,45 @@ test "codec: bytes arriving one at a time produce the same exchange" {
     try testing.expectEqualStrings("/drip", responders.made.items[0].seen.items[0]);
     try testing.expectEqual(@as(usize, 1), countFrames(fixture.written(), .headers));
 }
+
+test "codec: an application can send PING and begin a graceful shutdown" {
+    // Both are operations an application performs from inside a handler callback,
+    // which is the only place a `HandlerContext` exists — so the test drives them the
+    // way an application would rather than reaching around the pipeline. Until this
+    // existed neither had a caller anywhere: not in the library, not in a test, not
+    // in an example. In Zig that means neither had ever been compiled.
+    const gpa = testing.allocator;
+    var responders: Responders = .{ .gpa = gpa };
+    defer responders.deinit();
+
+    var fixture = try test_support.Fixture.init(gpa);
+    defer fixture.deinit();
+    const codec = try addServerCodec(fixture.pipeline, .{ .streams = .init(&responders) });
+
+    // A handler that reaches for the codec when the channel comes up, holding the
+    // context it was given.
+    const Shutdown = struct {
+        codec: *Codec,
+        pinged: bool = false,
+
+        pub fn onActive(self: *@This(), ctx: *HandlerContext) !void {
+            try self.codec.ping(ctx, .{ 1, 2, 3, 4, 5, 6, 7, 8 });
+            try self.codec.goAway(ctx, .no_error, "closing for maintenance");
+            self.pinged = true;
+            ctx.fireActive();
+        }
+    };
+    var shutdown: Shutdown = .{ .codec = codec };
+    _ = try fixture.pipeline.addLast("shutdown", .init(&shutdown));
+
+    fixture.pipeline.fireActive();
+    try testing.expect(shutdown.pinged);
+
+    const written = fixture.written();
+    try testing.expectEqual(@as(usize, 1), countFrames(written, .ping));
+    try testing.expectEqual(@as(usize, 1), countFrames(written, .goaway));
+    // §6.8: GOAWAY starts a graceful shutdown and does not close anything, because
+    // streams already open may still finish. A codec that closed here would cut off
+    // the responses it just promised to deliver.
+    try testing.expectEqual(@as(usize, 0), fixture.sink_impl.closes);
+}

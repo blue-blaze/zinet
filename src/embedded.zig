@@ -500,6 +500,16 @@ test "embedded: outbound messages keep their type and reach the sink encoded" {
     defer message.deinit(gpa);
     try testing.expectEqualStrings("hello\n", message.bytes().?);
     try testing.expectEqual(@as(usize, 0), channel.outboundCount());
+
+    // `clearOutbound` exists so a test can assert on one exchange and then start
+    // again without reading everything it does not care about — and unlike ignoring
+    // the messages, it frees them, which `finish` would otherwise report as a leak.
+    try channel.writeOutbound(try Message.initBytes(gpa, "one"));
+    try channel.writeOutbound(try Message.initBytes(gpa, "two"));
+    try testing.expectEqual(@as(usize, 2), channel.outboundCount());
+    channel.clearOutbound();
+    try testing.expectEqual(@as(usize, 0), channel.outboundCount());
+    try testing.expect(channel.readOutbound() == null);
 }
 
 test "embedded: finish reports messages nobody read" {
@@ -551,6 +561,13 @@ test "embedded: lifecycle, events and errors are all observable" {
 
     channel.fireReadComplete();
     try testing.expectEqual(@as(usize, 1), channel.record.read_completes);
+
+    // A close travelling the pipeline is counted, which is how a test asserts that a
+    // protocol with a closing handshake actually performed one rather than having its
+    // connection dropped.
+    try testing.expectEqual(@as(usize, 0), channel.closeCount());
+    try channel.pipeline.close();
+    try testing.expectEqual(@as(usize, 1), channel.closeCount());
 
     _ = channel.finish();
     try testing.expect(!channel.isActive());

@@ -123,7 +123,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("TLS handshake failed: {s}\n", .{@errorName(err)});
         return err;
     };
-    std.debug.print("connected: TLS {s}\n", .{@tagName(client.connection.protocolVersion())});
+    // Asserted rather than only printed. `protocolVersion` documents itself as always
+    // 1.3, because the standard library has no 1.2 client — so anything else means
+    // that claim has stopped being true, and a claim nothing checks is the kind this
+    // repository has already had to correct once.
+    const version = client.connection.protocolVersion();
+    std.debug.print("connected: TLS {s}\n", .{@tagName(version)});
+    if (version != .tls_1_3) {
+        std.debug.print("expected TLS 1.3, got {s}\n", .{@tagName(version)});
+        return error.UnexpectedTlsVersion;
+    }
 
     // The request goes through the pipeline, so the HTTP encoder serializes it —
     // the TLS session only ever sees the bytes it produced.

@@ -89,10 +89,6 @@ pub const Frame = struct {
         gpa.free(@constCast(frame.payload));
     }
 
-    pub fn isText(frame: Frame) bool {
-        return frame.opcode == .text;
-    }
-
     /// Text payload, or null when this is not a text frame.
     pub fn text(frame: Frame) ?[]const u8 {
         return if (frame.opcode == .text) frame.payload else null;

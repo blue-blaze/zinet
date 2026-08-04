@@ -512,6 +512,13 @@ test "dns: a query round-trips through its own decoder" {
     try testing.expectEqual(@as(usize, 1), message.question_len);
     try testing.expect(message.questions[0].name.eqlText("www.example.com"));
     try testing.expectEqual(Type.a, message.questions[0].type);
+    // `questionSlice` is how a caller correlates a reply with what it asked: the
+    // array is fixed-size storage, and reading past `question_len` would hand out
+    // undefined records. Its counterpart `answerSlice` is what the resolver uses.
+    const questions = message.questionSlice();
+    try testing.expectEqual(@as(usize, 1), questions.len);
+    try testing.expect(questions[0].name.eqlText("www.example.com"));
+    try testing.expectEqual(@as(usize, 0), message.answerSlice().len);
     // The EDNS(0) OPT record went in the additional section.
     try testing.expectEqual(@as(usize, 1), message.additional_len);
     try testing.expectEqual(Type.opt, message.additionals[0].type);
