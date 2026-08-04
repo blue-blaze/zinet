@@ -135,41 +135,42 @@ codebase already states, which is the useful part.
   applies to every asynchronous close: submitting one is not performing one, and a
   test that runs once cannot tell the difference.
 
-## Open, with evidence
+## Found by the in-process TLS pairing
 
-One finding is recorded here rather than fixed, because it is not yet localized and a
-half-diagnosis stated as a fix is worse than an honest open item.
+**F8 FIXED (major, silent stall)** A reply that arrived while `tls.Connection`'s reader
+was parked was not delivered until the client sent something else — or until the peer
+closed. Found within an hour of the standard library's TLS client being pointed at our
+server in-process, which is the argument for that pairing existing: `openssl s_client` and
+`curl` had never provoked it, because both send a request and then read to end of stream.
 
-**A reply that arrives while `tls.Connection`'s reader is parked is not delivered until
-the client sends again.** Found by the new cross-implementation test: the standard
-library's TLS client handshakes against the self-written server, sends a message the
-server's echo handler receives in plaintext, and then never sees the echo — until the
-client writes anything else, at which point the echo turns up complete and in order.
+The cause is a contract, not an oversight in either implementation. `tls.Client`'s reader
+"writes exclusively to the buffer": its `readVec` returns *zero* and reports plaintext by
+advancing `end`. And `Io.Reader.readVec` fills as much of the destination as it can — it
+copies what is buffered and then, while the destination still has room, calls the vtable
+again. Our read loop handed it a whole 16 KiB inbound `Buffer`, so after copying a 31-byte
+answer it went straight back to blocking on the socket, holding the answer it already had.
+End of stream is where those bytes finally came out, via `readVec`'s own
+`EndOfStream => if (n == 0) … else 0` — which is exactly why every client checked until now
+looked fine.
 
-What was measured, so the next attempt does not start from scratch:
+The fix is to say what the loop actually wants: `fill(1)`, then take everything buffered.
+It blocks until there is at least one plaintext byte and returns as soon as there is one.
+It also removed the `max_empty_reads` counter and its heuristic, because a record carrying
+only handshake bytes no longer reaches this layer at all — std's fill loop keeps going
+until plaintext appears, and a zero-length read has stopped being a thing that can happen.
 
-- The handshake completes and `protocolVersion()` is 1.3, so the two implementations
-  agree on keys and transcript. Client-to-server application data works.
-- The server's `writeAndFlush` returns no error, and `driver.flushOutput` does both
-  steps — `writeAll` then `flush` on the socket writer — so the record is not sitting in
-  a userspace buffer that a missing flush explains.
-- The client's read loop is alive: `PumpReader` receives with a `write_poll` deadline and
-  loops on timeout, and a second outbound message goes out promptly, which only happens
-  from inside that loop.
-- The delayed bytes are intact: 31 bytes, byte for byte, delivered to the pipeline the
-  moment the second message is written.
+Confirmed by mutation: restoring the `readVec`-into-the-whole-chunk shape fails the new
+round-trip assertion. Re-checked in both directions afterwards — our client against
+`openssl s_server -www` (status 200) and `curl --http2` against our server
+(http=2 status=200).
 
-That combination rules out the obvious causes and points at the boundary between
-`PumpReader`, `std.crypto.tls.Client`'s reader and the `readVec`-returns-zero path, where
-a record can be buffered without the loop above being told there is something to decrypt.
-The test asserts everything that does hold and says in place why the round trip is not
-asserted.
+Diagnosing it took five measurements, and each one eliminated a plausible story: the
+server's flush does both steps and pushed exactly 53 bytes; the client received exactly
+those 53 bytes; its reader consumed all of them (`seek == end`); its loop was alive, since
+a second outbound message went out promptly and only that loop sends; and the delayed
+bytes arrived intact. What remained was the boundary between the two readers.
 
-Worth noting what this does *not* affect: the `https_client` example against OpenSSL and
-the HTTP/1.1-over-TLS tests both work, because a client that sends a request and reads a
-response gets the reply while it is still in the read path rather than after it.
-
-## Method
+## Method## Method
 
 The review walked the call path rather than the file list: accept → register →
 `Channel.serve` → the two per-connection tasks → pipeline propagation → codecs,

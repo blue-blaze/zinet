@@ -727,21 +727,24 @@ test "tls13 server: the standard library's TLS client handshakes against our ser
     // Data in the client-to-server direction, which is what proves the traffic keys
     // agree and not only that the handshake completed: the server's echo handler sees
     // the plaintext.
+    // Application data in both directions, which is what proves the traffic keys agree
+    // rather than only that the handshake completed. The reply is the half that found a
+    // defect: it arrived decrypted but undelivered, because the read loop asked
+    // `Io.Reader.readVec` to fill a 16 KiB destination and it kept blocking for more
+    // ciphertext while a 31-byte answer sat in the TLS reader's buffer. Nothing noticed,
+    // because every other client here reads a response and then closes — and end of
+    // stream is exactly when those buffered bytes get handed over.
     try client.connection.writeBytes("hello from the standard library");
+
+    const expected = "hello from the standard library";
     const deadline = Io.Timestamp.now(io, .awake).addDuration(.fromSeconds(5));
-    while (test_echo_reads.load(.acquire) == 0) {
+    while (test_collector.seen.load(.acquire) < expected.len) {
         if (Io.Timestamp.now(io, .awake).nanoseconds >= deadline.nanoseconds) break;
         try io.sleep(.fromMilliseconds(2), .awake);
     }
     try testing.expectEqual(@as(usize, 1), test_echo_reads.load(.acquire));
-
-    // The reply is deliberately *not* asserted here, and the reason is written down in
-    // REVIEW.md rather than left as a silent omission: the echo does arrive intact, but
-    // only after the client sends something else. Measured — the server's write reports
-    // no error, the client's read loop is alive and cycling, and the 31 bytes turn up
-    // complete the moment a second message goes out. Something is holding the reply
-    // until the next event on the connection, and asserting a round trip here would
-    // either hang or paper over it.
+    const seen = test_collector.seen.load(.acquire);
+    try testing.expectEqualStrings(expected, test_collector.buf[0..seen]);
 
     client.shutdown();
 }

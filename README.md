@@ -61,7 +61,10 @@ RFC 9001 Appendix A and RFC 8448.
 
 Those cross-implementation checks run in CI, not only by hand, and they keep
 earning it: they caught a closing handshake that was skipped about one run in five,
-and later four HTTP/2 defects that had each passed the entire test suite first. The
+later four HTTP/2 defects that had each passed the entire test suite first, and — within
+an hour of the standard library's TLS client being pointed at our server in-process — a
+reply that was decrypted and then never handed to the application until the peer sent
+something else. The
 review's findings and every defect it, the fuzzer and cross-implementation testing
 turned up are written down in [REVIEW.md](REVIEW.md).
 

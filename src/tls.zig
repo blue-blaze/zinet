@@ -558,7 +558,6 @@ pub const Connection = struct {
     fn readLoop(connection: *Connection) void {
         var chunk: ?Buffer = null;
         defer if (chunk) |*pending| connection.releaseInbound(pending);
-        var empty_reads: usize = 0;
 
         while (connection.isOpen()) {
             if (!connection.pumpOutbound()) return;
@@ -570,25 +569,38 @@ pub const Connection = struct {
                 };
             }
 
-            var destination: [1][]u8 = .{chunk.?.writableSlice()};
-            assert(destination[0].len > 0);
+            const writable = chunk.?.writableSlice();
+            assert(writable.len > 0);
 
-            const n = connection.client.reader.readVec(&destination) catch |err| {
+            // `fill(1)` and then take whatever is buffered, rather than `readVec`
+            // into this whole chunk.
+            //
+            // The difference is not a style one. `Io.Reader.readVec` fills as much
+            // of the destination as it can: it copies what is buffered and, while
+            // the destination has room, calls the vtable again — which here means
+            // blocking on the socket. And `tls.Client`'s reader *always* reports
+            // through its buffer and returns zero ("this function writes exclusively
+            // to the buffer"), so a reply that has already been decrypted sat in that
+            // buffer while this loop waited for more ciphertext to fill a 16 KiB
+            // destination that a 31-byte answer was never going to fill. The peer had
+            // answered; the application was told nothing until something else arrived
+            // — or until end of stream, which is why a request/response client that
+            // reads and then closes never noticed.
+            //
+            // `fill(1)` says what this loop actually wants: block until there is at
+            // least one plaintext byte, then hand over everything available. It also
+            // subsumes the empty-read counting this used to need, because a record
+            // carrying only handshake bytes no longer surfaces here at all — std's
+            // fill loop keeps going until plaintext appears.
+            connection.client.reader.fill(1) catch |err| {
                 connection.finishRead(err);
                 return;
             };
-            if (n == 0) {
-                // A zero-length read does not mean the stream ended: a TLS
-                // record may have carried only handshake bytes. Tolerating a
-                // bounded run of them is what keeps this from spinning a core.
-                empty_reads += 1;
-                if (empty_reads >= max_empty_reads) {
-                    connection.finishRead(error.EndOfStream);
-                    return;
-                }
-                continue;
-            }
-            empty_reads = 0;
+            const plaintext = connection.client.reader.buffered();
+            const n = @min(plaintext.len, writable.len);
+            assert(n > 0);
+            @memcpy(writable[0..n], plaintext[0..n]);
+            connection.client.reader.toss(n);
 
             chunk.?.commit(n);
             connection.stats.bytes_read += n;
@@ -600,10 +612,6 @@ pub const Connection = struct {
             connection.pipeline.fireReadComplete();
         }
     }
-
-    /// Consecutive zero-length reads tolerated before the session is treated as
-    /// finished.
-    const max_empty_reads = 64;
 
     /// Sends everything that has been queued, then flushes. Returns false when
     /// the loop should stop.
