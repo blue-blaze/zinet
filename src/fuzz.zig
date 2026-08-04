@@ -1884,6 +1884,35 @@ const deflate_corpus = [_][]const u8{
 
 const stress_iterations = 400;
 
+/// Bytes a `Smith` can actually draw varied values from, which uniformly random
+/// bytes are not.
+///
+/// `std/testing/Smith.zig` consumes eight bytes per draw, reads them as a
+/// little-endian u64, and — if that value falls outside the range the caller asked
+/// for — substitutes the range's *minimum* instead. Random bytes therefore give a
+/// value near 2^63 on every draw, which is out of range for every small range a
+/// target asks about, so every draw returns the minimum: `boolWeighted` is always
+/// false, `valueRangeAtMost(u8, 1, 8)` is always 1, `slice` is always empty. These
+/// stress loops ran four hundred iterations of one degenerate input each until this
+/// was measured.
+///
+/// So the input is a sequence of small little-endian u64s: mostly tiny, so the
+/// narrow ranges that select frame types and branches are hit; some moderate; a few
+/// arbitrary, to keep exercising the out-of-range fallback that random bytes were
+/// accidentally testing exclusively.
+fn stressInput(random: std.Random, buf: []u8) usize {
+    const draws = random.intRangeAtMost(usize, 0, buf.len / 8);
+    for (0..draws) |i| {
+        const value: u64 = switch (random.intRangeAtMost(u8, 0, 19)) {
+            0...13 => random.intRangeAtMost(u64, 0, 7),
+            14...17 => random.intRangeAtMost(u64, 0, 255),
+            else => random.int(u64),
+        };
+        std.mem.writeInt(u64, buf[i * 8 ..][0..8], value, .little);
+    }
+    return draws * 8;
+}
+
 fn runStress(
     comptime body: fn (harness: *Harness, smith: *Smith) anyerror!void,
     seed: u64,
@@ -1896,8 +1925,7 @@ fn runStress(
 
     var input: [512]u8 = undefined;
     for (0..stress_iterations) |iteration| {
-        const len = random.intRangeAtMost(usize, 0, input.len);
-        random.bytes(input[0..len]);
+        const len = stressInput(random, &input);
         var smith: Smith = .{ .in = input[0..len] };
         body(&harness, &smith) catch |err| {
             std.debug.print(
@@ -1923,6 +1951,10 @@ test "stress: JSON value framing over random inputs" {
 
 test "stress: HTTP/2 connection over random inputs" {
     try runStress(fuzzHttp2, 0x2000);
+}
+
+test "stress: HTTP/3 connection over random inputs" {
+    try runStress(fuzzHttp3Connection, 0x3000);
 }
 
 test "stress: HPACK over random inputs" {
@@ -2168,6 +2200,352 @@ test "fuzz: QUIC ACK ranges against a bitmap model" {
         "",
         "\x01\x02\x03\x04\x05\x06\x07\x08",
     } });
+}
+
+// -- HTTP/3 connection -------------------------------------------------------
+
+/// The state machine above the frame parser: which frame is permitted on which
+/// stream in which state, and what the peer is told when one is not.
+///
+/// The frame-parser target next door covers reassembly. This one covers the layer
+/// that has the state — request streams with their own grammar, a control stream
+/// whose rules differ, tunnels, GOAWAY in both directions, cancellation — and it is
+/// the layer the equivalent HTTP/2 target has repeatedly found defects in.
+///
+/// The property is chunk independence again, one level up, because that is where a
+/// stateful reader gets it wrong: bytes are delivered to the connection either in one
+/// write or in pieces *with the connection driven between them*, so a frame can be
+/// half-arrived when the reader returns and has to resume from its own state. The
+/// event transcripts must be identical. Body bytes are recorded as bytes rather than
+/// per-event, for the same reason the parser target does it: DATA is delivered as it
+/// arrives, so a split frame legitimately produces more events carrying the same
+/// bytes.
+fn fuzzHttp3ConnectionBody(_: *Harness, smith: *Smith, gpa: Allocator) anyerror!void {
+    // Which of the two stream kinds the bytes land on. The control stream has its own
+    // rules (§7.2: SETTINGS once and first, GOAWAY monotonic, no DATA), so fuzzing
+    // only request streams would leave that half of the state machine unvisited.
+    const on_control = smith.boolWeighted(1, 2);
+
+    // A *sequence of frames* rather than arbitrary bytes, which is the difference
+    // between fuzzing the state machine and fuzzing the parser next door. Raw bytes
+    // were tried first and do not reach this layer: a request stream whose first
+    // frame is not a well-formed field section is failed with H3_MESSAGE_ERROR
+    // (§4.1.2) before any state exists, so almost every input exercised that one
+    // rejection and nothing else. A mutation to the "stream finished" condition
+    // survived both the unit suite and the raw-bytes version of this target; it does
+    // not survive this one.
+    var built: std.ArrayList(u8) = .empty;
+    defer built.deinit(gpa);
+    try buildH3Stream(gpa, smith, on_control, &built);
+    const input = built.items;
+    // Whether the stream ends after the bytes. Without this the FIN path is never
+    // reached, and a whole class of rules lives there: which frame may be the last
+    // (§4.1), a truncated frame at a clean end (§7.1), and on the control stream
+    // §6.2.1's H3_CLOSED_CRITICAL_STREAM. The first version of this target omitted
+    // it, and a mutation that decided "stream finished" without checking that the
+    // item consumed the whole buffer went unnoticed by the unit suite *and* by this
+    // target — because `fin_seen` was never true in either run.
+    const finish = smith.boolWeighted(1, 2);
+    // Whether a genuine, valid HEADERS frame goes first. Without one almost nothing
+    // gets past the front door: a request stream whose first frame is not a
+    // well-formed field section is failed with H3_MESSAGE_ERROR immediately (§4.1.2),
+    // so random bytes would only ever exercise that one rejection. With the prefix,
+    // the fuzzer's bytes are read in `headers_received` — where DATA, trailers,
+    // tunnels and the rest of the grammar actually live.
+    const prefixed = !on_control and smith.boolWeighted(3, 1);
+
+    var whole: std.ArrayList(u8) = .empty;
+    defer whole.deinit(gpa);
+    const whole_failed = try h3ConnectionTranscript(gpa, .{
+        .input = input,
+        .on_control = on_control,
+        .finish = finish,
+        .prefixed = prefixed,
+    }, null, &whole);
+
+    var split: std.ArrayList(u8) = .empty;
+    defer split.deinit(gpa);
+    const split_failed = try h3ConnectionTranscript(gpa, .{
+        .input = input,
+        .on_control = on_control,
+        .finish = finish,
+        .prefixed = prefixed,
+    }, smith, &split);
+
+    if (whole_failed != split_failed) return error.H3ConnectionOutcomeDiffers;
+    if (!std.mem.eql(u8, whole.items, split.items)) return error.H3ConnectionTranscriptDiffers;
+}
+
+/// Feeds `input` to a server connection and records what it reports. With `smith`,
+/// the bytes go in fuzzer-chosen pieces and the connection is driven between them.
+/// Returns whether the exchange ended in an error, which is itself part of the
+/// comparison.
+const H3Case = struct {
+    input: []const u8,
+    on_control: bool,
+    finish: bool,
+    prefixed: bool,
+};
+
+fn h3ConnectionTranscript(
+    gpa: Allocator,
+    case: H3Case,
+    smith: ?*Smith,
+    out: *std.ArrayList(u8),
+) !bool {
+    var pair = try http3.connection.testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    // Settle the handshake and both control streams first, so the transcript is
+    // about the fuzzer's bytes rather than about connection setup.
+    http3.connection.pumpH3(gpa, client, server, 16) catch return true;
+    while (server.nextEvent()) |_| {}
+
+    const stream = if (case.on_control)
+        client.control_out orelse return true
+    else
+        client.transport.openStream(gpa, true) catch return true;
+
+    var failed = false;
+    if (case.prefixed) {
+        h3WriteValidHeaders(gpa, client, stream) catch return true;
+        http3.connection.pumpH3(gpa, client, server, 4) catch return true;
+        try recordH3Events(gpa, server, out);
+    }
+    if (smith) |chooser| {
+        var offset: usize = 0;
+        while (offset < case.input.len) {
+            const remaining = case.input.len - offset;
+            // Small pieces on purpose. With chunks as large as the built stream, the
+            // "fragmented" run is the whole run again and the comparison proves
+            // nothing — which is how a mutation to the "stream finished" condition
+            // first slipped through this target.
+            const chunk_len: usize = chooser.valueRangeAtMost(u16, 1, @intCast(@min(8, remaining)));
+            _ = client.transport.write(gpa, stream, case.input[offset..][0..chunk_len]) catch {
+                failed = true;
+                break;
+            };
+            offset += chunk_len;
+            // Driving here is the point: the server resumes mid-frame.
+            http3.connection.pumpH3(gpa, client, server, 4) catch {
+                failed = true;
+                break;
+            };
+            try recordH3Events(gpa, server, out);
+        }
+    } else {
+        _ = client.transport.write(gpa, stream, case.input) catch {
+            failed = true;
+        };
+    }
+
+    if (!failed and case.finish) {
+        client.transport.finishStream(stream) catch {
+            failed = true;
+        };
+    }
+    if (!failed) {
+        http3.connection.pumpH3(gpa, client, server, 8) catch {
+            failed = true;
+        };
+    }
+    try recordH3Events(gpa, server, out);
+
+    // Terminal states are terminal: once the connection has been failed, nothing
+    // further may be reported. A state machine that keeps emitting after closing is
+    // telling the application about a connection that no longer exists.
+    if (server.close_code) |code| {
+        try out.appendSlice(gpa, "CLOSE:");
+        try out.appendSlice(gpa, &std.mem.toBytes(code));
+        try out.append(gpa, ';');
+        if (server.nextEvent() != null) return error.H3EventsAfterClose;
+    }
+    return failed;
+}
+
+/// A sequence of HTTP/3 frames, mostly well-formed, for the stream kind named.
+/// Well-formed most of the time on purpose: the interesting rules are about which
+/// frame is permitted *where*, and a stream that dies on its first frame never
+/// reaches them.
+fn buildH3Stream(gpa: Allocator, smith: *Smith, on_control: bool, out: *std.ArrayList(u8)) !void {
+    var remaining = smith.valueRangeAtMost(u8, 1, 8);
+    while (remaining > 0) : (remaining -= 1) {
+        // Weighted by what the stream kind permits, which is not a nicety: §7.2 makes
+        // most types fatal on the wrong stream, so choosing uniformly means the
+        // connection dies on the first frame and the *sequence* rules — trailers after
+        // DATA, a second HEADERS, FIN placement — are never reached. Measured: with a
+        // uniform choice this target never once produced two events.
+        //
+        // The wrong type still appears, one time in eight, because "fatal on the wrong
+        // stream" is itself a rule worth exercising.
+        const kind: u64 = if (on_control) switch (smith.valueRangeAtMost(u8, 0, 5)) {
+            0, 1 => 0x07, // GOAWAY, whose identifier must not increase (§7.2.6)
+            2 => 0x0d, // MAX_PUSH_ID, which must not decrease (§7.2.7)
+            3 => 0x21, // reserved: 0x1f * 0 + 0x21
+            4 => 0x4242, // a type we do not know, which §9 says to ignore
+            else => 0x00, // DATA, which §7.2.1 forbids here
+        } else switch (smith.valueRangeAtMost(u8, 0, 7)) {
+            0, 1, 2 => 0x00, // DATA
+            3, 4 => 0x01, // HEADERS: a request, trailers, or a second one
+            5 => 0x21, // reserved
+            6 => 0x4242, // unknown
+            else => 0x04, // SETTINGS, which §7.2.4 forbids off the control stream
+        };
+
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(gpa);
+
+        if (kind == 0x01 and smith.boolWeighted(4, 1)) {
+            // A field section QPACK can decode, so the layers above it are reached
+            // rather than only its error path. Sometimes a request, sometimes
+            // trailers, sometimes a response — which is malformed at a server and so
+            // exercises §4.3's direction rules.
+            const fields: []const http3.qpack.FieldLine = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+                0 => &.{
+                    .{ .name = ":method", .value = "POST" },
+                    .{ .name = ":scheme", .value = "https" },
+                    .{ .name = ":authority", .value = "fuzz.test" },
+                    .{ .name = ":path", .value = "/" },
+                },
+                1 => &.{
+                    .{ .name = ":method", .value = "CONNECT" },
+                    .{ .name = ":authority", .value = "fuzz.test:443" },
+                },
+                2 => &.{.{ .name = "x-checksum", .value = "abc" }},
+                else => &.{.{ .name = ":status", .value = "200" }},
+            };
+            try http3.qpack.encodeSection(gpa, &payload, fields);
+        } else if (kind == 0x04) {
+            // Settings the iterator will accept, and occasionally a value it must
+            // reject (RFC 8441 §3 permits only 0 or 1 for 0x08).
+            var buf: [16]u8 = undefined;
+            var n = quic.varint.encode(&buf, 0x06); // MAX_FIELD_SECTION_SIZE
+            n += quic.varint.encode(buf[n..], smith.valueRangeAtMost(u16, 0, 4096));
+            n += quic.varint.encode(buf[n..], 0x08); // ENABLE_CONNECT_PROTOCOL
+            n += quic.varint.encode(buf[n..], smith.valueRangeAtMost(u8, 0, 2));
+            try payload.appendSlice(gpa, buf[0..n]);
+        } else if (kind == 0x03 or kind == 0x07 or kind == 0x0d) {
+            // These carry one varint, and the identifier rules (§7.2.6's monotonic
+            // GOAWAY, §7.2.7's non-decreasing MAX_PUSH_ID) are what is under test.
+            var buf: [8]u8 = undefined;
+            const n = quic.varint.encode(&buf, smith.valueRangeAtMost(u8, 0, 16));
+            try payload.appendSlice(gpa, buf[0..n]);
+        } else {
+            var scratch: [64]u8 = undefined;
+            const n = smith.slice(&scratch);
+            try payload.appendSlice(gpa, scratch[0..n]);
+        }
+
+        var header: [16]u8 = undefined;
+        // A length that lies, now and then: §7.1 makes a payload that ends early or
+        // late an H3_FRAME_ERROR, and that check is only reached if the length is
+        // sometimes wrong.
+        const declared = if (smith.boolWeighted(1, 16))
+            smith.valueRangeAtMost(u8, 0, 32)
+        else
+            payload.items.len;
+        const header_len = http3.frame.writeFrameHeader(&header, kind, declared);
+        try out.appendSlice(gpa, header[0..header_len]);
+        try out.appendSlice(gpa, payload.items);
+
+        if (on_control and remaining == 1 and smith.boolWeighted(1, 8)) {
+            // Trailing junk after the last frame, which a stateful reader has to hold
+            // rather than mistake for a frame header.
+            var scratch: [8]u8 = undefined;
+            const n = smith.slice(&scratch);
+            try out.appendSlice(gpa, scratch[0..n]);
+        }
+    }
+}
+
+/// A well-formed request header section, written as a HEADERS frame. §4.3.1's
+/// mandatory set for anything but CONNECT, so the server accepts it and moves on.
+fn h3WriteValidHeaders(gpa: Allocator, conn: *http3.connection.Connection, stream: u64) !void {
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(gpa);
+    try http3.qpack.encodeSection(gpa, &encoded, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "fuzz.test" },
+        .{ .name = ":path", .value = "/" },
+    });
+    var header: [16]u8 = undefined;
+    const header_len = http3.frame.writeFrameHeader(
+        &header,
+        @backingInt(http3.frame.FrameType.headers),
+        encoded.items.len,
+    );
+    _ = try conn.transport.write(gpa, stream, header[0..header_len]);
+    _ = try conn.transport.write(gpa, stream, encoded.items);
+}
+
+fn recordH3Events(gpa: Allocator, conn: *http3.connection.Connection, out: *std.ArrayList(u8)) !void {
+    while (conn.nextEvent()) |event| switch (event) {
+        .established => try out.appendSlice(gpa, "EST;"),
+        .headers => |e| {
+            try out.appendSlice(gpa, "H:");
+            try out.append(gpa, if (e.fin) '1' else '0');
+            // The section itself, so that two runs differing in *what* they decoded
+            // are caught and not only two runs differing in event order.
+            if (conn.takeSection(e.stream)) |taken| {
+                var section = taken;
+                defer section.deinit(gpa);
+                for (section.fields.items) |field| {
+                    try out.appendSlice(gpa, field.name);
+                    try out.append(gpa, '=');
+                    try out.appendSlice(gpa, field.value);
+                    try out.append(gpa, ',');
+                }
+            }
+            try out.append(gpa, ';');
+        },
+        .body => |e| {
+            // Bytes, not events: see the note on the target above.
+            const chunk = conn.readBody(e.stream);
+            try out.appendSlice(gpa, chunk);
+            conn.consumeBody(e.stream, chunk.len);
+            if (e.fin) try out.appendSlice(gpa, "|END;");
+        },
+        .goaway => |e| {
+            try out.appendSlice(gpa, "GO:");
+            try out.appendSlice(gpa, &std.mem.toBytes(e.id));
+            try out.append(gpa, ';');
+        },
+        .stream_reset => |e| {
+            try out.appendSlice(gpa, "RST:");
+            try out.appendSlice(gpa, &std.mem.toBytes(e.code));
+            try out.append(gpa, ';');
+        },
+        .peer_closed => |e| {
+            try out.appendSlice(gpa, "PEER:");
+            try out.appendSlice(gpa, &std.mem.toBytes(e.code));
+            try out.append(gpa, ';');
+        },
+        .idle_timeout => try out.appendSlice(gpa, "IDLE;"),
+    };
+}
+
+fn fuzzHttp3Connection(harness: *Harness, smith: *Smith) anyerror!void {
+    return withLeakCheck(harness, smith, fuzzHttp3ConnectionBody);
+}
+
+test "fuzz: HTTP/3 connection state machine" {
+    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
+    defer harness.threaded.deinit();
+    try std.testing.fuzz(&harness, fuzzHttp3Connection, .{
+        .corpus = &.{
+            "",
+            "\x01\x00", // an empty HEADERS: a field section with no fields
+            "\x00\x05hello", // DATA with no HEADERS before it (§4.1: unexpected)
+            "\x04\x00", // a second SETTINGS, which §7.2.4 forbids
+            "\x07\x04", // GOAWAY
+            "\x0d\x00", // MAX_PUSH_ID
+            "\x21\x02ab", // a reserved type, which must be ignored
+            "\x01\x04\x00\x00\xd1\xd7", // HEADERS with an indexed :method GET, :scheme https
+        },
+    });
 }
 
 // -- HTTP/3 frames -----------------------------------------------------------
