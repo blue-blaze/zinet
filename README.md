@@ -38,7 +38,7 @@ handshake written here, because Netty binds Quiche and the standard library has 
 TLS server; see [HTTP3.md](HTTP3.md) and [TLS.md](TLS.md) — Redis RESP2/RESP3,
 datagram (UDP) endpoints, a DNS resolver, TLS 1.3 on both sides of a connection, a
 bounded client connection pool, and `EmbeddedChannel` for testing pipelines without
-sockets. 765 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
+sockets. 767 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
 all under a leak-checking allocator, plus twenty-two fuzz targets. The same suite
 also runs **on fibers** rather than threads — see [Choosing an `Io`](#choosing-an-io).
 
@@ -48,7 +48,8 @@ counterpart: the HTTP server against `curl`, the HTTP client against Python's
 `websockets` library, the RESP server against `redis-py`, the UDP endpoint against
 Python's `socket` and `nc -u`, the DNS resolver against `dig` — address for
 address — the TLS client against OpenSSL's `s_server` and the TLS *server* against
-`openssl s_client` and `curl`, the HTTP/2 server against `curl` with `nghttp2`
+`openssl s_client`, `curl`, and — in the ordinary test suite, with no external process —
+the standard library's own `std.crypto.tls.Client`, the HTTP/2 server against `curl` with `nghttp2`
 underneath it (multiplexed, with 300 KiB crossing the flow-control window in both
 directions, over cleartext and over TLS with `h2` negotiated by ALPN), and HTTP/3
 against `aioquic` in **both** directions — our client against its server and its

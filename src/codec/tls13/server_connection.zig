@@ -35,6 +35,8 @@ const BufferPool = pool_mod.BufferPool;
 const driver = @import("driver.zig");
 const session_mod = @import("session.zig");
 const identity_mod = @import("identity.zig");
+/// The standard library's TLS client, for the cross-implementation test at the bottom.
+const tls_mod = @import("../../tls.zig");
 pub const ServerSession = session_mod.ServerSession;
 pub const Identity = identity_mod.Identity;
 
@@ -451,8 +453,11 @@ const test_certificate = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
 const test_certificates = [_][]const u8{&test_certificate};
 
 /// Echoes what it reads, so the client can observe the round trip.
+var test_echo_reads: std.atomic.Value(usize) = .init(0);
+
 const EchoHandler = struct {
     pub fn onRead(_: *EchoHandler, ctx: *pipeline_mod.HandlerContext, msg: Message) !void {
+        _ = test_echo_reads.fetchAdd(1, .monotonic);
         return ctx.writeAndFlush(msg);
     }
 };
@@ -666,4 +671,77 @@ test "tls13 server: a request coalesced with the client Finished is not lost" {
         try session.receive(gpa, incoming.data);
     }
     try testing.expectEqualStrings("coalesced request", session.appData());
+}
+
+test "tls13 server: the standard library's TLS client handshakes against our server" {
+    // A cross-implementation check that runs in the ordinary suite rather than against
+    // an external process. `openssl s_client` and `curl` already exercise this server,
+    // but only where those binaries exist and only by hand or in CI's shell steps; this
+    // one runs everywhere the tests do, on both platforms, under a leak-checking
+    // allocator.
+    //
+    // The client is `std.crypto.tls.Client`, wrapped by `tls.Connection`. It shares no
+    // code with the handshake engine here: it builds its own ClientHello, derives its
+    // own key schedule, and — the part that matters — parses the certificate chain and
+    // verifies CertificateVerify against the public key it finds there. That is why this
+    // needs `testRealIdentity` rather than the eight-byte placeholder the tests above
+    // use: our own client is told to verify nothing, and any other implementation cannot
+    // be.
+    try channel_mod.skipIfReadDeadlinesAreBroken();
+
+    const gpa = testing.allocator;
+    var threaded = try backend.Runtime.init(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const identity = identity_mod.testRealIdentity();
+    var server = try Server.listen(.{
+        .gpa = gpa,
+        .io = io,
+        .address = .{ .ip4 = .loopback(0) },
+        .identity = &identity,
+        .alpn = &.{ "h2", "http/1.1" },
+        .child = .{ .initializer = .initFunction(buildEcho) },
+        .seed = @splat(0x36),
+    });
+    defer server.deinit();
+    try server.serve();
+
+    test_collector = .{};
+    test_echo_reads.store(0, .release);
+    var client = try tls_mod.Client.connect(.{
+        .gpa = gpa,
+        .io = io,
+        .address = server.boundAddress(),
+        // Checked against the certificate's subject and SAN, so the name is part of
+        // what is being tested rather than decoration.
+        .host = identity_mod.test_real_host,
+        // Verifies the name and accepts a valid self-signed certificate. Not
+        // `insecure`: that would skip the parse this test exists to exercise.
+        .verification = .self_signed,
+        .initializer = .initFunction(buildCollector),
+    });
+
+    try testing.expectEqual(std.crypto.tls.ProtocolVersion.tls_1_3, client.connection.protocolVersion());
+
+    // Data in the client-to-server direction, which is what proves the traffic keys
+    // agree and not only that the handshake completed: the server's echo handler sees
+    // the plaintext.
+    try client.connection.writeBytes("hello from the standard library");
+    const deadline = Io.Timestamp.now(io, .awake).addDuration(.fromSeconds(5));
+    while (test_echo_reads.load(.acquire) == 0) {
+        if (Io.Timestamp.now(io, .awake).nanoseconds >= deadline.nanoseconds) break;
+        try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    try testing.expectEqual(@as(usize, 1), test_echo_reads.load(.acquire));
+
+    // The reply is deliberately *not* asserted here, and the reason is written down in
+    // REVIEW.md rather than left as a silent omission: the echo does arrive intact, but
+    // only after the client sends something else. Measured — the server's write reports
+    // no error, the client's read loop is alive and cycling, and the 31 bytes turn up
+    // complete the moment a second message goes out. Something is holding the reply
+    // until the next event on the connection, and asserting a round trip here would
+    // either hang or paper over it.
+
+    client.shutdown();
 }
