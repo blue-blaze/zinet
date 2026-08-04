@@ -491,6 +491,12 @@ fn buildCollector(pipeline: *Pipeline) anyerror!void {
 }
 
 test "tls13 server: our client handshakes against our server over a real socket" {
+    // Skipped on the fiber backend for the upstream defect the README describes: zio
+    // panics on `net_receive` for a stream socket, and every socket read here is
+    // bounded by a deadline, which is the one primitive that reaches it. Three tests in
+    // this file were reaching it and panicking rather than skipping — the guard existed
+    // and was simply not applied here.
+    try channel_mod.skipIfReadDeadlinesAreBroken();
     // Both ends of the self-written engine, meeting over TCP with the record
     // layer between them. Nothing here is simulated: two sockets, two tasks,
     // one certificate that neither side pretends to trust.
@@ -542,6 +548,7 @@ test "tls13 server: our client handshakes against our server over a real socket"
 }
 
 test "tls13 server: a client offering no shared protocol is still served" {
+    try channel_mod.skipIfReadDeadlinesAreBroken();
     const gpa = testing.allocator;
     var threaded = try backend.Runtime.init(gpa);
     defer threaded.deinit();
@@ -587,6 +594,7 @@ test "tls13 server: a client offering no shared protocol is still served" {
 }
 
 test "tls13 server: a request coalesced with the client Finished is not lost" {
+    try channel_mod.skipIfReadDeadlinesAreBroken();
     // The regression test for a real defect, and the reason `driver.readLoop`
     // delivers before its first read: a request/response client writes its
     // Finished and its first request in one go, so the handshake loop consumes

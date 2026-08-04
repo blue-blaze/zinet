@@ -170,6 +170,34 @@ those 53 bytes; its reader consumed all of them (`seek == end`); its loop was al
 a second outbound message went out promptly and only that loop sends; and the delayed
 bytes arrived intact. What remained was the boundary between the two readers.
 
+## The shape that was checked, and where it was not
+
+F8's shape — a reader that reports through its own buffer while the loop above reads only
+the return value — was swept for elsewhere the moment it was understood, because that is
+the difference between fixing an instance and fixing a class.
+
+It exists in exactly one other place: `Channel.readLoop`, the plain socket path every
+non-TLS connection uses. It is *immune*, and the reason is one line: the reader is built
+unbuffered, so `defaultReadVec` always takes the branch that streams into the caller's
+destination and there is nowhere for bytes to hide. That was stated as an optimisation —
+"no intermediate copy" — and is now stated as the invariant it actually is, with an
+assertion, because the next person to add a buffer there for throughput would reintroduce
+F8 in the path with the widest reach.
+
+The sweep also removed something worse than nothing. That loop tolerated a run of
+zero-length reads and then declared the stream broken. Neither of its two paths can
+produce a zero: `receiveBounded` maps a zero-length receive to `.ended`, since on a stream
+socket that is the orderly shutdown, and the unbuffered `readVec` cannot return zero while
+holding bytes. So the tolerance guarded nothing — and would have *hidden* the one case
+that can arise, turning a delivery bug into sixty-four silent retries and an
+`error.Unexpected`. It is an assertion now.
+
+Separately, running the fiber backend to check all this found that three TLS server socket
+tests were panicking there rather than skipping: they postdate the
+`skipIfReadDeadlinesAreBroken` guard, and the fiber build had not been re-run since.
+`zig build test -Dio=zio` is green again, and the README's count of skipped tests was
+four and is eight.
+
 ## Method## Method
 
 The review walked the call path rather than the file list: accept → register →

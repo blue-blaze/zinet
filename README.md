@@ -153,19 +153,23 @@ an HTTP exchange with `curl` against a fiber-backed server. Checked by hand as
 well: WebSocket with `permessage-deflate` against the third-party `websockets`
 library, and UDP against Python's `socket`.
 
-Four tests skip on `-Dio=zio`, all for one upstream defect in zio rather than a
+Eight tests skip on `-Dio=zio`, all for one upstream defect in zio rather than a
 difference of design. `std.Io.Operation` offers exactly one primitive that can put
 a deadline on a socket read — `net_receive` — and zio panics on it for a *stream*
 socket: `recvmsg` leaves `msg_name` untouched on a connected socket, and zio
 converts that untouched buffer unconditionally (`src/io.zig:2406` reaching
 `else => unreachable` at `src/io.zig:1871`) where the standard library defines the
-case away (`std/Io/Threaded.zig:14181`). So ticks, task hopping and TLS are
-affected; everything else is not. A minimal reproducer is in
+case away (`std/Io/Threaded.zig:14181`). So ticks, task hopping and TLS on both
+sides are affected; everything else is not. Three of those eight were *panicking*
+rather than skipping until the guard that the other five already used was applied to
+them as well — the TLS server's socket tests came later than the guard and nobody
+re-ran the fiber build. A minimal reproducer is in
 [docs/zio-net-receive-repro.zig](docs/zio-net-receive-repro.zig).
 
 That defect is worth waiting on rather than working around, because the fix is one
 line and it has been checked: changing that `unreachable` to the placeholder the
-standard library returns takes the suite to **272/272 on fibers**, and the two
+standard library returns took the suite green on fibers when it was measured — 272 tests then, and the count
+has since grown — and the two
 examples that panicked — a WebSocket client with a closing handshake, an HTTPS
 client against OpenSSL — both complete. Reverting the line brings the panic back.
 The write-up is in [docs/zio-net-receive.md](docs/zio-net-receive.md).

@@ -675,16 +675,22 @@ pub const Channel = struct {
     /// chunk into the pipeline.
     fn readLoop(channel: *Channel) void {
         const io = channel.io;
-        // An unbuffered reader lands socket bytes straight in the inbound
-        // buffer, so there is no intermediate copy.
+        // An unbuffered reader lands socket bytes straight in the inbound buffer, so
+        // there is no intermediate copy — and, less obviously, so that there is
+        // nowhere for received bytes to hide.
+        //
+        // `Io.Reader.readVec` reports through the reader's own buffer whenever that
+        // buffer has more room than the destination, returning zero while having
+        // stored the bytes (`defaultReadVec`). A loop that reads the return value and
+        // ignores the buffer would then hold a delivered reply until more arrived —
+        // which is exactly the defect the TLS client had, where the reader is
+        // `tls.Client`'s and buffering is not optional. Here it is optional, and the
+        // choice is load-bearing rather than an optimisation, so it is asserted.
         var reader = channel.stream.reader(io, &.{});
+        assert(reader.interface.buffer.len == 0);
 
-        // `readVec` may return 0 without the stream having ended. That is not a
-        // reason to throw the buffer away and allocate another one, and a run of
-        // them is not a reason to spin a core either.
         var chunk: ?Buffer = null;
         defer if (chunk) |*pending| channel.releaseInbound(pending);
-        var empty_reads: usize = 0;
 
         // Absolute rather than per-read, so ticks keep a steady cadence instead
         // of being pushed back by every arriving byte.
@@ -765,17 +771,18 @@ pub const Channel = struct {
                 };
             }
 
-            if (n == 0) {
-                empty_reads += 1;
-                if (empty_reads > max_empty_reads) {
-                    // The stream is neither delivering bytes nor reporting an
-                    // end. Treating that as a failure is better than looping.
-                    channel.finishRead(error.ReadFailed, error.Unexpected);
-                    return;
-                }
-                continue;
-            }
-            empty_reads = 0;
+            // Neither path can report zero. `receiveBounded` turns a zero-length
+            // receive into `.ended`, because on a stream socket that is the orderly
+            // shutdown; and the unbuffered `readVec` above streams straight into the
+            // destination, so it cannot return zero while holding bytes back.
+            //
+            // This used to tolerate a run of zeroes and then declare the stream
+            // broken. That guarded a case neither path produces, and it would have
+            // *hidden* the one case that can: give the reader a buffer and `readVec`
+            // starts returning zero with the bytes stored, at which point sixty-four
+            // silent retries and an `error.Unexpected` is a far worse report than an
+            // assertion naming the invariant.
+            assert(n > 0);
 
             var ready = chunk.?;
             chunk = null;
@@ -857,10 +864,6 @@ pub const Channel = struct {
         if (incoming.data.len == 0) return .ended;
         return .{ .received = incoming.data.len };
     }
-
-    /// How many consecutive zero-length reads are tolerated before the stream is
-    /// declared broken.
-    const max_empty_reads = 64;
 
     /// Classifies why the read loop stopped and reports it once.
     fn finishRead(channel: *Channel, err: anyerror, stream_err: ?Io.net.Stream.Reader.Error) void {
