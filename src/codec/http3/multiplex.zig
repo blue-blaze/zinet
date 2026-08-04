@@ -452,12 +452,12 @@ test "http3 multiplex: a request gets its own pipeline and the answer goes back"
     defer threaded.deinit();
     const io = threaded.io();
 
-    var pair = try connection_mod.testPairForMultiplex(gpa);
+    var pair = try connection_mod.testPair(gpa);
     const client = &pair.client;
     const server = &pair.server;
     defer client.deinit(gpa);
     defer server.deinit(gpa);
-    try connection_mod.pumpForMultiplex(gpa, client, server, 16);
+    try connection_mod.pumpH3(gpa, client, server, 16);
 
     var builder: Builder = .{};
     var multiplexer: Multiplexer = .init(gpa, io, server, .init(&builder));
@@ -469,7 +469,7 @@ test "http3 multiplex: a request gets its own pipeline and the answer goes back"
         connection_mod.requestFields("GET", "https", "h", "/x", &.{}, &buf),
         true,
     );
-    try connection_mod.pumpForMultiplex(gpa, client, server, 8);
+    try connection_mod.pumpH3(gpa, client, server, 8);
 
     // Route what the server saw into child pipelines.
     while (server.nextEvent()) |event| {
@@ -485,7 +485,7 @@ test "http3 multiplex: a request gets its own pipeline and the answer goes back"
     try testing.expectEqual(@as(usize, 0), multiplexer.count());
 
     // And the client received what the handler wrote.
-    try connection_mod.pumpForMultiplex(gpa, client, server, 8);
+    try connection_mod.pumpH3(gpa, client, server, 8);
     var saw_status = false;
     var saw_body = false;
     var received: std.ArrayList(u8) = .empty;
@@ -520,12 +520,12 @@ test "http3 multiplex: a reset tells the handler before the pipeline goes away" 
     defer threaded.deinit();
     const io = threaded.io();
 
-    var pair = try connection_mod.testPairForMultiplex(gpa);
+    var pair = try connection_mod.testPair(gpa);
     const client = &pair.client;
     const server = &pair.server;
     defer client.deinit(gpa);
     defer server.deinit(gpa);
-    try connection_mod.pumpForMultiplex(gpa, client, server, 16);
+    try connection_mod.pumpH3(gpa, client, server, 16);
 
     var builder: Builder = .{};
     var multiplexer: Multiplexer = .init(gpa, io, server, .init(&builder));
@@ -554,12 +554,12 @@ test "http3 multiplex: a peer's reset reaches the stream handler with its code" 
     defer threaded.deinit();
     const io = threaded.io();
 
-    var pair = try connection_mod.testPairForMultiplex(gpa);
+    var pair = try connection_mod.testPair(gpa);
     const client = &pair.client;
     const server = &pair.server;
     defer client.deinit(gpa);
     defer server.deinit(gpa);
-    try connection_mod.pumpForMultiplex(gpa, client, server, 16);
+    try connection_mod.pumpH3(gpa, client, server, 16);
 
     var builder: Builder = .{};
     var multiplexer: Multiplexer = .init(gpa, io, server, .init(&builder));
@@ -572,13 +572,13 @@ test "http3 multiplex: a peer's reset reaches the stream handler with its code" 
         connection_mod.requestFields("GET", "https", "h", "/abandoned", &.{}, &buf),
         false,
     );
-    try connection_mod.pumpForMultiplex(gpa, client, server, 8);
+    try connection_mod.pumpH3(gpa, client, server, 8);
     while (server.nextEvent()) |event| _ = try multiplexer.dispatch(event);
     try testing.expectEqual(@as(usize, 1), builder.log.created);
 
     // The client gives up on it.
     client.cancel(gpa, id, 0x010c); // H3_REQUEST_CANCELLED
-    try connection_mod.pumpForMultiplex(gpa, client, server, 8);
+    try connection_mod.pumpH3(gpa, client, server, 8);
 
     var handled = false;
     while (server.nextEvent()) |event| {

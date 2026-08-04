@@ -294,6 +294,34 @@ Each fix is pinned by a regression test asserting "reported once, not once per
 read", and the framing tests now assert that a rejected frame does not take its
 neighbours with it.
 
+Two more came from taking the same property one layer up, to the HTTP/3
+*connection* rather than its frame parser. Both were found while building that
+target, and the second one only after the first was fixed — which is the argument
+for the target existing.
+
+- F5 FIXED (**major, silent hang**) `http3.connection` never reported the end of a
+  request or response when the FIN arrived *after* the last frame had been consumed.
+  The end was only noticed while the read loop held an item, and a FIN that arrives
+  on its own finds the buffer empty. §4.1 has a client close its sending side after
+  the request, and QUIC may carry that STREAM frame in a later packet — so a server
+  would wait forever for a body that had already arrived in full. Nothing caught it
+  because every test, and both endpoints here, set the FIN together with the last
+  frame; the fuzz target's whole-versus-fragmented comparison found the same bytes
+  ending the stream in one delivery and not in the other. Now a `Request` records
+  whether the end was reported, and a lone FIN reports it exactly once.
+- F6 FIXED (**test infrastructure, and it invalidated thirteen tests**) The
+  `stress: … over random inputs` loops fed uniformly random bytes to a
+  `std.testing.Smith`. That is not what a `Smith` consumes: it takes eight bytes per
+  draw, reads them as a little-endian u64, and substitutes the *minimum* of the
+  requested range whenever the value falls outside it
+  (`std/testing/Smith.zig`). Random bytes give a value near 2^63 every time, so every
+  draw returned its minimum — `boolWeighted` always false, every range always its low
+  end, every `slice` empty. Thirteen stress tests were running four hundred iterations
+  of one degenerate input each. Measured, not inferred: with random bytes the HTTP/3
+  connection target never once produced more than one event; with the input shaped as
+  small little-endian u64s it reaches request/response sequences, which is how F5
+  surfaced.
+
 ## Found while adding the server sides
 
 Nine defects, all mine, all introduced by the work that found them. This is the

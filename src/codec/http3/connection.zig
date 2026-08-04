@@ -88,6 +88,10 @@ const Request = struct {
     /// Whether any DATA frame has arrived, which is what turns the next
     /// HEADERS into trailers.
     saw_data: bool = false,
+    /// Whether the end of the stream has been reported upward. One flag, because the
+    /// end can be learned two ways — riding with the last frame, or arriving alone
+    /// afterwards — and the application must hear about it exactly once.
+    end_reported: bool = false,
     /// §4.4: this stream carries a CONNECT tunnel, so only DATA may follow.
     ///
     /// Set on a server when the CONNECT request arrives, and on a client when a 2xx
@@ -697,6 +701,7 @@ pub const Connection = struct {
                     req.saw_data = true;
                     try req.body.appendSlice(gpa, chunk.bytes);
                     if (chunk.last) {
+                        if (stream_done) req.end_reported = true;
                         try self.events.append(gpa, .{ .body = .{
                             .stream = id,
                             .fin = stream_done,
@@ -704,6 +709,23 @@ pub const Connection = struct {
                     }
                 },
             }
+        }
+
+        // A FIN that arrives on its own, after the last frame was already consumed.
+        // Nothing reported the end in that case, because the loop above only learns
+        // "finished" while it holds an item — and `read` returns nothing here.
+        //
+        // Legal and ordinary: §4.1 has the client close its sending side after the
+        // request, and QUIC may carry that STREAM frame in a later packet than the
+        // data. Every test and both endpoints in this repository happen to set the
+        // FIN *with* the last frame, which is why an exchange could hang here for a
+        // peer that does not — a server waiting for a request body that is already
+        // complete. Found by the connection fuzz target's whole-versus-fragmented
+        // comparison, where the same bytes ended the stream in one delivery and did
+        // not in the other.
+        if (req.fin_seen and !req.end_reported) {
+            req.end_reported = true;
+            try self.events.append(gpa, .{ .body = .{ .stream = id, .fin = true } });
         }
     }
 
@@ -772,6 +794,7 @@ pub const Connection = struct {
                     }
                 }
                 try req.sections.append(gpa, section);
+                if (stream_done) req.end_reported = true;
                 try self.events.append(gpa, .{ .headers = .{
                     .stream = id,
                     .fin = stream_done,
@@ -1631,7 +1654,9 @@ var h3_identity: @import("../tls13/identity.zig").Identity = undefined;
 /// Drives datagrams between two HTTP/3 connections until neither has more to
 /// send. Bounded, because a handshake that has not settled is a defect and an
 /// unbounded loop would hang the suite rather than report it.
-fn pumpH3(gpa: Allocator, a: *Connection, b: *Connection, rounds: usize) !void {
+/// Bounded pumping: moves datagrams both ways until neither side has anything to
+/// say, or `rounds` is exhausted.
+pub fn pumpH3(gpa: Allocator, a: *Connection, b: *Connection, rounds: usize) !void {
     var buf: [1500]u8 = undefined;
     var round: usize = 0;
     while (round < rounds) : (round += 1) {
@@ -1664,16 +1689,10 @@ fn pumpUntilFailure(gpa: Allocator, a: *Connection, b: *Connection, rounds: usiz
 
 pub const TestPair = struct { client: Connection, server: Connection };
 
-pub fn testPairForMultiplex(gpa: Allocator) !TestPair {
-    return testPair(gpa);
-}
-
-/// Bounded pumping, shared with `multiplex.zig`'s tests.
-pub fn pumpForMultiplex(gpa: Allocator, a: *Connection, b: *Connection, rounds: usize) !void {
-    return pumpH3(gpa, a, b, rounds);
-}
-
-fn testPair(gpa: Allocator) !TestPair {
+/// A handshaken client and server, shared with `multiplex.zig`'s tests and the
+/// fuzz targets. Public because those live in other modules, not because an
+/// application has any use for it.
+pub fn testPair(gpa: Allocator) !TestPair {
     return testPairWith(gpa, false);
 }
 
@@ -2418,4 +2437,63 @@ test "http3: a setting value other than 0 or 1 is a settings error" {
     var dup_it = frame.SettingsIterator.init(buf[0..dup_len]);
     _ = try dup_it.next();
     try testing.expectError(error.SettingsError, dup_it.next());
+}
+
+test "http3: a FIN that arrives on its own still ends the request" {
+    // §4.1: a client closes its sending side after the request, and QUIC is free to
+    // carry that STREAM frame in a later packet than the data it follows. Every test
+    // here, and both endpoints in this repository, happen to set the FIN together
+    // with the last frame — so a peer that does not could leave a server waiting for
+    // a request body that had already arrived in full.
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    var fields: [8]qpack.FieldLine = undefined;
+    const request = requestFields("POST", "https", "example.test", "/upload", &.{}, &fields);
+    const id = try client.request(gpa, request, false);
+    try client.writeBody(gpa, id, "payload", false);
+    // Deliberately delivered before the FIN exists, so the server consumes every
+    // byte and then hears nothing more until the FIN arrives alone.
+    try pumpH3(gpa, client, server, 8);
+
+    var saw_end = false;
+    while (server.nextEvent()) |event| switch (event) {
+        .body => |e| {
+            const chunk = server.readBody(e.stream);
+            server.consumeBody(e.stream, chunk.len);
+            if (e.fin) saw_end = true;
+        },
+        .headers => |e| {
+            var section = server.takeSection(e.stream) orelse continue;
+            section.deinit(gpa);
+            if (e.fin) saw_end = true;
+        },
+        else => {},
+    };
+    try testing.expect(!saw_end); // nothing has ended yet
+
+    try client.transport.finishStream(id);
+    try pumpH3(gpa, client, server, 8);
+
+    while (server.nextEvent()) |event| switch (event) {
+        .body => |e| {
+            const chunk = server.readBody(e.stream);
+            server.consumeBody(e.stream, chunk.len);
+            if (e.fin) saw_end = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw_end);
+
+    // And exactly once: a second delivery of the same FIN must not repeat it.
+    try pumpH3(gpa, client, server, 4);
+    while (server.nextEvent()) |event| switch (event) {
+        .body => |e| try testing.expect(!e.fin),
+        else => {},
+    };
 }
