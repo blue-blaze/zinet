@@ -1882,7 +1882,13 @@ const deflate_corpus = [_][]const u8{
 // ordinary test run covers thousands of cases, and a failure is reproducible
 // from the printed seed.
 
-const stress_iterations = 400;
+/// Iterations per stress loop.
+///
+/// 400 for a long time, and measured to be too few: the HTTP/3 connection target found a
+/// real disagreement between whole and fragmented delivery at iteration 1263, which every
+/// run before that had missed. Raised with the cost measured rather than guessed — the
+/// whole fuzz step takes about two minutes here at this count, and about six at 4000.
+const stress_iterations = 1500;
 
 /// Bytes a `Smith` can actually draw varied values from, which uniformly random
 /// bytes are not.
@@ -2272,8 +2278,26 @@ fn fuzzHttp3ConnectionBody(_: *Harness, smith: *Smith, gpa: Allocator) anyerror!
         .prefixed = prefixed,
     }, smith, &split);
 
-    if (whole_failed != split_failed) return error.H3ConnectionOutcomeDiffers;
-    if (!std.mem.eql(u8, whole.items, split.items)) return error.H3ConnectionTranscriptDiffers;
+    if (whole_failed != split_failed) {
+        std.debug.print("h3 outcome differs: whole_failed={} split_failed={}\n", .{
+            whole_failed, split_failed,
+        });
+        return error.H3ConnectionOutcomeDiffers;
+    }
+    if (!std.mem.eql(u8, whole.items, split.items)) {
+        // Printed rather than merely reported: the two transcripts *are* the bug
+        // report, and reconstructing them from a seed is work the next reader should
+        // not have to do.
+        std.debug.print(
+            "h3 transcripts differ (control={} finish={} prefixed={} bytes={d}):\n  whole: {f}\n  split: {f}\n",
+            .{
+                on_control,                               finish,
+                prefixed,                                 input.len,
+                std.ascii.hexEscape(whole.items, .lower), std.ascii.hexEscape(split.items, .lower),
+            },
+        );
+        return error.H3ConnectionTranscriptDiffers;
+    }
 }
 
 /// Feeds `input` to a server connection and records what it reports. With `smith`,
@@ -2309,10 +2333,11 @@ fn h3ConnectionTranscript(
         client.transport.openStream(gpa, true) catch return true;
 
     var failed = false;
+    var ends: usize = 0;
     if (case.prefixed) {
         h3WriteValidHeaders(gpa, client, stream) catch return true;
         http3.connection.pumpH3(gpa, client, server, 4) catch return true;
-        try recordH3Events(gpa, server, out);
+        try recordH3Events(gpa, server, out, &ends);
     }
     if (smith) |chooser| {
         var offset: usize = 0;
@@ -2333,7 +2358,7 @@ fn h3ConnectionTranscript(
                 failed = true;
                 break;
             };
-            try recordH3Events(gpa, server, out);
+            try recordH3Events(gpa, server, out, &ends);
         }
     } else {
         _ = client.transport.write(gpa, stream, case.input) catch {
@@ -2351,7 +2376,10 @@ fn h3ConnectionTranscript(
             failed = true;
         };
     }
-    try recordH3Events(gpa, server, out);
+    try recordH3Events(gpa, server, out, &ends);
+
+    // One marker per reported end, at a fixed place rather than where it happened.
+    for (0..ends) |_| try out.appendSlice(gpa, "|END;");
 
     // Terminal states are terminal: once the connection has been failed, nothing
     // further may be reported. A state machine that keeps emitting after closing is
@@ -2481,12 +2509,23 @@ fn h3WriteValidHeaders(gpa: Allocator, conn: *http3.connection.Connection, strea
     _ = try conn.transport.write(gpa, stream, encoded.items);
 }
 
-fn recordH3Events(gpa: Allocator, conn: *http3.connection.Connection, out: *std.ArrayList(u8)) !void {
+fn recordH3Events(
+    gpa: Allocator,
+    conn: *http3.connection.Connection,
+    out: *std.ArrayList(u8),
+    ends: *usize,
+) !void {
     while (conn.nextEvent()) |event| switch (event) {
         .established => try out.appendSlice(gpa, "EST;"),
         .headers => |e| {
             try out.appendSlice(gpa, "H:");
-            try out.append(gpa, if (e.fin) '1' else '0');
+            // The end is *counted*, not recorded here. Which event carries it depends on
+            // whether QUIC delivered the FIN with the field section, with the last body
+            // bytes, or on its own afterwards — the same delivery-dependent detail that
+            // already makes body bytes rather than body *events* the thing compared. What
+            // must match is the sections, the bytes, and that the end appears exactly
+            // once, so the count is compared as a suffix instead of a position.
+            if (e.fin) ends.* += 1;
             // The section itself, so that two runs differing in *what* they decoded
             // are caught and not only two runs differing in event order.
             if (conn.takeSection(e.stream)) |taken| {
@@ -2506,7 +2545,7 @@ fn recordH3Events(gpa: Allocator, conn: *http3.connection.Connection, out: *std.
             const chunk = conn.readBody(e.stream);
             try out.appendSlice(gpa, chunk);
             conn.consumeBody(e.stream, chunk.len);
-            if (e.fin) try out.appendSlice(gpa, "|END;");
+            if (e.fin) ends.* += 1;
         },
         .goaway => |e| {
             try out.appendSlice(gpa, "GO:");

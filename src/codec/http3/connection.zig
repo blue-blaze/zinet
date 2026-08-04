@@ -44,6 +44,17 @@ pub const Error = error{
 } || quic.connection.Error || frame.Error || qpack.Error;
 
 /// What this connection reports upward. IDs only — see the module comment.
+///
+/// **The end of a stream is reported exactly once, but which event carries it depends
+/// on how QUIC delivered the bytes.** It rides on `headers.fin` when the FIN arrived
+/// with the field section, on `body.fin` when it arrived with the last body bytes, and
+/// on a `body` event with *no* bytes when it arrived on its own afterwards — which is
+/// legal and ordinary, since a client closes its sending side after the request and the
+/// transport may carry that in a later packet. An application must therefore treat all
+/// three as the same signal; every consumer in this repository does, and the connection
+/// fuzz target asserts that the sections and body bytes are identical across those
+/// deliveries and that the end appears once. This was an unwritten three-way contract
+/// until that target found the two shapes disagreeing.
 pub const Event = union(enum) {
     /// The QUIC and HTTP/3 layers are both up: SETTINGS sent, streams open.
     established,
@@ -2657,4 +2668,56 @@ test "http3: a stream ending between frames is not a frame error" {
         else => {},
     };
     try testing.expect(ended);
+}
+
+test "http3: a bodyless request reports its end once, whichever packet the FIN rides in" {
+    // The three-way contract on `Event`, stated as a test because the connection fuzz
+    // target found the two deliveries disagreeing about it and nothing had written it
+    // down: a request with no body ends either on `headers.fin`, when the FIN arrived
+    // with the field section, or on a `body` event carrying no bytes, when it arrived
+    // afterwards. Exactly once, either way.
+    const gpa = testing.allocator;
+
+    for ([_]bool{ true, false }) |fin_with_headers| {
+        var pair = try testPair(gpa);
+        const client = &pair.client;
+        const server = &pair.server;
+        defer client.deinit(gpa);
+        defer server.deinit(gpa);
+        try pumpH3(gpa, client, server, 16);
+
+        var fields: [8]qpack.FieldLine = undefined;
+        const request = requestFields("GET", "https", "example.test", "/none", &.{}, &fields);
+        const id = try client.request(gpa, request, fin_with_headers);
+        try pumpH3(gpa, client, server, 8);
+        if (!fin_with_headers) {
+            // The FIN on its own, after the field section was consumed.
+            try client.transport.finishStream(id);
+            try pumpH3(gpa, client, server, 8);
+        }
+
+        var ends: usize = 0;
+        var sections: usize = 0;
+        var body_bytes: usize = 0;
+        while (server.nextEvent()) |event| switch (event) {
+            .headers => |e| {
+                var section = server.takeSection(e.stream) orelse continue;
+                section.deinit(gpa);
+                sections += 1;
+                if (e.fin) ends += 1;
+            },
+            .body => |e| {
+                const chunk = server.readBody(e.stream);
+                body_bytes += chunk.len;
+                server.consumeBody(e.stream, chunk.len);
+                if (e.fin) ends += 1;
+            },
+            else => {},
+        };
+
+        try testing.expectEqual(@as(usize, 1), sections);
+        try testing.expectEqual(@as(usize, 0), body_bytes);
+        try testing.expectEqual(@as(usize, 1), ends);
+        try testing.expect(server.close_code == null);
+    }
 }

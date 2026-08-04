@@ -198,6 +198,42 @@ tests were panicking there rather than skipping: they postdate the
 `zig build test -Dio=zio` is green again, and the README's count of skipped tests was
 four and is eight.
 
+## An unwritten contract, found by the target that was just fixed
+
+The HTTP/3 connection target — the one whose input generation had to be repaired before it
+could reach anything — found a disagreement between whole and fragmented delivery at
+iteration 1263 of its stress loop. Every run before it had used four hundred, so it was
+inside the machine and unreached the whole time.
+
+The two transcripts, which the target now prints rather than merely reporting:
+
+    whole: H:1 :method=CONNECT,:authority=fuzz.test:443,;
+    split: H:0 :method=CONNECT,:authority=fuzz.test:443,;|END;
+
+A bodyless request, and the same bytes. Delivered at once, the end rides on the field
+section's `fin`; delivered in pieces, the section arrives without it and a later `body`
+event carrying no bytes brings the end instead. Reported exactly once either way, with
+identical sections and identical (empty) content.
+
+**This one is not a defect, and saying so required checking rather than assuming.** Every
+consumer in the repository handles both carriers — `multiplex.dispatch` finishes the stream
+on either, and so do `http3.server` and `http3.client`. What was wrong is that the contract
+was nowhere: `Event` said `fin` means "the stream ended with it" and never said the end may
+instead arrive alone, which is precisely what the FIN fix (F5) made possible. It is written
+on `Event` now, and pinned by a test that drives a bodyless request both ways and requires
+exactly one end from each.
+
+So the oracle was refined rather than the code: the *count* of reported ends is compared,
+and its position is normalised away — the same treatment body bytes already had, for the
+same reason. Which event carries the end is a fact about how QUIC packetized, not about the
+message.
+
+Two things worth keeping from the episode. A fuzz target should print the disagreement it
+found; reconstructing two transcripts from a seed is work the next reader should not have
+to repeat. And an iteration count is a measurement, not a preference: four hundred was
+enough to find nothing and 1263 was needed, so the loops run 1500 now, which costs about
+two minutes for the whole fuzz step against six at four thousand.
+
 ## Method## Method
 
 The review walked the call path rather than the file list: accept → register →
