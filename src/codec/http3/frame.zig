@@ -93,6 +93,9 @@ pub const Error = error{
     IdError,
     /// H3_EXCESSIVE_LOAD: a frame larger than this implementation will buffer.
     ExcessiveLoad,
+    /// H3_DATAGRAM_ERROR (RFC 9297 §5.2): a datagram that could not be parsed, or one
+    /// whose Quarter Stream ID could not name a stream.
+    DatagramError,
 } || Allocator.Error;
 
 /// §8.1's wire codes, for the CONNECTION_CLOSE this layer's errors become.
@@ -104,6 +107,7 @@ pub fn errorCode(err: Error) u64 {
         error.MissingSettings => 0x010a,
         error.IdError => 0x0108,
         error.ExcessiveLoad => 0x0107,
+        error.DatagramError => 0x33,
         error.OutOfMemory => 0x0102, // H3_INTERNAL_ERROR
     };
 }
@@ -121,6 +125,10 @@ pub const Setting = struct {
     /// RFC 9220 §3: SETTINGS_ENABLE_CONNECT_PROTOCOL, the same value as in
     /// HTTP/2, registered separately for HTTP/3 as Appendix A.3 requires.
     pub const enable_connect_protocol = 0x08;
+    /// RFC 9297 §2.1.1: SETTINGS_H3_DATAGRAM. Value 0 or 1, and 0x33 is also the
+    /// error code for a datagram this side cannot parse — the same number in two
+    /// registries, which is the RFC's choice rather than a coincidence worth hiding.
+    pub const h3_datagram = 0x33;
 
     /// §11.2.2: grease for settings uses the same 0x1f * N + 0x21 formula.
     pub fn isGrease(id: u64) bool {
@@ -158,6 +166,9 @@ pub const Settings = struct {
     /// the extension safe to negotiate with a setting at all: §9 requires that an
     /// omitted setting leave the extension disabled.
     enable_connect_protocol: bool = false,
+    /// RFC 9297 §2.1.1: whether the peer will receive HTTP/3 Datagrams. Default 0,
+    /// for the same reason.
+    h3_datagram: bool = false,
 
     pub fn apply(self: *Settings, setting: Setting) void {
         switch (setting.id) {
@@ -168,6 +179,9 @@ pub const Settings = struct {
             // outside that never reaches here — `SettingsIterator.next` refuses it,
             // which is also where §7.2.4's other payload rules live.
             Setting.enable_connect_protocol => self.enable_connect_protocol = setting.value == 1,
+            // RFC 9297 §2.1.1: "MUST be either 0 or 1", refused in the iterator with
+            // the other payload rules.
+            Setting.h3_datagram => self.h3_datagram = setting.value == 1,
             // §9: unknown settings must be ignored. This is where grease lands
             // too, and deliberately through the same path — grease works only
             // because it is indistinguishable from a real future extension.
@@ -226,6 +240,10 @@ pub const SettingsIterator = struct {
         // forbids is precisely "an error in the payload of a SETTINGS frame"
         // (§8.1), which is the code this iterator's error already carries.
         if (id == Setting.enable_connect_protocol and value > 1) return error.SettingsError;
+        // RFC 9297 §2.1.1: "If the SETTINGS_H3_DATAGRAM setting is received with a
+        // value that is neither 0 nor 1, the receiver MUST terminate the connection
+        // with error H3_SETTINGS_ERROR."
+        if (id == Setting.h3_datagram and value > 1) return error.SettingsError;
 
         // §7.2.4: "The same setting identifier MUST NOT occur more than once".
         // Only tracked for identifiers small enough to matter to us — a full

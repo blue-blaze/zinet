@@ -58,6 +58,9 @@ pub const Error = error{
 pub const Event = union(enum) {
     /// The QUIC and HTTP/3 layers are both up: SETTINGS sent, streams open.
     established,
+    /// RFC 9297: an HTTP Datagram arrived for `stream`. Carries the length only, like
+    /// `body`: `readDatagram` hands out the payload until `consumeDatagram`.
+    datagram: struct { stream: u64, len: usize },
     /// A field section arrived on `stream`; `takeSection` yields it.
     /// `fin` says the stream ended with it.
     headers: struct { stream: u64, fin: bool },
@@ -83,6 +86,28 @@ pub const Event = union(enum) {
 
 /// One request stream's receive state: §4.1's grammar as a state machine, so
 /// what is accepted is visible in one place.
+const QueuedDatagram = struct { stream: u64, payload: []u8 };
+
+/// RFC 9297 §2.1 rides on RFC 9221, so enabling the HTTP/3 setting has to enable the
+/// transport parameter too — and derived here rather than left to the caller, because a
+/// connection that advertised one without the other would negotiate a feature it then
+/// could not use. §3 of RFC 9221 recommends 65535, meaning "any DATAGRAM frame that
+/// fits inside a QUIC packet", which is exactly the promise this layer can keep: the
+/// frame cannot be larger than a packet anyway, and the inbound queue is bounded by
+/// count rather than by advertised size.
+fn datagramParameters(
+    given: quic.transport.Parameters,
+    enable: bool,
+) quic.transport.Parameters {
+    if (!enable) return given;
+    var params = given;
+    if (params.max_datagram_frame_size == 0) params.max_datagram_frame_size = 65535;
+    return params;
+}
+
+/// How many inbound HTTP Datagrams this connection holds before dropping the oldest.
+pub const max_queued_datagrams = 32;
+
 const RequestState = enum {
     /// Nothing yet; only HEADERS (or ignorable unknown frames) may come.
     awaiting_headers,
@@ -119,6 +144,11 @@ const Request = struct {
     /// Body bytes waiting for the application.
     body: std.ArrayList(u8) = .empty,
     fin_seen: bool = false,
+    /// Whether this side has finished sending on the stream. RFC 9297 §2.1 makes it
+    /// the condition for sending a datagram: "HTTP/3 Datagrams MUST NOT be sent unless
+    /// the corresponding stream's send side is open", and a datagram associated with a
+    /// stream we have said everything on has nothing left to be associated with.
+    fin_sent: bool = false,
 
     fn deinit(self: *Request, gpa: Allocator) void {
         self.parser.deinit(gpa);
@@ -152,6 +182,12 @@ pub const Options = struct {
     /// CONNECT has told its peers something untrue. Sending it as a client has no
     /// effect (RFC 8441 §3), so it is only meaningful on a server.
     enable_connect_protocol: bool = false,
+    /// RFC 9297 §2.1.1: whether to advertise SETTINGS_H3_DATAGRAM, which is what makes
+    /// QUIC DATAGRAM frames usable for HTTP Datagrams. Off by default: §2 requires an
+    /// association with "an HTTP request that explicitly supports them", so an
+    /// application that has no such extension gains nothing and would only "stick
+    /// out" (§4).
+    enable_datagram: bool = false,
 };
 
 pub const ServerOptions = struct {
@@ -169,6 +205,12 @@ pub const ServerOptions = struct {
     max_field_section_size: u64 = 64 * 1024,
     /// RFC 9220 §3, as in `Options`.
     enable_connect_protocol: bool = false,
+    /// RFC 9297 §2.1.1: whether to advertise SETTINGS_H3_DATAGRAM, which is what makes
+    /// QUIC DATAGRAM frames usable for HTTP Datagrams. Off by default: §2 requires an
+    /// association with "an HTTP request that explicitly supports them", so an
+    /// application that has no such extension gains nothing and would only "stick
+    /// out" (§4).
+    enable_datagram: bool = false,
 };
 
 pub const Connection = struct {
@@ -204,6 +246,15 @@ pub const Connection = struct {
 
     /// Request streams by ID.
     requests: std.AutoHashMapUnmanaged(u64, Request) = .empty,
+    /// RFC 9297 datagrams waiting for the application, and how many were dropped.
+    ///
+    /// Bounded for the reason RFC 9221 §5.3 makes unavoidable: datagrams have no flow
+    /// control, so a peer's sending rate is limited by congestion control and nothing
+    /// else. Dropped counts are observable because a drop here is indistinguishable to
+    /// the application from one on the network, and an application tuning its own rate
+    /// needs to be able to tell.
+    datagram_queue: std.ArrayList(QueuedDatagram) = .empty,
+    datagrams_dropped: u64 = 0,
     /// Peer unidirectional streams whose type is not yet known, or which are
     /// being deliberately ignored (unknown/grease types, §6.2.4).
     ignored_uni: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -217,6 +268,12 @@ pub const Connection = struct {
     close_code: ?u64 = null,
     /// Whether we advertise RFC 9220's SETTINGS_ENABLE_CONNECT_PROTOCOL.
     enable_connect_protocol: bool = false,
+    /// RFC 9297 §2.1.1: whether to advertise SETTINGS_H3_DATAGRAM, which is what makes
+    /// QUIC DATAGRAM frames usable for HTTP Datagrams. Off by default: §2 requires an
+    /// association with "an HTTP request that explicitly supports them", so an
+    /// application that has no such extension gains nothing and would only "stick
+    /// out" (§4).
+    enable_datagram: bool = false,
 
     pub fn init(options: Options, seed: [64]u8) !Connection {
         return .{
@@ -226,7 +283,7 @@ pub const Connection = struct {
                 // choose: a connection speaking this layer's frames under a
                 // different token would be lying to the peer about what it is.
                 .alpn = &.{"h3"},
-                .parameters = options.parameters,
+                .parameters = datagramParameters(options.parameters, options.enable_datagram),
                 .verification = options.verification,
                 .local_cid = options.local_cid,
                 .initial_destination = options.initial_destination,
@@ -234,6 +291,7 @@ pub const Connection = struct {
             }, seed),
             .max_field_section_size = options.max_field_section_size,
             .enable_connect_protocol = options.enable_connect_protocol,
+            .enable_datagram = options.enable_datagram,
         };
     }
 
@@ -247,7 +305,7 @@ pub const Connection = struct {
                 // §3.1: "h3" and nothing else. A server that accepted another
                 // token for these frames would be misdescribing itself.
                 .alpn = &.{"h3"},
-                .parameters = options.parameters,
+                .parameters = datagramParameters(options.parameters, options.enable_datagram),
                 .local_cid = options.local_cid,
                 .destination = options.destination,
                 .original_destination = options.original_destination,
@@ -256,6 +314,7 @@ pub const Connection = struct {
             }, seed),
             .max_field_section_size = options.max_field_section_size,
             .enable_connect_protocol = options.enable_connect_protocol,
+            .enable_datagram = options.enable_datagram,
         };
     }
 
@@ -263,6 +322,8 @@ pub const Connection = struct {
         var it = self.requests.valueIterator();
         while (it.next()) |req| req.deinit(gpa);
         self.requests.deinit(gpa);
+        for (self.datagram_queue.items) |entry| gpa.free(entry.payload);
+        self.datagram_queue.deinit(gpa);
         self.ignored_uni.deinit(gpa);
         self.control_parser.deinit(gpa);
         self.events.deinit(gpa);
@@ -297,6 +358,120 @@ pub const Connection = struct {
         return self.transport.send(gpa, dest);
     }
 
+    /// RFC 9297 §2.1: the largest HTTP Datagram payload that can be sent for `stream`,
+    /// or null when datagrams are not usable on this connection.
+    ///
+    /// The Quarter Stream ID's varint sits in front of every payload, so the room left
+    /// depends on which stream it is for. Offered rather than left to the caller for
+    /// the same reason the transport offers `maxDatagramPayload`: re-deriving an
+    /// overhead is how a sender produces frames its peer must reject.
+    pub fn maxDatagramPayload(self: *const Connection, stream: u64) ?usize {
+        if (!self.datagramsAllowed()) return null;
+        const budget = self.transport.maxDatagramPayload() orelse return null;
+        const prefix = quic.varint.encodedLen(stream / 4);
+        if (budget <= prefix) return null;
+        return budget - prefix;
+    }
+
+    /// Whether HTTP Datagrams may be sent (RFC 9297 §2.1.1).
+    ///
+    /// Both directions of two different negotiations have to line up, which is why this
+    /// is one function rather than a field: §2.1.1 requires the *setting* to have been
+    /// "both sent and received with a value of 1", and RFC 9221 §3 requires the peer's
+    /// `max_datagram_frame_size` to be non-zero before a DATAGRAM frame may be sent at
+    /// all. Either missing means silence, not an error.
+    pub fn datagramsAllowed(self: *const Connection) bool {
+        if (!self.enable_datagram) return false;
+        const peer = self.peer_settings orelse return false;
+        if (!peer.h3_datagram) return false;
+        return self.transport.datagramsAllowed();
+    }
+
+    /// RFC 9297 §2.1: send an HTTP Datagram associated with `stream`.
+    pub fn sendDatagram(
+        self: *Connection,
+        gpa: Allocator,
+        stream: u64,
+        payload: []const u8,
+    ) !void {
+        if (!self.datagramsAllowed()) return error.DatagramsUnsupported;
+        // §2.1: "HTTP/3 Datagrams MUST NOT be sent unless the corresponding stream's
+        // send side is open." A datagram for a stream we have finished sending on has
+        // nothing to be associated with.
+        // §2.1: the association is a client-initiated bidirectional stream, divided by
+        // four — so an ID that is not one cannot be named by a Quarter Stream ID at all.
+        // Checked before the stream's state, because "this is not a stream a datagram
+        // can belong to" is a different answer from "that stream is finished", and the
+        // caller acts differently on each.
+        if (stream % 4 != 0) return error.DatagramStreamInvalid;
+        const req = self.requests.getPtr(stream) orelse return error.DatagramStreamClosed;
+        if (req.fin_sent) return error.DatagramStreamClosed;
+
+        var buf: [quic.connection.max_datagram]u8 = undefined;
+        const prefix = quic.varint.encode(&buf, stream / 4);
+        if (prefix + payload.len > buf.len) return error.DatagramTooLarge;
+        @memcpy(buf[prefix..][0..payload.len], payload);
+        try self.transport.sendDatagram(gpa, buf[0 .. prefix + payload.len]);
+    }
+
+    /// The oldest HTTP Datagram that has arrived, with the stream it belongs to.
+    pub fn readDatagram(self: *const Connection) ?struct { stream: u64, payload: []const u8 } {
+        if (self.datagram_queue.items.len == 0) return null;
+        const entry = self.datagram_queue.items[0];
+        return .{ .stream = entry.stream, .payload = entry.payload };
+    }
+
+    /// Release what `readDatagram` returned.
+    pub fn consumeDatagram(self: *Connection, gpa: Allocator) void {
+        if (self.datagram_queue.items.len == 0) return;
+        gpa.free(self.datagram_queue.orderedRemove(0).payload);
+    }
+
+    fn onDatagram(self: *Connection, gpa: Allocator) !void {
+        const raw = self.transport.readDatagram() orelse return;
+        defer self.transport.consumeDatagram(gpa);
+
+        // §2.1: "Receipt of a QUIC DATAGRAM frame whose payload is too short to allow
+        // parsing the Quarter Stream ID field MUST be treated as an HTTP/3 connection
+        // error of type H3_DATAGRAM_ERROR."
+        var rest = raw;
+        const quarter = quic.varint.take(&rest) catch
+            return self.failFrame(error.DatagramError);
+        // §2.1: "The largest legal QUIC stream ID value is 2^62-1, so the largest legal
+        // value of the Quarter Stream ID field is 2^60-1."
+        if (quarter > (@as(u64, 1) << 60) - 1) return self.failFrame(error.DatagramError);
+        const stream = quarter * 4;
+
+        // §2.1: a datagram for a stream that does not exist yet is dropped or buffered
+        // — "SHALL either drop that datagram silently or buffer it temporarily". Dropped
+        // here: buffering costs memory a peer chooses the size of, and this layer's
+        // rule is that such a thing needs a bound before it needs a feature. And "if a
+        // datagram is received after the corresponding stream's receive side is closed,
+        // the received datagrams MUST be silently dropped".
+        const owner = self.requests.getPtr(stream) orelse {
+            self.datagrams_dropped += 1;
+            return;
+        };
+        // §2.1: dropped once the receive side is closed, for both roles — the exchange
+        // it belonged to is over.
+        if (owner.fin_seen) {
+            self.datagrams_dropped += 1;
+            return;
+        }
+
+        if (self.datagram_queue.items.len == max_queued_datagrams) {
+            gpa.free(self.datagram_queue.orderedRemove(0).payload);
+            self.datagrams_dropped += 1;
+        }
+        const owned = try gpa.dupe(u8, rest);
+        errdefer gpa.free(owned);
+        try self.datagram_queue.append(gpa, .{ .stream = stream, .payload = owned });
+        try self.events.append(gpa, .{ .datagram = .{
+            .stream = stream,
+            .len = owned.len,
+        } });
+    }
+
     /// Feed one datagram, then translate whatever the transport surfaced.
     pub fn receive(self: *Connection, gpa: Allocator, datagram: []const u8) !void {
         self.transport.receive(gpa, datagram) catch |err| return err;
@@ -323,6 +498,7 @@ pub const Connection = struct {
         while (self.transport.nextEvent()) |event| {
             switch (event) {
                 .established => try self.onEstablished(gpa),
+                .datagram => try self.onDatagram(gpa),
                 .stream_readable => |e| try self.onReadable(gpa, e.id, e.fin),
                 .stream_reset => |e| {
                     // The peer abandoned a response. RFC 9204 §4.4.2 would have
@@ -373,7 +549,7 @@ pub const Connection = struct {
         // field-section bound; QPACK capacity and blocked streams stay at
         // their defaults of zero by *omission* — §7.2.4.2 makes omitted and
         // default indistinguishable, so sending zeros would say nothing.
-        var advertised: [2]frame.Setting = undefined;
+        var advertised: [3]frame.Setting = undefined;
         advertised[0] = .{
             .id = frame.Setting.max_field_section_size,
             .value = self.max_field_section_size,
@@ -386,6 +562,15 @@ pub const Connection = struct {
         // 0, which cannot arise here because HTTP/3 sends SETTINGS exactly once.
         if (self.enable_connect_protocol) {
             advertised[advertised_len] = .{ .id = frame.Setting.enable_connect_protocol, .value = 1 };
+            advertised_len += 1;
+        }
+        // RFC 9297 §2.1.1, and the same omit-when-false rule. §2.1.1 recommends always
+        // sending 1 to avoid "sticking out" (§4); that recommendation is about a
+        // deployment's traffic analysis posture rather than about correctness, and it
+        // is the application that knows whether it wants to receive datagrams at all —
+        // so it is an option, and the reasoning is here rather than lost.
+        if (self.enable_datagram) {
+            advertised[advertised_len] = .{ .id = frame.Setting.h3_datagram, .value = 1 };
             advertised_len += 1;
         }
         len += frame.writeSettings(buf[len..], advertised[0..advertised_len]);
@@ -452,7 +637,11 @@ pub const Connection = struct {
                 sent_connect = std.mem.eql(u8, field.value, "CONNECT");
             }
         }
-        try self.requests.put(gpa, id, .{ .sent_connect = sent_connect });
+        // `fin_sent` is recorded here rather than beside the `finishStream` above,
+        // because the entry does not exist yet at that point — RFC 9297 §2.1 reads this
+        // flag to decide whether a datagram may be sent, and a flag set on an absent
+        // entry is a flag that is always false.
+        try self.requests.put(gpa, id, .{ .sent_connect = sent_connect, .fin_sent = fin });
         return id;
     }
 
@@ -466,7 +655,13 @@ pub const Connection = struct {
         );
         _ = try self.transport.write(gpa, id, header[0..header_len]);
         _ = try self.transport.write(gpa, id, bytes);
-        if (fin) try self.transport.finishStream(id);
+        if (fin) {
+            try self.transport.finishStream(id);
+            // RFC 9297 §2.1 needs to know the send side has closed; recorded at every
+            // point a FIN leaves, because a flag that is right in two places out of
+            // three is worse than none.
+            if (self.requests.getPtr(id)) |req| req.fin_sent = true;
+        }
     }
 
     /// Send a response header section on a request stream.
@@ -496,7 +691,10 @@ pub const Connection = struct {
         );
         _ = try self.transport.write(gpa, stream, header[0..header_len]);
         _ = try self.transport.write(gpa, stream, encoded.items);
-        if (fin) try self.transport.finishStream(stream);
+        if (fin) {
+            try self.transport.finishStream(stream);
+            if (self.requests.getPtr(stream)) |req| req.fin_sent = true;
+        }
     }
 
     /// §4.1.1: cancel an exchange, in whichever directions are still open.
@@ -1712,8 +1910,17 @@ pub const TestPair = struct { client: Connection, server: Connection };
 /// fuzz targets. Public because those live in other modules, not because an
 /// application has any use for it.
 pub fn testPair(gpa: Allocator) !TestPair {
-    return testPairWith(gpa, false);
+    return testPairWith(gpa, .{});
 }
+
+/// Which extensions the pair negotiates. A struct rather than positional flags: two
+/// bools in a call are two chances to swap them.
+pub const TestPairOptions = struct {
+    /// RFC 9220 §3's setting, which is all the extension changes about setup.
+    connect_protocol: bool = false,
+    /// RFC 9297 §2.1.1's setting, and with it RFC 9221's transport parameter.
+    datagram: bool = false,
+};
 
 /// `connect_protocol` makes the server advertise RFC 9220's setting, which is the
 /// only difference the extension makes to a connection's setup.
@@ -1721,7 +1928,8 @@ pub fn testPair(gpa: Allocator) !TestPair {
 /// Public because the WebSocket binding in `http3/websocket.zig` needs a pair with
 /// the extension enabled, and a second copy of this setup would be a second thing to
 /// keep in step with the handshake.
-pub fn testPairWith(gpa: Allocator, connect_protocol: bool) !TestPair {
+pub fn testPairWith(gpa: Allocator, options: TestPairOptions) !TestPair {
+    const connect_protocol = options.connect_protocol;
     h3_identity = quic.server.testIdentity();
     const client_cid = quic.packet.ConnectionId.init(&.{ 0xc0, 0xc1, 0xc2, 0xc3 }) catch unreachable;
     const server_cid = quic.packet.ConnectionId.init(&.{ 0x50, 0x51, 0x52, 0x53 }) catch unreachable;
@@ -1734,6 +1942,10 @@ pub fn testPairWith(gpa: Allocator, connect_protocol: bool) !TestPair {
         .verification = null,
         .local_cid = client_cid,
         .initial_destination = dcid,
+        // Deliberately not `enable_connect_protocol`: RFC 8441 §3 says receipt by a
+        // server "does not have any impact", so a client advertising it says nothing,
+        // and a test asserting the server saw nothing is asserting something real.
+        .enable_datagram = options.datagram,
     }, @splat(0x71));
     errdefer client.deinit(gpa);
     var server = try Connection.initServer(.{
@@ -1743,6 +1955,7 @@ pub fn testPairWith(gpa: Allocator, connect_protocol: bool) !TestPair {
         .original_destination = dcid,
         .peer_cid = client_cid,
         .enable_connect_protocol = connect_protocol,
+        .enable_datagram = options.datagram,
     }, @splat(0x72));
     errdefer server.deinit(gpa);
     try client.start(gpa);
@@ -2389,7 +2602,7 @@ test "http3: extended CONNECT needs the peer's permission first" {
 
 test "http3: an advertised setting makes extended CONNECT usable end to end" {
     const gpa = testing.allocator;
-    var pair = try testPairWith(gpa, true);
+    var pair = try testPairWith(gpa, .{ .connect_protocol = true });
     const client = &pair.client;
     const server = &pair.server;
     defer client.deinit(gpa);
@@ -2724,4 +2937,151 @@ test "http3: a bodyless request reports its end once, whichever packet the FIN r
         try testing.expectEqual(@as(usize, 1), ends);
         try testing.expect(server.close_code == null);
     }
+}
+
+test "http3: RFC 9297 datagrams travel with their stream, and the rules that bound them" {
+    // The mapping in one test: SETTINGS_H3_DATAGRAM in both directions, the Quarter
+    // Stream ID in front of the payload, and each of §2.1's drop rules.
+    const gpa = testing.allocator;
+    var pair = try testPairWith(gpa, .{ .datagram = true });
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    // §2.1.1: both sent and received with a value of 1, *and* RFC 9221 §3's transport
+    // parameter — either missing means datagrams stay unusable.
+    try testing.expect(client.peerSettings().?.h3_datagram);
+    try testing.expect(client.datagramsAllowed());
+    try testing.expect(server.datagramsAllowed());
+
+    var fields: [8]qpack.FieldLine = undefined;
+    // Two requests, and the datagram goes on the *second*. Stream 0 has a Quarter
+    // Stream ID of 0, so a mapping that forgot the prefix entirely would look correct
+    // on it — the first version of this test used stream 0 and did not notice.
+    _ = try client.request(
+        gpa,
+        requestFields("POST", "https", "example.test", "/first", &.{}, &fields),
+        false,
+    );
+    const stream = try client.request(
+        gpa,
+        requestFields("POST", "https", "example.test", "/flow", &.{}, &fields),
+        false, // the send side stays open: §2.1 requires it for sending datagrams
+    );
+    try testing.expect(stream > 0);
+    try testing.expectEqual(@as(u64, 1), stream / 4);
+    try pumpH3(gpa, client, server, 8);
+    // The server has to know the stream before a datagram for it can be delivered.
+    while (server.nextEvent()) |_| {}
+
+    // §2.1: the association is the stream ID divided by four, in front of the payload.
+    try client.sendDatagram(gpa, stream, "tick");
+    try pumpH3(gpa, client, server, 8);
+
+    var got: ?struct { stream: u64, len: usize } = null;
+    while (server.nextEvent()) |event| switch (event) {
+        .datagram => |d| got = .{ .stream = d.stream, .len = d.len },
+        else => {},
+    };
+    try testing.expectEqual(stream, got.?.stream);
+    const received = server.readDatagram().?;
+    try testing.expectEqual(stream, received.stream);
+    try testing.expectEqualStrings("tick", received.payload);
+    server.consumeDatagram(gpa);
+
+    // And back the other way, which is what makes them bidirectional (§2).
+    try server.sendDatagram(gpa, stream, "tock");
+    try pumpH3(gpa, client, server, 8);
+    var back: ?[]const u8 = null;
+    while (client.nextEvent()) |event| switch (event) {
+        .datagram => back = client.readDatagram().?.payload,
+        else => {},
+    };
+    try testing.expectEqualStrings("tock", back.?);
+    client.consumeDatagram(gpa);
+
+    // §2.1: a Quarter Stream ID naming a stream that does not exist is dropped
+    // silently, not an error — "SHALL either drop that datagram silently or buffer it".
+    const dropped_before = server.datagrams_dropped;
+    var unknown: [9]u8 = undefined;
+    // Quarter 1024, so stream 4096 — a client-initiated bidirectional ID that exists in
+    // the numbering and not on this connection.
+    const unknown_len = quic.varint.encode(&unknown, 1024);
+    unknown[unknown_len] = 'x';
+    try client.transport.sendDatagram(gpa, unknown[0 .. unknown_len + 1]);
+    try pumpH3(gpa, client, server, 8);
+    try testing.expect(server.datagrams_dropped > dropped_before);
+
+    // §2.1: "the largest legal value of the Quarter Stream ID field is 2^60-1", and a
+    // larger one is a connection error of type H3_DATAGRAM_ERROR — not a drop, because
+    // a value that cannot name a stream means the peer is not speaking this mapping.
+    var oversized: [9]u8 = undefined;
+    const n = quic.varint.encode(&oversized, (@as(u64, 1) << 60));
+    try client.transport.sendDatagram(gpa, oversized[0..n]);
+    pumpUntilFailure(gpa, client, server, 4);
+    try testing.expectEqual(@as(?u64, frame.errorCode(error.DatagramError)), server.close_code);
+    try testing.expectEqual(@as(u64, 0x33), frame.errorCode(error.DatagramError));
+}
+
+test "http3: datagrams need the setting from both sides, and an open send side" {
+    // The two refusals §2.1 and §2.1.1 require, and they are refusals rather than
+    // silent drops because a caller that cannot send needs to know before it builds a
+    // protocol on top.
+    const gpa = testing.allocator;
+
+    // A pair that never advertised the setting.
+    var plain = try testPair(gpa);
+    defer plain.client.deinit(gpa);
+    defer plain.server.deinit(gpa);
+    try pumpH3(gpa, &plain.client, &plain.server, 16);
+    try testing.expect(!plain.client.datagramsAllowed());
+    try testing.expectError(
+        error.DatagramsUnsupported,
+        plain.client.sendDatagram(gpa, 0, "x"),
+    );
+
+    var pair = try testPairWith(gpa, .{ .datagram = true });
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+    try pumpH3(gpa, client, server, 16);
+
+    var fields: [8]qpack.FieldLine = undefined;
+    const stream = try client.request(
+        gpa,
+        requestFields("GET", "https", "example.test", "/done", &.{}, &fields),
+        true, // finished sending, which §2.1 makes the disqualifying condition
+    );
+    try testing.expectError(
+        error.DatagramStreamClosed,
+        client.sendDatagram(gpa, stream, "too late"),
+    );
+
+    // §2.1: the association is a client-initiated bidirectional stream, so an ID that
+    // is not one cannot be named by a Quarter Stream ID at all.
+    try testing.expectError(
+        error.DatagramStreamInvalid,
+        client.sendDatagram(gpa, 3, "wrong kind"),
+    );
+
+    // §2.1.1 in isolation: the *setting* must have been received with a value of 1, and
+    // that is a separate negotiation from RFC 9221's transport parameter. Cleared
+    // directly, because a pair that disabled both would pass this check for the wrong
+    // reason — which is what the first version of this test did.
+    const open_stream = try client.request(
+        gpa,
+        requestFields("POST", "https", "example.test", "/still-open", &.{}, &fields),
+        false,
+    );
+    try client.sendDatagram(gpa, open_stream, "fine");
+    try testing.expect(client.transport.datagramsAllowed());
+    client.peer_settings.?.h3_datagram = false;
+    try testing.expect(!client.datagramsAllowed());
+    try testing.expectError(
+        error.DatagramsUnsupported,
+        client.sendDatagram(gpa, open_stream, "not fine"),
+    );
 }

@@ -58,6 +58,9 @@ pub const Type = enum(u64) {
     connection_close_transport = 0x1c,
     connection_close_application = 0x1d,
     handshake_done = 0x1e,
+    /// RFC 9221 §4. The low bit is the LEN flag, exactly as for STREAM frames.
+    datagram = 0x30,
+    datagram_len = 0x31,
     _,
 };
 
@@ -284,6 +287,10 @@ pub const Frame = union(enum) {
     path_response: *const [path_data_len]u8,
     connection_close: ConnectionClose,
     handshake_done,
+    /// RFC 9221: application data that will not be retransmitted. Borrowed from the
+    /// packet being parsed on the way in, and from the caller on the way out — the
+    /// same contract every other payload-carrying frame here has.
+    datagram: []const u8,
 
     /// §13.2: whether receiving this frame obliges an acknowledgement. ACK,
     /// PADDING and CONNECTION_CLOSE do not, and that exclusion is what stops
@@ -315,6 +322,9 @@ pub const Frame = union(enum) {
             // §12.4: ACK and CRYPTO are forbidden in 0-RTT.
             .ack, .crypto => space != .zero_rtt,
             .new_token, .path_response, .handshake_done => space == .one_rtt,
+            // RFC 9221 §5: "Like STREAM frames, DATAGRAM frames contain application
+            // data and MUST be protected with either 0-RTT or 1-RTT keys."
+            .datagram => space == .zero_rtt or space == .one_rtt,
             .connection_close => |close| if (close.is_application)
                 // §12.4: an application close needs an application, which does
                 // not exist before the handshake keys do.
@@ -413,6 +423,18 @@ pub fn parse(src: *[]const u8) Error!Frame {
             } };
         },
         .handshake_done => .handshake_done,
+        // RFC 9221 §4: the LEN bit decides whether a length is present, and with it
+        // clear "the Datagram Data field extends to the end of the packet". Empty
+        // datagrams are explicitly allowed, so a zero length is not an error.
+        .datagram, .datagram_len => blk: {
+            const with_length = type_value == @backingInt(Type.datagram_len);
+            const data = if (with_length) try varint.takeBytes(src) else rest: {
+                const all = src.*;
+                src.* = src.*[src.len..];
+                break :rest all;
+            };
+            break :blk .{ .datagram = data };
+        },
         // §19: unlike HTTP/2, an unknown frame type is fatal. Extensions are
         // agreed through transport parameters, so an unnegotiated type means the
         // peer has a different idea of what was agreed than we do.
@@ -542,6 +564,10 @@ pub fn encodedLen(frame: Frame) usize {
     return switch (frame) {
         .padding => |count| @intCast(count),
         .ping, .handshake_done => 1,
+        // Always encoded with an explicit length (type 0x31): the length-less form
+        // only works as the last frame in a packet, and making that a property of the
+        // caller's frame ordering would be a trap for one saved byte.
+        .datagram => |data| 1 + varint.encodedLen(data.len) + data.len,
         .ack => |ack| blk: {
             var len: usize = 1 + varint.encodedLen(ack.largest) +
                 varint.encodedLen(ack.delay) + varint.encodedLen(ack.range_count) +
@@ -601,6 +627,12 @@ pub fn encode(dest: []u8, frame: Frame) usize {
         },
         .ping => {
             i += putType(dest[i..], .ping);
+        },
+        .datagram => |data| {
+            i += putType(dest[i..], .datagram_len);
+            i += varint.encode(dest[i..], data.len);
+            @memcpy(dest[i..][0..data.len], data);
+            i += data.len;
         },
         .handshake_done => {
             i += putType(dest[i..], .handshake_done);

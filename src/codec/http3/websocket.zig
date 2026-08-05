@@ -407,7 +407,7 @@ test "http3 websocket: a CONNECT tunnel carries real WebSocket frames both ways"
     defer threaded.deinit();
     const io = threaded.io();
 
-    var pair = try connection_mod.testPairWith(gpa, true);
+    var pair = try connection_mod.testPairWith(gpa, .{ .connect_protocol = true });
     const client = &pair.client;
     const server = &pair.server;
     defer client.deinit(gpa);

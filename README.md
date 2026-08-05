@@ -38,7 +38,7 @@ handshake written here, because Netty binds Quiche and the standard library has 
 TLS server; see [HTTP3.md](HTTP3.md) and [TLS.md](TLS.md) — Redis RESP2/RESP3,
 datagram (UDP) endpoints, a DNS resolver, TLS 1.3 on both sides of a connection, a
 bounded client connection pool, and `EmbeddedChannel` for testing pipelines without
-sockets. 789 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
+sockets. 793 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
 all under a leak-checking allocator, plus twenty-two fuzz targets. The same suite
 also runs **on fibers** rather than threads — see [Choosing an `Io`](#choosing-an-io).
 
@@ -279,6 +279,8 @@ graph TB
 | HPACK `Encoder` / `Decoder` | `http2.hpack` | RFC 7541, verified against Appendix C |
 | `codec-quic` (incubator) | `quic.connection.Connection` | Netty binds Cloudflare's Quiche over JNI; this is RFC 9000/9001/9002 implemented here, client role |
 | `codec-http3` (incubator) | `http3.connection.Connection` | Datagrams in, events out, no sockets; see [HTTP3.md](HTTP3.md) |
+| — | `quic.connection.sendDatagram` | RFC 9221's unreliable DATAGRAM frames: ack-eliciting, never retransmitted, bounded because they have no flow control |
+| — | `http3.connection.sendDatagram` | RFC 9297 HTTP Datagrams over those frames, with the Quarter Stream ID mapping |
 | — | `http3.client.Client` | The connection mounted on a `datagram.Endpoint`, with QUIC's timers driven by ticks |
 | QPACK `QpackEncoder` / `QpackDecoder` | `http3.qpack` | RFC 9204 at zero table capacity — the default every connection starts in; Huffman shared with HPACK |
 | `WeightedFairQueueByteDistributor` | `http2.flow.Scheduler` | Round robin, one frame per stream per pass; no priority tree (§5.3.1 deprecates it) |

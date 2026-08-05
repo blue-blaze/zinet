@@ -79,6 +79,11 @@ const Collector = struct {
             .peer_closed => |e| outcomes.putOne(self.io, .{ .closed = e.code }) catch {},
             .idle_timeout => outcomes.putOne(self.io, .timed_out) catch {},
             .goaway => {},
+            // RFC 9297: this example never enables datagrams, so one cannot arrive —
+            // the setting is off, and §2.1.1 forbids a peer sending them until it is
+            // both sent and received with a value of 1. Named rather than swept into an
+            // `else`, so that turning the option on shows up here as a decision.
+            .datagram => {},
             // §4.1.1: the server abandoned the exchange. Reported as an outcome
             // rather than ignored, because the code says whether this request could
             // be retried — which is the whole reason the code is carried.

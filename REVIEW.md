@@ -321,6 +321,32 @@ STREAM_LIMIT_ERROR, which §20.1 defines as a stream identifier exceeding an adv
 limit — not what happened. §19.11 names FRAME_ENCODING_ERROR, and an existing test had
 frozen the wrong answer.
 
+## Two tests that found real defects while being written
+
+Both halves of the datagram work produced a defect *from the test*, and both were the
+kind no amount of re-reading the code would have shown.
+
+**A datagram queued and never sent.** `send` asks `hasSomethingToSend` which levels are
+worth writing a packet for, and that function knew about crypto bytes, ACKs, path
+challenges, connection IDs and tokens — not about the new queue. So a datagram went out
+only when something *reliable* happened to be due, and an application sending nothing but
+datagrams would have sent nothing at all. RFC 9221 §5's "SHOULD be sent as soon as
+possible" became "whenever something else is". The end-to-end test failed with the payload
+still in the queue, which is exactly what it was written to notice.
+
+**A test blind to the thing it was testing.** The first version of the RFC 9297 test sent
+its datagram on stream 0, whose Quarter Stream ID is also 0 — so a mapping that omitted the
+prefix entirely produced identical bytes and the test passed. The mutation that removes the
+prefix survived, which is the signal that the test was wrong rather than the code right. It
+uses the second request stream now, and asserts the quarter is 1 before relying on it.
+
+A third finding came from a compiler assertion rather than a test, and is worth recording
+because it did its job: the transport parameter decoder tracked duplicates in a `u32`
+bitmap indexed by parameter identifier, with `assert(id_value <= 0x10)` to say so. RFC
+9221's identifier is 0x20. The assertion fired on the first datagram-enabled handshake
+instead of a bit silently shifting out of range, which is the difference between an
+assertion that documents an invariant and a comment that claims one.
+
 ## Method## Method
 
 The review walked the call path rather than the file list: accept → register →

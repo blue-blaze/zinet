@@ -2517,6 +2517,11 @@ fn recordH3Events(
 ) !void {
     while (conn.nextEvent()) |event| switch (event) {
         .established => try out.appendSlice(gpa, "EST;"),
+        // RFC 9297 datagrams are not part of this target's alphabet: the transcript is
+        // built from stream frames, and a datagram cannot arrive from one. Recorded
+        // rather than ignored so that a future generator emitting them cannot silently
+        // produce transcripts that compare equal by omission.
+        .datagram => try out.appendSlice(gpa, "DG;"),
         .headers => |e| {
             try out.appendSlice(gpa, "H:");
             // The end is *counted*, not recorded here. Which event carries it depends on

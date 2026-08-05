@@ -233,6 +233,15 @@ pub const Multiplexer = struct {
                 if (incoming.fin) multiplexer.finishInbound(incoming.stream);
                 return true;
             },
+            .datagram => {
+                // RFC 9297 §2: a datagram belongs to a request, but its *semantics* are
+                // the extension's — "HTTP Datagrams MUST only be sent with an
+                // association to an HTTP request that explicitly supports them". This
+                // multiplexer routes HTTP messages; an extension that wants datagrams
+                // reads them from the connection, which is why this is reported back as
+                // unhandled rather than turned into a stream message nobody asked for.
+                return false;
+            },
             .stream_reset => |reset_event| {
                 // §4.1.1: the exchange is over, and the code is what the handler
                 // needs — it decides whether the request may be retried. `reset`

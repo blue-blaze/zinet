@@ -227,6 +227,10 @@ pub const Event = union(enum) {
     /// §19.5: the peer no longer wants what we are sending on a stream, and §3.5
     /// obliges us to reset it.
     stream_stop_sending: struct { id: u64, code: u64 },
+    /// RFC 9221: a datagram arrived. Carries only its length, for the same reason
+    /// `stream_readable` carries only an ID: the bytes live in this connection's
+    /// inbound queue, and `readDatagram` hands them out until `consumeDatagram`.
+    datagram: struct { len: usize },
 };
 
 pub const Options = struct {
@@ -655,6 +659,23 @@ pub const Connection = struct {
     parameters: transport.Parameters,
     peer_parameters: ?transport.Parameters = null,
 
+    // ── RFC 9221 datagrams ──────────────────────────────────────────────────
+    /// Datagrams waiting to go out, and the ones that have arrived.
+    ///
+    /// Both are bounded, and the bound is the interesting part: RFC 9221 §5.3 gives
+    /// DATAGRAM frames *no* flow control and says a receiver "MAY drop them if it
+    /// cannot process them", which means the only thing standing between a peer and
+    /// this process's memory is a limit stated here. Dropping the oldest rather than
+    /// the newest on overflow, because an unreliable transport that prefers stale data
+    /// to fresh has the trade-off backwards.
+    outgoing_datagrams: std.ArrayList([]u8) = .empty,
+    incoming_datagrams: std.ArrayList([]u8) = .empty,
+    /// Datagrams dropped for want of room, in each direction. Observable because the
+    /// alternative to a bound is unbounded memory and the alternative to reporting is
+    /// a loss the application cannot distinguish from the network's.
+    datagrams_dropped_outbound: u64 = 0,
+    datagrams_dropped_inbound: u64 = 0,
+
     /// §8.1's address validation token, replayed in every Initial we send.
     token_buf: [max_token_len]u8 = undefined,
     token_len: usize = 0,
@@ -863,12 +884,101 @@ pub const Connection = struct {
         self.loss.deinit(gpa);
         for (&self.sent_meta) |*list| list.deinit(gpa);
         self.credit_rearm.deinit(gpa);
+        for (self.outgoing_datagrams.items) |payload| gpa.free(payload);
+        self.outgoing_datagrams.deinit(gpa);
+        for (self.incoming_datagrams.items) |payload| gpa.free(payload);
+        self.incoming_datagrams.deinit(gpa);
         self.* = undefined;
     }
 
     /// Begin: produces the ClientHello into the Initial space.
     pub fn start(self: *Connection, gpa: Allocator) !void {
         try self.engine.start(gpa);
+    }
+
+    /// How many datagrams either direction will hold before dropping.
+    ///
+    /// A count rather than a byte budget, because a DATAGRAM frame cannot be
+    /// fragmented — each one is at most a packet — so a count bounds memory to within
+    /// a factor of the MTU, and a count is what an application can reason about.
+    pub const max_queued_datagrams = 32;
+
+    /// RFC 9221 §5: send an unreliable datagram.
+    ///
+    /// Refusals rather than best-effort, because each is something the caller must
+    /// know: a datagram this connection is not allowed to send is not a datagram that
+    /// might arrive late.
+    pub fn sendDatagram(self: *Connection, gpa: Allocator, payload: []const u8) !void {
+        if (self.state != .active) return error.ConnectionClosed;
+        // §3: "An endpoint MUST NOT send DATAGRAM frames until it has received the
+        // max_datagram_frame_size transport parameter with a non-zero value." Ours
+        // says what we will *receive*; the peer's is what bounds what we may send.
+        const peer = self.peer_parameters orelse return error.DatagramsUnsupported;
+        if (peer.max_datagram_frame_size == 0) return error.DatagramsUnsupported;
+        const framed = 1 + varint.encodedLen(payload.len) + payload.len;
+        if (framed > peer.max_datagram_frame_size) return error.DatagramTooLarge;
+        // And a limit of ours: a frame that cannot fit a packet cannot be sent at all,
+        // since §5 forbids fragmenting one.
+        if (framed > max_datagram) return error.DatagramTooLarge;
+
+        if (self.outgoing_datagrams.items.len == max_queued_datagrams) {
+            return error.DatagramQueueFull;
+        }
+        const owned = try gpa.dupe(u8, payload);
+        errdefer gpa.free(owned);
+        try self.outgoing_datagrams.append(gpa, owned);
+    }
+
+    /// The oldest datagram that has arrived, or null.
+    pub fn readDatagram(self: *const Connection) ?[]const u8 {
+        if (self.incoming_datagrams.items.len == 0) return null;
+        return self.incoming_datagrams.items[0];
+    }
+
+    /// Release the datagram `readDatagram` returned.
+    pub fn consumeDatagram(self: *Connection, gpa: Allocator) void {
+        if (self.incoming_datagrams.items.len == 0) return;
+        gpa.free(self.incoming_datagrams.orderedRemove(0));
+    }
+
+    /// Whether the peer said it will receive datagrams (RFC 9221 §3), which an
+    /// application protocol has to ask before it can rely on them — §3 requires
+    /// every such protocol to "define how they react to the absence" of the
+    /// parameter.
+    pub fn datagramsAllowed(self: *const Connection) bool {
+        const peer = self.peer_parameters orelse return false;
+        return peer.max_datagram_frame_size != 0;
+    }
+
+    /// The largest payload `sendDatagram` will accept right now, or null when the peer
+    /// does not take datagrams at all. Offered because the alternative is for every
+    /// caller to re-derive the frame overhead, and getting that wrong produces frames
+    /// the peer must treat as a protocol violation.
+    pub fn maxDatagramPayload(self: *const Connection) ?usize {
+        const peer = self.peer_parameters orelse return null;
+        if (peer.max_datagram_frame_size == 0) return null;
+        const budget = @min(peer.max_datagram_frame_size, max_datagram);
+        if (budget < 3) return null;
+        // One byte of type, and the length field grows with the payload — solved by
+        // trying the largest encoding first, which is exact rather than conservative.
+        var payload = budget - 1;
+        while (payload > 0 and 1 + varint.encodedLen(payload) + payload > budget) {
+            payload -= 1;
+        }
+        return payload;
+    }
+
+    fn acceptDatagram(self: *Connection, gpa: Allocator, payload: []const u8) !void {
+        // §5.3: unreliable both ways. A receiver that cannot hold it drops it, and
+        // says so, rather than growing to fit whatever the peer sends.
+        if (self.incoming_datagrams.items.len == max_queued_datagrams) {
+            gpa.free(self.incoming_datagrams.orderedRemove(0));
+            self.datagrams_dropped_inbound += 1;
+        }
+        const owned = try gpa.dupe(u8, payload);
+        errdefer gpa.free(owned);
+        try self.incoming_datagrams.append(gpa, owned);
+        try self.events.append(gpa, .{ .datagram = .{ .len = owned.len } });
     }
 
     pub fn isEstablished(self: *const Connection) bool {
@@ -1884,6 +1994,21 @@ pub const Connection = struct {
                 .retire_connection_id => |sequence| {
                     self.local.retire(sequence) catch return error.ProtocolViolation;
                 },
+                .datagram => |data| {
+                    // RFC 9221 §3, both MUSTs, and they are about *our* advertisement
+                    // rather than the peer's: an endpoint that receives a DATAGRAM
+                    // frame without having advertised support, or one larger than the
+                    // size it advertised, terminates the connection with
+                    // PROTOCOL_VIOLATION. The size compared is the whole frame, not
+                    // the payload — the parameter's definition includes the type and
+                    // length fields, and a receiver that forgot that would accept
+                    // frames it told its peer it would not.
+                    const limit = self.parameters.max_datagram_frame_size;
+                    if (limit == 0) return error.ProtocolViolation;
+                    const framed = 1 + varint.encodedLen(data.len) + data.len;
+                    if (framed > limit) return error.ProtocolViolation;
+                    try self.acceptDatagram(gpa, data);
+                },
                 .handshake_done => {
                     // §4.1.2 of RFC 9001: only the server sends this, and it is
                     // what confirms the handshake for a client. §19.20 makes
@@ -2497,6 +2622,12 @@ pub const Connection = struct {
         // A NEW_TOKEN owed to the client (§19.7).
         if (level == .one_rtt and self.owesNewToken()) return true;
 
+        // RFC 9221 §5: a datagram waiting. Without this the frame would sit in the
+        // queue until some *other* reason to send appeared, which for an application
+        // sending only datagrams is never — and "as soon as possible" would come to
+        // mean "whenever something reliable happens to be due".
+        if (level == .one_rtt and self.outgoing_datagrams.items.len > 0) return true;
+
         // A STOP_SENDING owed to the peer. Here as well as in `writeFrames`, for
         // the reason stated below it.
         if (level == .one_rtt and self.owesStopSending()) return true;
@@ -2629,6 +2760,7 @@ pub const Connection = struct {
         var payload: [max_datagram]u8 = undefined;
         var meta: SentMeta = .{ .number = pn };
         const payload_len = self.writeFrames(
+            gpa,
             payload[0..@min(payload_room, payload.len)],
             level,
             // Padding is expressed in terms of the finished datagram, so work
@@ -2692,6 +2824,7 @@ pub const Connection = struct {
 
     fn writeFrames(
         self: *Connection,
+        gpa: Allocator,
         dest: []u8,
         level: Level,
         pad_to: usize,
@@ -2880,6 +3013,26 @@ pub const Connection = struct {
                 // Expanding the datagram to 1200 bytes (§8.2.1) is decided before
                 // any frame is written — see `needs_padding` in `send`, which asks
                 // the same question this branch does.
+            }
+        }
+
+        // RFC 9221 §5: "This frame SHOULD be sent as soon as possible", so datagrams go
+        // in ahead of stream data — an unreliable payload that waits behind a reliable
+        // one has lost the property it was sent for.
+        //
+        // Nothing about them is recorded in `meta`, and that omission *is* §5.2:
+        // "DATAGRAM frames are not retransmitted upon loss detection". Every other
+        // payload here leaves a note so a lost packet can re-send it; a datagram
+        // deliberately leaves none. It is still ack-eliciting, which §5.2 requires and
+        // which the flag below gives it.
+        if (level == .one_rtt and !terminal) {
+            while (self.outgoing_datagrams.items.len > 0) {
+                const payload = self.outgoing_datagrams.items[0];
+                const f: frame.Frame = .{ .datagram = payload };
+                if (len + frame.encodedLen(f) > dest.len) break;
+                len += frame.encode(dest[len..], f);
+                meta.ack_eliciting = true;
+                gpa.free(self.outgoing_datagrams.orderedRemove(0));
             }
         }
 
@@ -6226,7 +6379,7 @@ test "connection: announcements that do not fit wait for the next packet" {
     // + 8 bytes of ID + a 16-byte token is 29, and an ACK may precede it.
     var payload: [64]u8 = undefined;
     var meta: SentMeta = .{ .number = 0 };
-    const written = srv.writeFrames(&payload, .one_rtt, 0, &meta);
+    const written = srv.writeFrames(gpa, &payload, .one_rtt, 0, &meta);
     try testing.expect(written > 0);
 
     // Some went out, the rest are still queued rather than gone.
@@ -6855,4 +7008,115 @@ test "connection: §10.2.3 an application close is converted before the handshak
     try testing.expect(!close.is_application); // 0x1c, not 0x1d
     try testing.expectEqual(@as(u64, 0x0c), close.error_code); // APPLICATION_ERROR
     try testing.expectEqual(@as(usize, 0), close.reason.len);
+}
+
+test "connection: RFC 9221 datagrams cross a connection and are not retransmitted" {
+    // The extension in one place: negotiation, both size MUSTs, and the property the
+    // whole thing exists for — a lost datagram stays lost.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xd7);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    try exchange(gpa, cl, srv, 8);
+
+    // §3: not until the peer's parameter has been received with a non-zero value.
+    // `establishedPair` negotiates without it, so this pair may not send.
+    try testing.expect(!cl.datagramsAllowed());
+    try testing.expectError(error.DatagramsUnsupported, cl.sendDatagram(gpa, "x"));
+
+    // Both sides now say they will receive them. Set directly because the handshake
+    // that carried the parameters is already over in this pair.
+    cl.peer_parameters.?.max_datagram_frame_size = 1200;
+    srv.peer_parameters.?.max_datagram_frame_size = 1200;
+    cl.parameters.max_datagram_frame_size = 1200;
+    srv.parameters.max_datagram_frame_size = 1200;
+    try testing.expect(cl.datagramsAllowed());
+
+    // §3: nothing larger than the peer's advertised size, and the size is the *frame*
+    // — type and length included — which is why the payload limit is short of 1200.
+    const limit = cl.maxDatagramPayload().?;
+    try testing.expect(limit < 1200);
+    try testing.expect(1 + varint.encodedLen(limit) + limit <= 1200);
+    const oversized: [1300]u8 = @splat(0);
+    try testing.expectError(error.DatagramTooLarge, cl.sendDatagram(gpa, &oversized));
+
+    try cl.sendDatagram(gpa, "unreliable");
+    try exchange(gpa, cl, srv, 4);
+
+    var saw: ?usize = null;
+    while (srv.nextEvent()) |event| switch (event) {
+        .datagram => |d| saw = d.len,
+        else => {},
+    };
+    try testing.expectEqual(@as(?usize, 10), saw);
+    try testing.expectEqualStrings("unreliable", srv.readDatagram().?);
+    srv.consumeDatagram(gpa);
+    try testing.expect(srv.readDatagram() == null);
+
+    // §5.2: not retransmitted on loss. The queue is empty the moment the frame is
+    // written, and nothing in the packet's record mentions it — so declaring that
+    // packet lost re-sends everything else it carried and none of this.
+    try testing.expectEqual(@as(usize, 0), cl.outgoing_datagrams.items.len);
+
+    // §5.3: no flow control, so the only bound is the queue's. Filling it refuses
+    // rather than growing.
+    for (0..Connection.max_queued_datagrams) |_| try cl.sendDatagram(gpa, "q");
+    try testing.expectError(error.DatagramQueueFull, cl.sendDatagram(gpa, "q"));
+}
+
+test "connection: a datagram nobody advertised, or one too large, ends the connection" {
+    // §3's two receive-side MUSTs. Both are PROTOCOL_VIOLATION, and both are about what
+    // *we* advertised — an endpoint that accepted more than it promised would have made
+    // its own advertisement meaningless.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xd8);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+    try exchange(gpa, cl, srv, 8);
+
+    var frames: [64]u8 = undefined;
+    const len = frame.encode(&frames, .{ .datagram = "hello" });
+
+    // Never advertised: the server's own parameter is zero.
+    try testing.expectEqual(@as(u64, 0), srv.parameters.max_datagram_frame_size);
+    try testing.expectError(
+        error.ProtocolViolation,
+        injectOneRttOn(gpa, cl, srv, frames[0..len], 0x1234),
+    );
+    // §11.1's signalling applies here as to any other violation.
+    try testing.expectEqual(@as(u64, 0x0a), srv.close_info.?.code);
+
+    // Advertised, but smaller than what arrives.
+    var second = try establishedPair(gpa, 0xd9);
+    const cl2 = &second.a;
+    const srv2 = &second.b;
+    defer cl2.deinit(gpa);
+    defer srv2.deinit(gpa);
+    try exchange(gpa, cl2, srv2, 8);
+    // Room for a three-byte frame: type, length, one byte of payload.
+    srv2.parameters.max_datagram_frame_size = 3;
+    try testing.expectError(
+        error.ProtocolViolation,
+        injectOneRttOn(gpa, cl2, srv2, frames[0..len], 0x1234),
+    );
+
+    // And exactly at the limit is accepted, which is what makes the check a boundary
+    // rather than an approximation.
+    var third = try establishedPair(gpa, 0xda);
+    const cl3 = &third.a;
+    const srv3 = &third.b;
+    defer cl3.deinit(gpa);
+    defer srv3.deinit(gpa);
+    try exchange(gpa, cl3, srv3, 8);
+    srv3.parameters.max_datagram_frame_size = 3;
+    const exact = frame.encode(&frames, .{ .datagram = "!" });
+    try testing.expectEqual(@as(usize, 3), exact);
+    try injectOneRttOn(gpa, cl3, srv3, frames[0..exact], 0x1234);
+    try testing.expectEqualStrings("!", srv3.readDatagram().?);
+    srv3.consumeDatagram(gpa);
 }

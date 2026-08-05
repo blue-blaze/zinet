@@ -57,6 +57,10 @@ pub const Id = enum(u64) {
     active_connection_id_limit = 0x0e,
     initial_source_connection_id = 0x0f,
     retry_source_connection_id = 0x10,
+    /// RFC 9221 §3: how large a DATAGRAM frame this endpoint will receive, or 0 for
+    /// "not at all". An extension parameter rather than a core one, which is why the
+    /// value is out past 0x10.
+    max_datagram_frame_size = 0x20,
     _,
 
     /// §18.2: four parameters are the server's alone. A client sending one is
@@ -130,6 +134,15 @@ pub const Parameters = struct {
     max_ack_delay_ms: u64 = 25,
     disable_active_migration: bool = false,
     active_connection_id_limit: u64 = min_active_connection_id_limit,
+    /// RFC 9221 §3: the largest DATAGRAM frame this endpoint will receive, *including*
+    /// the frame type and length fields — not just the payload, which is the detail
+    /// worth getting right because a sender that forgets the overhead sends a frame
+    /// its peer must treat as a PROTOCOL_VIOLATION.
+    ///
+    /// Zero means unsupported, and is the default because §3 makes it one: "the
+    /// default for this parameter is 0, which indicates that the endpoint does not
+    /// support DATAGRAM frames". An application that wants them says so.
+    max_datagram_frame_size: u64 = 0,
 
     /// §7.3: the connection ID this endpoint put in the Source Connection ID
     /// field of its first packet. Both roles send it, and both check it.
@@ -277,6 +290,12 @@ fn write(sink: anytype, params: *const Parameters, role: Role) void {
     if (params.active_connection_id_limit != min_active_connection_id_limit) {
         put.integer(sink, .active_connection_id_limit, params.active_connection_id_limit);
     }
+    // RFC 9221 §3: omitted rather than sent as zero when unsupported, because absence
+    // and zero mean the same thing and the shorter encoding is the one a peer that
+    // never heard of the extension will ignore either way.
+    if (params.max_datagram_frame_size != 0) {
+        put.integer(sink, .max_datagram_frame_size, params.max_datagram_frame_size);
+    }
     if (params.initial_source_connection_id) |cid| {
         put.blob(sink, .initial_source_connection_id, cid.slice());
     }
@@ -318,7 +337,10 @@ pub fn decode(bytes: []const u8, sender: Role) Error!Parameters {
     // A bitmask rather than an EnumSet: `Id` is non-exhaustive so its tag values
     // reach 2^62, and only the seventeen §18.2 defines can be duplicated in a way
     // that matters — unknown ones are ignored before they get here.
-    var seen: u32 = 0;
+    // One bit per identifier, and 64 rather than 32 because RFC 9221's
+    // `max_datagram_frame_size` is 0x20 — an extension identifier that a 32-bit word
+    // cannot index. Widened with the assertion below rather than after a crash.
+    var seen: u64 = 0;
 
     var rest = bytes;
     while (rest.len > 0) {
@@ -337,8 +359,13 @@ pub fn decode(bytes: []const u8, sender: Role) Error!Parameters {
 
         // §18: a duplicate is a connection error. Without this a peer could send
         // a safe value and then an unsafe one and see which the receiver kept.
-        assert(id_value <= @backingInt(Id.retry_source_connection_id));
-        const bit = @as(u32, 1) << @intCast(id_value);
+        //
+        // The bitmap is indexed by identifier, so it has to cover every identifier
+        // this decoder claims to know — which stopped being "0x00 through 0x10" when
+        // RFC 9221's 0x20 arrived. The assertion caught exactly that, which is what it
+        // was for; the fix is a wider word rather than a narrower claim.
+        assert(id_value <= @backingInt(Id.max_datagram_frame_size));
+        const bit = @as(u64, 1) << @intCast(id_value);
         if (seen & bit != 0) return error.TransportParameterError;
         seen |= bit;
 
@@ -390,6 +417,7 @@ pub fn decode(bytes: []const u8, sender: Role) Error!Parameters {
                 if (limit < min_active_connection_id_limit) return error.TransportParameterError;
                 params.active_connection_id_limit = limit;
             },
+            .max_datagram_frame_size => params.max_datagram_frame_size = try integer(value),
             .initial_source_connection_id => {
                 params.initial_source_connection_id = ConnectionId.init(value) catch
                     return error.TransportParameterError;
