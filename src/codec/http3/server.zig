@@ -41,6 +41,7 @@ const Message = @import("../../message.zig").Message;
 const Initializer = @import("../../channel.zig").Initializer;
 
 const quic = @import("../quic.zig");
+const rate_limit = @import("../rate_limit.zig");
 const connection_mod = @import("connection.zig");
 const Connection = connection_mod.Connection;
 const multiplex = @import("multiplex.zig");
@@ -76,9 +77,30 @@ pub const Options = struct {
     /// to find the ID in one is to know it in advance (§5.1).
     connection_id_len: u8 = 8,
     max_field_section_size: u64 = 64 * 1024,
-    /// Randomness. Injected like everything else here, so a test can make a whole
-    /// server reproducible; `null` asks the `Io` for it.
+    /// Randomness, and — because §10.3.2 derives stateless reset tokens from it —
+    /// the one input that decides whether this server can answer a peer that
+    /// still believes in a connection this server has forgotten.
+    ///
+    /// Injected like everything else here, so a test can make a whole server
+    /// reproducible; `null` asks the `Io` for it. **Pass a value that outlives the
+    /// process to make stateless reset work across a restart**, which is what
+    /// §10.3 is mostly for: a server that generates this per start can only reset
+    /// connections it forgot while running. Sharing it across a fleet has the same
+    /// effect and the caveat §21.11 names — see `statelessResetsSent`.
     seed: ?[32]u8 = null,
+    /// How many stateless resets this server may send per window (§10.3.3).
+    ///
+    /// The window is global rather than per remote address, which is a deliberate
+    /// departure from §10.3.3's suggestion: per-address limits need a map keyed by
+    /// something the peer chooses, and this layer exists precisely to answer
+    /// unknown packets *without* allocating anything an attacker can grow. The
+    /// looping the RFC worries about is prevented structurally instead — every
+    /// reset is strictly smaller than the packet that triggered it, so an exchange
+    /// of them shrinks to nothing; see `quic.acceptor.statelessResetLen`. What
+    /// remains is reflection at a spoofed address, and a ceiling per unit time is
+    /// the honest bound for that.
+    max_stateless_resets_per_window: u32 = 100,
+    stateless_reset_window: Io.Duration = .fromSeconds(1),
 };
 
 /// One accepted connection: the HTTP/3 connection, its stream multiplexer, and
@@ -160,6 +182,16 @@ pub const Handler = struct {
     /// reason `accepted` is: it is how a test can tell the announcements happened
     /// without reaching into a connection that another task owns.
     spares_total: usize = 0,
+    /// Stateless resets sent (§10.3), and the rate limit that bounds them.
+    ///
+    /// Observable because the assertion worth making is about *when* it moves: it
+    /// must stay at zero for every packet belonging to a live connection, since
+    /// §11 forbids a reset from an endpoint that still holds the state to send a
+    /// frame, and §21.11 makes an unnecessary reset a denial-of-service primitive.
+    resets_sent: usize = 0,
+    reset_limiter: rate_limit.Window = .{},
+    /// Makes each reset's unpredictable bytes differ; see `writeStatelessReset`.
+    reset_nonce: u64 = 0,
 
     pub const handler_name = "http3-server";
 
@@ -294,6 +326,31 @@ pub const Handler = struct {
 
         switch (decision) {
             .drop => return,
+            .stateless_reset => |r| {
+                // §11: only reachable because no connection claimed this datagram.
+                // An endpoint that still has the state to send a frame must send
+                // CONNECTION_CLOSE instead, and §21.11 makes a reset sent while the
+                // connection is in fact alive a way to terminate it from off path.
+                // The check that guarantees it is the lookup above this call.
+                if (r.destination.len != self.options.connection_id_len) return;
+                if (!self.reset_limiter.allow(
+                    self.now(),
+                    self.options.max_stateless_resets_per_window,
+                    @intCast(@max(0, self.options.stateless_reset_window.nanoseconds)),
+                )) return;
+
+                var out: [quic.acceptor.max_stateless_reset_len]u8 = undefined;
+                const len = quic.acceptor.writeStatelessReset(
+                    &out,
+                    bytes.len,
+                    &self.seed,
+                    r.destination,
+                    self.reset_nonce,
+                ) orelse return;
+                self.reset_nonce += 1;
+                self.resets_sent += 1;
+                try self.sendRaw(ctx, from, out[0..len]);
+            },
             .negotiate_version => |v| {
                 var out: [256]u8 = undefined;
                 const len = quic.acceptor.writeVersionNegotiation(
@@ -339,6 +396,19 @@ pub const Handler = struct {
                 std.mem.writeInt(u64, seed[32..40], self.cid_counter, .little);
                 @memcpy(seed[40..64], self.seed[0..24]);
 
+                // §10.3: the token for the connection ID chosen during the
+                // handshake, which a client cannot learn any other way — only a
+                // server may send this parameter, since client transport parameters
+                // have no confidentiality protection. Without it a reset would be
+                // recognised only for IDs announced later in NEW_CONNECTION_ID
+                // frames, which is to say: not for a connection that never needed a
+                // spare, which is most of them.
+                var params: quic.transport.Parameters = .server_defaults;
+                params.stateless_reset_token = quic.cid.statelessResetToken(
+                    &self.seed,
+                    local_cid,
+                );
+
                 entry.* = .{
                     .conn = try Connection.initServer(.{
                         .identity = self.options.identity,
@@ -348,6 +418,7 @@ pub const Handler = struct {
                         .peer_cid = a.client_source,
                         .after_retry = a.after_retry,
                         .max_field_section_size = self.options.max_field_section_size,
+                        .parameters = params,
                     }, seed),
                     .mux = undefined,
                     .address = from,
@@ -446,16 +517,11 @@ pub const Handler = struct {
             // this is vanishingly unlikely rather than impossible.
             if (self.connections.contains(key)) return;
 
-            // The stateless reset token must be unguessable and tied to nothing an
-            // observer can see, since §10.3 makes possession of it sufficient to
-            // end the connection.
-            var token: [quic.cid.stateless_reset_token_len]u8 = undefined;
-            var mac: std.crypto.auth.hmac.sha2.HmacSha256 = .init(&self.seed);
-            mac.update("zinet stateless reset");
-            mac.update(spare.slice());
-            var digest: [32]u8 = undefined;
-            mac.final(&digest);
-            @memcpy(&token, digest[0..token.len]);
+            // §10.3.2's derivation, and deliberately the same call the handshake
+            // parameter makes: a token this server announces and a token it later
+            // produces from a forgotten connection ID have to agree, and the way to
+            // guarantee that is for there to be one function.
+            const token = quic.cid.statelessResetToken(&self.seed, spare);
 
             self.connections.put(self.gpa, key, entry) catch return;
             _ = entry.conn.transport.issueConnectionId(spare, token) catch {
@@ -703,6 +769,12 @@ pub const Server = struct {
         return self.handler.spares_total;
     }
 
+    /// How many stateless resets have been sent (§10.3). Observable because the
+    /// assertion worth making about a healthy exchange is that this is zero.
+    pub fn statelessResetsSent(self: *const Server) usize {
+        return self.handler.resets_sent;
+    }
+
     /// How many times a peer's address has been acted on as a migration (§9.3).
     pub fn addressMoves(self: *const Server) usize {
         return self.handler.address_moves;
@@ -749,6 +821,7 @@ test "http3 server: an address encodes its port, so two clients behind one NAT d
 }
 
 const backend = @import("backend");
+const embedded = @import("../../embedded.zig");
 
 /// A stream handler for the integration test: answers every request.
 const TestResponder = struct {
@@ -916,4 +989,113 @@ test "http3 server: our own client fetches from it over a real UDP socket" {
     // than "the right value", because the defect this guards against is rewriting the
     // address from whatever a datagram claims — which an attacker chooses.
     try testing.expectEqual(@as(usize, 0), server.addressMoves());
+
+    // §11: a stateless reset must never be sent by an endpoint that has the state to
+    // send a frame instead, and §21.11 makes one sent to a live connection a way to
+    // kill it from off path. Every packet in this exchange belonged to a connection
+    // this server knew, so the count must be zero — and it is the routing of the
+    // spare IDs above that makes that non-trivial: a spare announced but not routed
+    // would arrive as an unknown ID and be answered with a reset.
+    try testing.expectEqual(@as(usize, 0), server.statelessResetsSent());
+}
+
+test "http3 server: a packet for a connection it does not know is answered with a reset" {
+    // §10.3's whole purpose, driven through the real handler: a peer that still
+    // believes in a 1-RTT connection this endpoint has no state for gets told to
+    // stop. Before this the datagram was dropped and the peer waited out its idle
+    // timeout instead.
+    const gpa = testing.allocator;
+    var threaded = try backend.Runtime.init(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var log: TestLog = .{};
+    var builder: TestBuilder = .{ .log = &log };
+    const identity = quic.server.testIdentity();
+    const seed: [32]u8 = @splat(0x71);
+
+    var handler: Handler = .{
+        .gpa = gpa,
+        .io = io,
+        .options = .{
+            .gpa = gpa,
+            .io = io,
+            .address = .{ .ip4 = .loopback(0) },
+            .identity = &identity,
+            .streams = .init(&builder),
+            .token_key = .init(@splat(0x72)),
+            .seed = seed,
+        },
+        .seed = seed,
+    };
+    defer handler.deinit(gpa);
+
+    var channel: embedded.EmbeddedChannel = undefined;
+    try channel.init(gpa, io, .init(&handler));
+    defer channel.deinit();
+
+    const peer: Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 7 }, .port = 4433 } };
+    const unknown = ConnectionId.init(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }) catch unreachable;
+
+    // A short header addressed to an ID this server never issued: first byte with
+    // the fixed bit, the connection ID, then ciphertext it will never decrypt.
+    var trigger: [64]u8 = undefined;
+    @memset(&trigger, 0x5a);
+    trigger[0] = quic.packet.fixed_bit;
+    @memcpy(trigger[1..][0..unknown.len], unknown.slice());
+
+    channel.writeInbound(try Message.initAny(
+        gpa,
+        datagram.Datagram,
+        try datagram.Datagram.init(gpa, peer, &trigger),
+    ));
+
+    var out = channel.readOutbound() orelse return error.NoStatelessReset;
+    defer out.deinit(gpa);
+    const reply = out.get(datagram.Datagram) orelse return error.NotADatagram;
+    const sent = reply.payload.readableSlice();
+
+    try testing.expectEqual(@as(usize, 1), handler.resets_sent);
+    // §10.3.3: strictly smaller than what triggered it, so an exchange of resets
+    // shrinks to nothing instead of looping.
+    try testing.expect(sent.len < trigger.len);
+    try testing.expect(sent.len >= 21);
+    // §10.3: it must read as a short header to anyone without the token.
+    try testing.expectEqual(@as(u8, 0), sent[0] & quic.packet.header_form_bit);
+    try testing.expect(sent[0] & quic.packet.fixed_bit != 0);
+    // §10.3.2: the last sixteen bytes are the token for the ID *from the packet*,
+    // which is what lets an endpoint that has forgotten everything produce it.
+    const expected = quic.cid.statelessResetToken(&seed, unknown);
+    try testing.expectEqualSlices(u8, &expected, sent[sent.len - expected.len ..]);
+
+    // A long header gets nothing: §10.3 says a reset before the peer has the token
+    // is useless, and in version 1 long headers only appear during the handshake.
+    var long: [64]u8 = undefined;
+    @memset(&long, 0);
+    long[0] = quic.packet.header_form_bit | quic.packet.fixed_bit;
+    std.mem.writeInt(u32, long[1..5], 0x0badbeef, .big);
+    long[5] = 8;
+    @memcpy(long[6..][0..8], unknown.slice());
+    long[14] = 0;
+    channel.writeInbound(try Message.initAny(
+        gpa,
+        datagram.Datagram,
+        try datagram.Datagram.init(gpa, peer, &long),
+    ));
+    if (channel.readOutbound()) |*extra| {
+        var owned = extra.*;
+        owned.deinit(gpa);
+        // A Version Negotiation packet is a legitimate answer here; a reset is not.
+        try testing.expectEqual(@as(usize, 1), handler.resets_sent);
+    }
+
+    // The rate limit is a ceiling, not advice: exhausting it stops the answers.
+    handler.options.max_stateless_resets_per_window = 1;
+    channel.writeInbound(try Message.initAny(
+        gpa,
+        datagram.Datagram,
+        try datagram.Datagram.init(gpa, peer, &trigger),
+    ));
+    try testing.expectEqual(@as(usize, 1), handler.resets_sent);
+    try testing.expect(channel.readOutbound() == null);
 }

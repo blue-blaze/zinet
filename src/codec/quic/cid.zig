@@ -28,6 +28,36 @@ const ConnectionId = packet.ConnectionId;
 
 pub const stateless_reset_token_len = transport.stateless_reset_token_len;
 
+/// §10.3.2: the token for a connection ID, derived from one static key.
+///
+/// The alternative the RFC names first — a random secret per connection — is the
+/// one that cannot work, and it says so: stateless reset exists *for* the case
+/// where state was lost, so a token that has to be remembered is a token that is
+/// gone exactly when it is needed. Deriving it from `HMAC(key, cid)` means an
+/// endpoint that has forgotten everything can still produce the token for a
+/// connection ID that arrives in a packet.
+///
+/// Two consequences follow and are load-bearing rather than incidental. The key
+/// is an operational input, because a key generated per process cannot outlive a
+/// restart and a fleet's members must each recognise the others' tokens. And the
+/// token is per connection ID, which is what §10.3.2 requires ("the same
+/// stateless reset token MUST NOT be used for multiple connection IDs") and what
+/// makes revealing one end exactly one connection.
+///
+/// The label keeps this key's outputs distinct from any other use of the same
+/// bytes, which matters because the seed here also seeds connection ID selection.
+pub fn statelessResetToken(
+    key: *const [32]u8,
+    id: ConnectionId,
+) [stateless_reset_token_len]u8 {
+    var mac: std.crypto.auth.hmac.sha2.HmacSha256 = .init(key);
+    mac.update("zinet stateless reset");
+    mac.update(id.slice());
+    var digest: [32]u8 = undefined;
+    mac.final(&digest);
+    return digest[0..stateless_reset_token_len].*;
+}
+
 pub const Error = error{
     /// §5.1.1: the peer issued more connection IDs than we said we would store.
     /// A real limit rather than advice: without it the peer decides how much
@@ -689,4 +719,29 @@ test "cid: a pending retirement is queued once and cleared when sent" {
     try testing.expectEqual(@as(usize, 1), remote.pendingRetire().len);
     remote.clearPendingRetire(1);
     try testing.expectEqual(@as(usize, 0), remote.pendingRetire().len);
+}
+
+test "cid: a reset token is per connection id and stable across forgetting everything" {
+    // The two properties §10.3.2 needs at once: an endpoint that has lost all
+    // state recomputes the same token from the connection ID in the packet, and
+    // no two connection IDs share a token.
+    const key: [32]u8 = @splat(7);
+    const a = cid(&.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    const b = cid(&.{ 1, 2, 3, 4, 5, 6, 7, 9 });
+
+    try testing.expectEqual(statelessResetToken(&key, a), statelessResetToken(&key, a));
+    try testing.expect(!std.mem.eql(
+        u8,
+        &statelessResetToken(&key, a),
+        &statelessResetToken(&key, b),
+    ));
+
+    // A different static key gives a different token for the same ID, which is
+    // what makes the key rather than the ID the secret.
+    const other: [32]u8 = @splat(8);
+    try testing.expect(!std.mem.eql(
+        u8,
+        &statelessResetToken(&key, a),
+        &statelessResetToken(&other, a),
+    ));
 }

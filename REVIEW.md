@@ -234,6 +234,38 @@ to repeat. And an iteration count is a measurement, not a preference: four hundr
 enough to find nothing and 1263 was needed, so the loops run 1500 now, which costs about
 two minutes for the whole fuzz step against six at four thousand.
 
+## A stated blocker that was one code path away
+
+Sending a QUIC stateless reset was listed as absent, with a reason: §10.3 needs a key
+that outlives the process, "an operational input this layer does not take". Implementing
+it started by checking that claim, and the claim was false. `Options.seed` had always been
+an injected parameter, and the HMAC derivation §10.3.2 recommends was already running — it
+produced the tokens announced in NEW_CONNECTION_ID frames. The mechanism was complete; the
+gap was `.drop => return` for an unroutable short-header packet, plus a transport parameter
+that had an encoder and no caller.
+
+This is a different failure from a documented gap that is real. A reason that sounds like a
+design constraint stops anyone from looking, including the person who wrote it. The check
+that would have caught it is cheap and mechanical: **for every stated blocker, name the
+input that is missing and then grep for it.** Here the grep was `Options.seed`, and it was
+sitting in the same file as the code that was supposedly waiting for it.
+
+Two things were worth getting exactly right rather than approximately, and both came from
+reading §10.3 rather than from what the shape of the code suggested. The size of a reset is
+bounded from *both* ends — smaller than the packet that triggered it (§10.3.3, so a loop of
+resets shrinks to nothing without any per-peer state) and at least 21 bytes (§10.3, or a
+peer discards it as too small to be a packet) — and those two rules conflict for a trigger
+of 21 bytes or fewer, which therefore gets no answer at all. The RFC names that trade-off
+in the same section. And the rate limit is global rather than per remote address, departing
+from §10.3.3's suggestion, because a per-address limit needs a map keyed by something the
+peer chooses and this layer exists to answer unknown packets without allocating anything an
+attacker can grow.
+
+Checked from outside the test suite as well as inside it: a raw UDP probe sends a
+short header addressed to a connection ID nobody issued and gets back 48 bytes where it
+used to get silence — form bit clear, fixed bit set, smaller than the 64 bytes that
+triggered it, the token stable across two probes while the padding differs.
+
 ## Method## Method
 
 The review walked the call path rather than the file list: accept → register →

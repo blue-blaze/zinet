@@ -38,7 +38,7 @@ handshake written here, because Netty binds Quiche and the standard library has 
 TLS server; see [HTTP3.md](HTTP3.md) and [TLS.md](TLS.md) — Redis RESP2/RESP3,
 datagram (UDP) endpoints, a DNS resolver, TLS 1.3 on both sides of a connection, a
 bounded client connection pool, and `EmbeddedChannel` for testing pipelines without
-sockets. 768 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
+sockets. 776 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
 all under a leak-checking allocator, plus twenty-two fuzz targets. The same suite
 also runs **on fibers** rather than threads — see [Choosing an `Io`](#choosing-an-io).
 
@@ -69,12 +69,22 @@ review's findings and every defect it, the fuzzer and cross-implementation testi
 turned up are written down in [REVIEW.md](REVIEW.md).
 
 Not done: TLS 1.2 (a peer that cannot do 1.3 is refused), session resumption and
-0-RTT, client certificates, and **sending** a QUIC stateless reset — answering one is
-implemented, and checked before a datagram is parsed as §10.3 requires, but an
-endpoint that has lost its state can only produce a recognisable reset from a key
-that survives a restart, which is an operational input this layer does not yet take.
-Each is listed with its reason in [TLS.md](TLS.md) and [HTTP3.md](HTTP3.md) rather
-than left to be discovered. [HTTP2.md](HTTP2.md) is the HTTP/2 implementation record,
+0-RTT, and client certificates. Each is listed with its reason in [TLS.md](TLS.md)
+and [HTTP3.md](HTTP3.md) rather than left to be discovered.
+
+**Sending a QUIC stateless reset used to be on that list, and the reason given for it
+was wrong** — which is worth saying plainly rather than quietly deleting. The claim
+was that a reset needs "a key that survives a restart, which is an operational input
+this layer does not yet take". The layer already took it: `seed` is an option, and the
+HMAC derivation §10.3.2 recommends was already producing the tokens announced in
+NEW_CONNECTION_ID frames. What was missing was one code path — an unroutable
+short-header packet was returned from rather than answered — and the
+`stateless_reset_token` transport parameter, without which a peer recognises a reset
+only for connection IDs announced in a later frame. A packet for a connection this
+server has forgotten now gets an answer instead of leaving the peer to wait out its
+idle timeout, every reset is strictly smaller than the packet that triggered it so
+§10.3.3's looping cannot start, and §21.11's caveat about sharing one key across a
+fleet is stated in [HTTP3.md](HTTP3.md) rather than discovered. [HTTP2.md](HTTP2.md) is the HTTP/2 implementation record,
 including the one framework decision it forced.
 
 **QUIC connection migration used to be on that list and is not any more**, which is

@@ -26,8 +26,10 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const cid_mod = @import("cid.zig");
 const crypto = @import("crypto.zig");
 const packet = @import("packet.zig");
+const transport = @import("transport.zig");
 const varint = @import("varint.zig");
 
 const ConnectionId = packet.ConnectionId;
@@ -264,6 +266,92 @@ pub fn writeVersionNegotiation(
     return cursor;
 }
 
+/// The largest stateless reset this writes.
+///
+/// §10.3.3 wants resets small (a loop of them must shrink to nothing) and §10.3
+/// wants them indistinguishable from 1-RTT packets, which argues for *not* being
+/// identifiably short: "a Stateless Reset that is smaller than 41 bytes might be
+/// identifiable as a Stateless Reset by an observer". This sits above that line
+/// and is exactly the token plus one HMAC block of unpredictable bytes, which is
+/// where the number comes from rather than taste.
+pub const max_stateless_reset_len = stateless_reset_token_len + 32;
+
+const stateless_reset_token_len = transport.stateless_reset_token_len;
+
+/// §10.3: the size a reset may be, given the datagram that triggered it, or null
+/// when none may be sent.
+///
+/// Three requirements meet here, which is why it is one function rather than
+/// three checks at the call site:
+///
+///   * **Smaller than the trigger, always** (§10.3.3). The RFC permits equality
+///     only for an endpoint that "maintains state sufficient to prevent looping",
+///     and this layer holds no per-peer state by design — so a reset that met a
+///     reset could ping-pong for ever. Shrinking makes the loop terminate
+///     structurally instead of being watched for.
+///   * **At least 21 bytes** (§10.3), because the two fixed bits plus 38
+///     unpredictable bits plus a 16-byte token is the smallest thing a peer will
+///     accept: "short header packets that are smaller than 21 bytes are never
+///     valid", so a smaller reset would be discarded rather than acted on.
+///   * **Never three times or more the trigger** (§10.3), which the first rule
+///     already implies. Stated because it is the reason the first rule is a MUST
+///     and not a preference.
+///
+/// The consequence of the first two together is that a trigger of 21 bytes or
+/// fewer gets no answer at all — there is no size that is both valid and smaller.
+/// §10.3.3 acknowledges this trade-off directly: "not sending a Stateless Reset
+/// in response to a small packet might result in Stateless Resets not being
+/// useful in detecting cases of broken connections where only very small packets
+/// are sent".
+pub fn statelessResetLen(trigger_len: usize) ?usize {
+    if (trigger_len < min_stateless_reset_len + 1) return null;
+    return @min(trigger_len - 1, max_stateless_reset_len);
+}
+
+const min_stateless_reset_len = 21;
+
+/// Write a stateless reset for `destination` into `dest`, or report that the
+/// trigger was too small to answer.
+///
+/// The unpredictable bits are derived rather than drawn from a generator, for the
+/// same reason everything else here takes its randomness as a parameter: a server
+/// built from a fixed seed is reproducible in a test. `nonce` makes successive
+/// resets differ, which matters because §10.3 asks for bytes "indistinguishable
+/// from random" and a constant padding would be a signature.
+pub fn writeStatelessReset(
+    dest: []u8,
+    trigger_len: usize,
+    key: *const [32]u8,
+    destination: ConnectionId,
+    nonce: u64,
+) ?usize {
+    const len = statelessResetLen(trigger_len) orelse return null;
+    if (dest.len < len) return null;
+    assert(len >= min_stateless_reset_len);
+    assert(len < trigger_len);
+
+    var mac: std.crypto.auth.hmac.sha2.HmacSha256 = .init(key);
+    mac.update("zinet stateless reset padding");
+    var nonce_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &nonce_bytes, nonce, .little);
+    mac.update(&nonce_bytes);
+    var noise: [32]u8 = undefined;
+    mac.final(&noise);
+
+    const padding = len - stateless_reset_token_len;
+    assert(padding <= noise.len);
+    @memcpy(dest[0..padding], noise[0..padding]);
+    // §10.3's layout: header form 0 and the fixed bit 1, so this reads as a short
+    // header to anyone who does not hold the token; the other six bits stay
+    // random. Overwriting the first noise byte rather than reserving one keeps the
+    // packet's *first* byte from being the only unpredictable thing about it.
+    dest[0] = (dest[0] & ~(packet.header_form_bit | packet.fixed_bit)) | packet.fixed_bit;
+
+    const token = cid_mod.statelessResetToken(key, destination);
+    @memcpy(dest[padding..len], &token);
+    return len;
+}
+
 /// What to do with a datagram that no existing connection claims.
 pub const Decision = union(enum) {
     /// Not a valid new-connection attempt: drop it silently. §5.2.2 requires
@@ -274,6 +362,13 @@ pub const Decision = union(enum) {
     negotiate_version: struct { client_source: ConnectionId, destination: ConnectionId },
     /// Send a Retry to validate the address before creating any state.
     retry: struct { client_source: ConnectionId, original_destination: ConnectionId },
+    /// §10.3: a short header addressed to a connection ID we do not know. The
+    /// peer believes a 1-RTT connection exists and we have no state for it, which
+    /// is the one situation a stateless reset is for — and the only way to tell
+    /// that peer to stop, since answering with CONNECTION_CLOSE would need the
+    /// keys we do not have. `destination` is what to derive the token from
+    /// (§10.3.2): it came out of the packet, which is the whole point.
+    stateless_reset: struct { destination: ConnectionId },
     /// Create a connection.
     accept: struct {
         client_source: ConnectionId,
@@ -316,6 +411,12 @@ pub fn classify(
     address: []const u8,
     now_ms: u64,
 ) Decision {
+    // §17.3: no long type means a short header, so the peer is addressing a
+    // 1-RTT connection. Nothing here can create one — 1-RTT keys come from a
+    // handshake — so the only useful answers are silence and a stateless reset.
+    if (header.long_type == null) return .{ .stateless_reset = .{
+        .destination = header.destination,
+    } };
     // §7.2: a client's first Destination Connection ID is at least 8 bytes. A
     // shorter one is not a client we can talk to, and it is also the cheap
     // signal that this is not a real connection attempt.
@@ -610,4 +711,103 @@ test "acceptor: an unsupported version is answered with the ones we speak" {
         },
         else => return error.ExpectedVersionNegotiation,
     }
+}
+
+test "acceptor: a reset's size is bounded from both ends, so a loop of them dies out" {
+    // §10.3.3's MUST and §10.3's minimum meet here, and the interesting case is
+    // where they conflict: a trigger of 21 bytes has no valid answer, because
+    // anything smaller than 21 bytes is not a packet a peer will accept.
+    try testing.expectEqual(@as(?usize, null), statelessResetLen(0));
+    try testing.expectEqual(@as(?usize, null), statelessResetLen(21));
+    try testing.expectEqual(@as(?usize, 21), statelessResetLen(22));
+    try testing.expectEqual(@as(?usize, 29), statelessResetLen(30));
+    // §10.3: one byte shorter for triggers of 43 bytes or fewer, which this rule
+    // gives for free by always shrinking by one until the cap bites.
+    try testing.expectEqual(@as(?usize, 42), statelessResetLen(43));
+    // A full-size packet does not produce a full-size reset: §10.3.3 prefers small,
+    // and the cap keeps it above the 41 bytes that would make it identifiable.
+    try testing.expectEqual(@as(?usize, max_stateless_reset_len), statelessResetLen(1200));
+    try testing.expect(max_stateless_reset_len > 41);
+
+    // Every answer is strictly smaller than what triggered it. Checked as a range
+    // rather than at a few points, because this is the property that makes an
+    // exchange of resets terminate.
+    var trigger: usize = 22;
+    while (trigger <= 200) : (trigger += 1) {
+        const len = statelessResetLen(trigger).?;
+        try testing.expect(len < trigger);
+        try testing.expect(len >= 21);
+        // §10.3: never three times or more the trigger. Implied by shrinking, and
+        // asserted because that implication is the reason shrinking is a MUST.
+        try testing.expect(len < 3 * trigger);
+    }
+}
+
+test "acceptor: a stateless reset is a short header, random bits, and the token" {
+    const key: [32]u8 = @splat(0x33);
+    const destination = ConnectionId.init(&.{ 8, 7, 6, 5, 4, 3, 2, 1 }) catch unreachable;
+
+    var out: [max_stateless_reset_len]u8 = undefined;
+    const len = writeStatelessReset(&out, 1200, &key, destination, 0).?;
+    try testing.expectEqual(max_stateless_reset_len, len);
+
+    // §10.3's layout: header form clear, fixed bit set, token last.
+    try testing.expectEqual(@as(u8, 0), out[0] & packet.header_form_bit);
+    try testing.expect(out[0] & packet.fixed_bit != 0);
+    const token = cid_mod.statelessResetToken(&key, destination);
+    try testing.expectEqualSlices(u8, &token, out[len - token.len ..]);
+
+    // The unpredictable bits differ between resets. A constant padding would be a
+    // signature, which is the opposite of what §10.3 asks for.
+    var second: [max_stateless_reset_len]u8 = undefined;
+    const second_len = writeStatelessReset(&second, 1200, &key, destination, 1).?;
+    try testing.expectEqual(len, second_len);
+    try testing.expect(!std.mem.eql(u8, out[0 .. len - token.len], second[0 .. len - token.len]));
+    // But the token does not, because it is derived from the connection ID alone.
+    try testing.expectEqualSlices(u8, out[len - token.len ..], second[second_len - token.len ..]);
+
+    // A trigger too small to answer, and a destination buffer too small to write
+    // into, both report rather than truncate.
+    try testing.expectEqual(@as(?usize, null), writeStatelessReset(&out, 21, &key, destination, 0));
+    var tiny: [8]u8 = undefined;
+    try testing.expectEqual(@as(?usize, null), writeStatelessReset(&tiny, 1200, &key, destination, 0));
+}
+
+test "acceptor: a short header for an unknown connection asks for a reset, not a drop" {
+    const policy: Policy = .{ .key = .init(@splat(0x44)) };
+    const destination = ConnectionId.init(&.{ 1, 1, 2, 2, 3, 3, 4, 4 }) catch unreachable;
+
+    // §17.3: a short header has no long type. It cannot start a connection — 1-RTT
+    // keys come from a handshake — so the only answers are silence and a reset.
+    const short: packet.Protected = .{
+        .long_type = null,
+        .version = .v1,
+        .destination = destination,
+        .source = ConnectionId.init(&.{}) catch unreachable,
+        .token = &.{},
+        .pn_offset = 9,
+        .remainder_len = 40,
+    };
+    switch (classify(policy, short, "addr", 0)) {
+        .stateless_reset => |r| try testing.expectEqualSlices(
+            u8,
+            destination.slice(),
+            r.destination.slice(),
+        ),
+        else => return error.ExpectedStatelessReset,
+    }
+
+    // A long header that is not an Initial still drops: §10.3 says a reset before
+    // the peer holds the token achieves nothing, and long headers only appear
+    // during the handshake in version 1.
+    const handshake: packet.Protected = .{
+        .long_type = .handshake,
+        .version = .v1,
+        .destination = destination,
+        .source = destination,
+        .token = &.{},
+        .pn_offset = 20,
+        .remainder_len = 40,
+    };
+    try testing.expect(classify(policy, handshake, "addr", 0) == .drop);
 }

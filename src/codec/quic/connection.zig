@@ -3613,6 +3613,51 @@ test "connection: a stateless reset ends the connection without a protocol error
     try testing.expectEqual(Event.stateless_reset, conn.nextEvent().?);
 }
 
+test "connection: the reset a server writes is the reset a client recognises" {
+    // The two halves of §10.3, made to meet. Detecting a reset and producing one
+    // are in different files — `connection.zig` compares the trailing sixteen
+    // bytes, `acceptor.zig` writes them — and they agree only because both call
+    // `cid.statelessResetToken`. Nothing in either file's own tests would notice
+    // if one of them changed the derivation, which is the case this exists for.
+    const gpa = testing.allocator;
+    const acceptor = @import("acceptor.zig");
+
+    const client_cid = cid(&.{ 0xaa, 0xbb });
+    const initial_dcid = cid(&.{ 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37 });
+    // What the server issued us and would derive a reset from after losing state.
+    const server_cid = cid(&.{ 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7 });
+    const static_key: [32]u8 = @splat(0x4d);
+
+    var conn = try Connection.initClient(testOptions(client_cid, initial_dcid), @splat(0x19));
+    defer conn.deinit(gpa);
+    try conn.start(gpa);
+
+    // As a NEW_CONNECTION_ID frame would: the ID, and the token the server derived
+    // for it. A client only checks tokens for IDs it has actually used (§10.3.1).
+    try conn.remote.insert(1, 0, server_cid, cid_mod.statelessResetToken(&static_key, server_cid));
+
+    var out: [acceptor.max_stateless_reset_len]u8 = undefined;
+    const len = acceptor.writeStatelessReset(&out, 1200, &static_key, server_cid, 0) orelse
+        return error.NoResetWritten;
+
+    try conn.receive(gpa, out[0..len]);
+    try testing.expect(conn.state != .active);
+    try testing.expectEqual(Event.stateless_reset, conn.nextEvent().?);
+
+    // And a reset derived for a *different* connection ID is not ours: the token is
+    // per ID, so this must be ignored rather than ending the connection.
+    var other = try Connection.initClient(testOptions(client_cid, initial_dcid), @splat(0x1a));
+    defer other.deinit(gpa);
+    try other.start(gpa);
+    try other.remote.insert(1, 0, server_cid, cid_mod.statelessResetToken(&static_key, server_cid));
+
+    const stranger = cid(&.{ 0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7 });
+    const other_len = acceptor.writeStatelessReset(&out, 1200, &static_key, stranger, 1) orelse
+        return error.NoResetWritten;
+    try other.receive(gpa, out[0..other_len]);
+    try testing.expect(other.state == .active);
+}
+
 test "connection: a peer's CONNECTION_CLOSE is reported with its code" {
     const gpa = testing.allocator;
 
