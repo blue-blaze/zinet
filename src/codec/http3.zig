@@ -24,6 +24,8 @@ pub const connection = @import("http3/connection.zig");
 pub const multiplex = @import("http3/multiplex.zig");
 pub const client = @import("http3/client.zig");
 pub const server = @import("http3/server.zig");
+/// RFC 9220: WebSocket over HTTP/3, on top of the extended CONNECT above.
+pub const websocket = @import("http3/websocket.zig");
 
 pub const Headers = multiplex.Headers;
 pub const OutgoingHeaders = multiplex.OutgoingHeaders;

@@ -188,6 +188,16 @@ pub const EmbeddedChannel = struct {
     }
 
     /// The oldest message that reached the sink, ownership passed to the caller.
+    /// Take the next outbound message, or null.
+    ///
+    /// One sharp edge, and it follows from the ownership rules rather than from this
+    /// type: **outbound messages borrow their contents**, because a real sink
+    /// serializes them before `write` returns — `http.Response`, `http3.OutgoingHeaders`
+    /// and the like point at the caller's memory. This channel keeps the message
+    /// instead of serializing it, so anything read back here whose fields borrowed a
+    /// stack frame is reading memory that has gone. Byte messages are safe (they own
+    /// their buffer); structured outbound messages are safe only while the frame that
+    /// built them is still alive.
     pub fn readOutbound(self: *EmbeddedChannel) ?Message {
         if (self.record.outbound.items.len == 0) return null;
         return self.record.outbound.orderedRemove(0);

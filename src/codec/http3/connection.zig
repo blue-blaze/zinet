@@ -1717,7 +1717,11 @@ pub fn testPair(gpa: Allocator) !TestPair {
 
 /// `connect_protocol` makes the server advertise RFC 9220's setting, which is the
 /// only difference the extension makes to a connection's setup.
-fn testPairWith(gpa: Allocator, connect_protocol: bool) !TestPair {
+///
+/// Public because the WebSocket binding in `http3/websocket.zig` needs a pair with
+/// the extension enabled, and a second copy of this setup would be a second thing to
+/// keep in step with the handshake.
+pub fn testPairWith(gpa: Allocator, connect_protocol: bool) !TestPair {
     h3_identity = quic.server.testIdentity();
     const client_cid = quic.packet.ConnectionId.init(&.{ 0xc0, 0xc1, 0xc2, 0xc3 }) catch unreachable;
     const server_cid = quic.packet.ConnectionId.init(&.{ 0x50, 0x51, 0x52, 0x53 }) catch unreachable;
