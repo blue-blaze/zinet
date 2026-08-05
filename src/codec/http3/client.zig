@@ -102,6 +102,14 @@ pub const Handler = struct {
     /// Set when the connection has failed or drained; the handler stops
     /// pumping and the endpoint is idle until closed.
     finished: bool = false,
+    /// Whether the handshake has been begun.
+    ///
+    /// Exists because §9.2 lets this handler outlive the socket it was mounted on:
+    /// migrating to a new local address means opening another endpoint and mounting
+    /// the same handler, so `onActive` runs more than once per connection. A second
+    /// `start` would produce a second ClientHello, which is not a migration but a
+    /// different connection.
+    started: bool = false,
 
     pub const handler_name = "http3";
 
@@ -111,7 +119,13 @@ pub const Handler = struct {
 
     pub fn onActive(self: *Handler, ctx: *pipeline_mod.HandlerContext) !void {
         self.conn.setTime(self.now());
-        try self.conn.start(ctx.gpa());
+        if (!self.started) {
+            self.started = true;
+            try self.conn.start(ctx.gpa());
+        }
+        // Flushed either way, and that is the point on a second mount: whatever the
+        // connection owes — a PATH_CHALLENGE for the path just moved to (§8.2), the
+        // RETIRE_CONNECTION_ID the move owes (§5.1.2) — goes out from the new socket.
         try self.flush(ctx);
         ctx.fireActive();
     }
@@ -196,6 +210,14 @@ pub const Client = struct {
     endpoint: datagram.Endpoint,
     handler: *Handler,
     gpa: Allocator,
+    io: Io,
+    /// What to bind each socket to, kept because `migrate` opens another one.
+    bind_to: Io.net.IpAddress,
+    tick_interval: Io.Duration,
+    /// How many times `migrate` has been called, which doubles as the opaque path
+    /// identifier the connection wants (§9.2) — the connection never sees addresses,
+    /// so any value that distinguishes one local address from the next will do.
+    migrations: u64 = 0,
 
     pub fn connect(options: Options) !Client {
         const gpa = options.gpa;
@@ -231,30 +253,81 @@ pub const Client = struct {
         };
         errdefer handler.conn.deinit(gpa);
 
+        var client: Client = .{
+            .endpoint = undefined,
+            .handler = handler,
+            .gpa = gpa,
+            .io = options.io,
+            .bind_to = switch (options.address) {
+                .ip4 => .{ .ip4 = .unspecified(0) },
+                .ip6 => .{ .ip6 = .unspecified(0) },
+            },
+            .tick_interval = options.tick_interval,
+        };
+        client.endpoint = try datagram.Endpoint.open(client.endpointOptions());
+        return client;
+    }
+
+    /// One description of the socket, used by `connect` and again by `migrate`.
+    /// Separate so the two cannot drift: a migration that opened a socket with
+    /// different options would be a different connection in a way nothing would
+    /// report.
+    fn endpointOptions(self: *const Client) datagram.Endpoint.Options {
         const Bind = struct {
             fn build(pipeline: *pipeline_mod.Pipeline) anyerror!void {
                 const mounted: *Handler = @ptrCast(@alignCast(pipeline.owner.?));
                 _ = try pipeline.addLast(Handler.handler_name, .init(mounted));
             }
         };
-
-        const endpoint = try datagram.Endpoint.open(.{
-            .gpa = gpa,
-            .io = options.io,
-            .address = switch (options.address) {
-                .ip4 => .{ .ip4 = .unspecified(0) },
-                .ip6 => .{ .ip6 = .unspecified(0) },
-            },
+        return .{
+            .gpa = self.gpa,
+            .io = self.io,
+            // Port zero: the kernel picks, which is what makes each `migrate` a
+            // genuinely different local address rather than the same one reopened.
+            .address = self.bind_to,
             .initializer = .initFunction(Bind.build),
-            .owner = handler,
+            .owner = self.handler,
             // QUIC never sends larger, and an inbound datagram above this is
             // not QUIC v1 (§14 of RFC 9000 caps at the path MTU; our peer
             // cannot know a higher one).
             .max_datagram_size = 2048,
-            .tick_interval = options.tick_interval,
-        });
+            .tick_interval = self.tick_interval,
+        };
+    }
 
-        return .{ .endpoint = endpoint, .handler = handler, .gpa = gpa };
+    /// §9.2: move this connection to a new local address.
+    ///
+    /// The socket is replaced rather than rebound, because `std.Io` offers no
+    /// rebinding and a new socket is what a new address means. The order below is
+    /// the whole subtlety and is not an implementation detail:
+    ///
+    ///   1. the old endpoint is stopped, which cancels its reader task;
+    ///   2. the connection is migrated, which mutates state that reader touches;
+    ///   3. a new endpoint is opened, whose reader task takes over.
+    ///
+    /// Doing 2 before 1 would race the reader for the connection's state, and the
+    /// framework's one-reader-task rule is exactly what makes handler state need no
+    /// locks — so migration has to respect it rather than be an exception to it.
+    /// Between 1 and 3 nothing is read, which costs a few microseconds of a
+    /// connection that is in any case changing address.
+    ///
+    /// `port_only` is passed through to §9.4's congestion decision; see
+    /// `quic.connection.Connection.MigrateOptions`.
+    ///
+    /// On failure the connection is left usable but *unmounted*: the caller can
+    /// retry, or give up and `deinit`. That is stated because the alternative —
+    /// reopening on the old address to pretend nothing happened — would hide from
+    /// the caller that its address did change.
+    pub fn migrate(self: *Client, port_only: bool) !void {
+        self.endpoint.deinit();
+        self.migrations += 1;
+        // Through `transport`, as every other QUIC-level operation here is reached:
+        // migration is a transport concern and HTTP/3 has no opinion about it.
+        try self.handler.conn.transport.migrate(.{
+            .path = self.migrations,
+            .port_only = port_only,
+        });
+        self.endpoint = try datagram.Endpoint.open(self.endpointOptions());
     }
 
     /// Stops the endpoint (cancelling its reader) and frees the connection.

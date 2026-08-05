@@ -38,7 +38,7 @@ handshake written here, because Netty binds Quiche and the standard library has 
 TLS server; see [HTTP3.md](HTTP3.md) and [TLS.md](TLS.md) — Redis RESP2/RESP3,
 datagram (UDP) endpoints, a DNS resolver, TLS 1.3 on both sides of a connection, a
 bounded client connection pool, and `EmbeddedChannel` for testing pipelines without
-sockets. 776 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
+sockets. 780 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
 all under a leak-checking allocator, plus twenty-two fuzz targets. The same suite
 also runs **on fibers** rather than threads — see [Choosing an `Io`](#choosing-an-io).
 
@@ -91,9 +91,16 @@ including the one framework decision it forced.
 worth saying plainly rather than quietly editing: a peer that moves is now detected by
 §9.3's three conditions together — a non-probing frame, a new path, and the highest
 packet number seen — the new address is validated before anything is sent to it, and
-§9.4's congestion and RTT reset follows. Three named pieces are still absent, each for
-a stated reason: §9.3.3's probe of the *old* path, `preferred_address` (§9.6), and
-§9.2 client-initiated migration. The row in [HTTP3.md](HTTP3.md) says which and why.
+§9.4's congestion and RTT reset follows. **A client can now also move itself** (§9.2),
+which is the only migration QUIC version 1 permits: `Client.migrate` replaces the
+socket, because `std.Io` cannot rebind one, and the order matters more than the API
+does — the old reader task is stopped before the connection's state is touched, since
+the one-reader-task rule is what makes handler state need no locks. It refuses rather
+than improvises when a rule says it must: before the handshake is confirmed, when the
+peer sent `disable_active_migration`, and when no spare connection ID is available,
+because §9.5 forbids using one from two local addresses. Two named pieces are still
+absent, each for a stated reason: §9.3.3's probe of the *old* path and
+`preferred_address` (§9.6). The row in [HTTP3.md](HTTP3.md) says which and why.
 
 ### Blocked upstream
 

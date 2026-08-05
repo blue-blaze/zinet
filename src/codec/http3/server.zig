@@ -177,7 +177,10 @@ pub const Handler = struct {
     /// endpoint that takes the address from every datagram lets anyone able to spoof
     /// a source address redirect a connection's whole output at a victim, and the
     /// symptom of that defect is this number rising during ordinary traffic.
-    address_moves: usize = 0,
+    /// Atomic because a test polls it while the reader task writes it: this is the
+    /// one counter here whose *change* is what another task waits for, rather than
+    /// one read after a synchronisation point.
+    address_moves: std.atomic.Value(usize) = .init(0),
     /// Spare connection IDs issued across all connections. Observable for the same
     /// reason `accepted` is: it is how a test can tell the announcements happened
     /// without reaching into a connection that another task owns.
@@ -288,7 +291,7 @@ pub const Handler = struct {
                 // validating the new one fails.
                 entry.validated_address = entry.address;
                 entry.address = from;
-                self.address_moves += 1;
+                _ = self.address_moves.fetchAdd(1, .release);
             }
             try self.dispatchEvents(entry);
             self.offerToken(entry, from);
@@ -777,7 +780,7 @@ pub const Server = struct {
 
     /// How many times a peer's address has been acted on as a migration (§9.3).
     pub fn addressMoves(self: *const Server) usize {
-        return self.handler.address_moves;
+        return self.handler.address_moves.load(.acquire);
     }
 
     /// How many keys the routing table holds. More than one per connection once
@@ -1098,4 +1101,81 @@ test "http3 server: a packet for a connection it does not know is answered with 
     ));
     try testing.expectEqual(@as(usize, 1), handler.resets_sent);
     try testing.expect(channel.readOutbound() == null);
+}
+
+test "http3 server: a client that moves to a new socket keeps its connection" {
+    // §9.2 and §9.3 meeting over real sockets: the client rebinds, and the server
+    // recognises the move rather than treating the packets as a stranger's. The
+    // server side existed before this; what is new is the client choosing to move.
+    const gpa = testing.allocator;
+    var threaded = try backend.Runtime.init(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var log: TestLog = .{};
+    var builder: TestBuilder = .{ .log = &log };
+    const identity = quic.server.testIdentity();
+
+    var server = try Server.listen(.{
+        .gpa = gpa,
+        .io = io,
+        .address = .{ .ip4 = .loopback(0) },
+        .identity = &identity,
+        .streams = .init(&builder),
+        .token_key = .init(@splat(0x81)),
+        .seed = @splat(0x82),
+    });
+    defer server.deinit();
+
+    var recorder: ClientRecorder = .{ .gpa = gpa };
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(.{
+        .gpa = gpa,
+        .io = io,
+        .address = .{ .ip4 = .loopback(server.port()) },
+        .host = "example.test",
+        .verification = null,
+        .delegate = .init(&recorder, ClientRecorder.onEvent),
+        .seed = @splat(0x83),
+    });
+    defer client.deinit();
+
+    const deadline = Io.Timestamp.now(io, .awake).addDuration(.fromSeconds(10));
+    while (!recorder.done.load(.acquire)) {
+        if (Io.Timestamp.now(io, .awake).nanoseconds >= deadline.nanoseconds) {
+            return error.RequestTimedOut;
+        }
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+    try testing.expectEqualStrings("200", recorder.status[0..recorder.status_len]);
+    try testing.expectEqual(@as(usize, 0), server.addressMoves());
+
+    const before = client.localAddress();
+    try client.migrate(false);
+    const after = client.localAddress();
+    // A genuinely different local address, or the test would prove nothing: the
+    // kernel assigns the port, and asserting they differ is what makes this a
+    // migration rather than a reopened socket.
+    try testing.expect(!std.meta.eql(before, after));
+
+    // §9.1: the packet the move produces carries RETIRE_CONNECTION_ID for the ID it
+    // left behind (§5.1.2), and that is *not* a probing frame — which is what makes
+    // the server treat the new address as a migration under §9.3 rather than waiting
+    // for application data. Polled because it is another task that acts on it.
+    const move_deadline = Io.Timestamp.now(io, .awake).addDuration(.fromSeconds(10));
+    while (server.addressMoves() == 0) {
+        if (Io.Timestamp.now(io, .awake).nanoseconds >= move_deadline.nanoseconds) {
+            return error.MigrationNotObserved;
+        }
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+    try testing.expectEqual(@as(usize, 1), server.addressMoves());
+
+    // The connection survived rather than being replaced or reset: one accepted
+    // connection for the whole test, and no stateless reset — a server that had
+    // failed to recognise the move would have answered the new address with one,
+    // since a packet it cannot route is exactly what §10.3 answers.
+    try testing.expectEqual(@as(usize, 1), server.acceptedCount());
+    try testing.expectEqual(@as(usize, 0), server.statelessResetsSent());
+    try testing.expectEqual(@as(usize, 1), log.requests);
 }

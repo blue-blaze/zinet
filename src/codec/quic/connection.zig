@@ -629,6 +629,13 @@ pub const Connection = struct {
     /// How many times the peer has been observed to migrate, for tests and for the
     /// caller to notice.
     migrations: u64 = 0,
+    /// §9.2: the path this endpoint is sending *from*, and how many times it has
+    /// moved. Separate from `peer_path` because the two are different events with
+    /// different rules: a peer that moves must be validated before we send to it
+    /// (§9.3), while a move of our own needs no permission from the peer — its
+    /// address was validated during the handshake (§9.2).
+    local_path: ?u64 = null,
+    migrations_initiated: u64 = 0,
     /// Whether the validation in flight, if it succeeds, should reset congestion
     /// state (§9.4). Set when a migration starts one; cleared when the caller says
     /// the move was port-only, which §9.4 lets an endpoint treat as the same path
@@ -1082,6 +1089,102 @@ pub const Connection = struct {
 
     /// §8.2.1: start validating the path this connection is currently sending on.
     ///
+    /// Why a migration was refused. Every one of these is a rule from §9 rather
+    /// than a limitation of this implementation, which is why they are separate
+    /// errors: a caller that gets `MigrationDisabled` must stop asking, and one that
+    /// gets `ConnectionIdUnavailable` can ask again once the peer supplies more.
+    pub const MigrateError = error{
+        /// §9: "An endpoint MUST NOT initiate connection migration before the
+        /// handshake is confirmed."
+        HandshakeNotConfirmed,
+        /// §9: only clients migrate in this version of QUIC. A server changing its
+        /// address mid-connection is `preferred_address` (§9.6) and nothing else.
+        ServerCannotMigrate,
+        /// §18.2: the peer sent `disable_active_migration`, which says its
+        /// deployment cannot keep a connection when our address changes — usually a
+        /// load balancer that routes on addresses (§5.2.3).
+        MigrationDisabled,
+        /// §9.5: "An endpoint MUST NOT reuse a connection ID when sending from more
+        /// than one local address", so a migration needs one the peer has supplied
+        /// and we have not used. Without a spare, moving would either break that
+        /// rule or make us unreachable.
+        ConnectionIdUnavailable,
+        /// §9.5: "An endpoint SHOULD NOT initiate migration with a peer that has
+        /// requested a zero-length connection ID", because there is then no ID to
+        /// change and traffic on the new path is trivially linkable to the old.
+        ZeroLengthConnectionId,
+        /// A validation is already in flight. Not an RFC rule but a stated bound —
+        /// see `validating` — and reported rather than ignored because a caller that
+        /// has just rebound a socket needs to know the challenge did not go out.
+        ValidationInProgress,
+    };
+
+    pub const MigrateOptions = struct {
+        /// The caller's identifier for the path it is now sending from. Opaque here
+        /// for the same reason `peer_path` is: this layer never sees an address.
+        path: u64,
+        /// Whether the move changed only the source port.
+        ///
+        /// §9.4 lets an endpoint keep its congestion state when "the only change in
+        /// the peer's address is its port number", on the grounds that port-only
+        /// changes are usually middlebox activity on the same path. That sentence is
+        /// written for the endpoint *responding* to a move, but the reasoning
+        /// carries: a client that changes source port for privacy (§9.5) is on the
+        /// same path it was. It is a parameter rather than an assumption because only
+        /// the caller knows which kind of move it made.
+        port_only: bool = false,
+    };
+
+    /// §9.2: move to a new local address.
+    ///
+    /// What this does *not* do is send anything from the new address, because it
+    /// cannot: the socket belongs to the caller, which is why `path` is an opaque
+    /// number. The division is the same one the rest of this file keeps — datagrams
+    /// in, datagrams out, no addresses — and it is what makes the caller's rebinding
+    /// and this state change orderable: rebind, call this, then send.
+    ///
+    /// Three things happen here, and the order matters. The connection ID changes
+    /// first (§9.5), because a packet sent from the new address with the old ID has
+    /// already broken the rule; the old one is retired at the same time, since §5.1.2
+    /// asks an endpoint to retire IDs "when they are no longer actively using either
+    /// the local or destination address for which the connection ID was used" and
+    /// that is exactly what just happened. Then congestion state is reset (§9.2 via
+    /// §9.4), *immediately* rather than on validation: §9.4's "on confirming a peer's
+    /// ownership" is about a peer that moved, and here the peer has not moved at all —
+    /// §9.2 says an endpoint "can migrate to a new local address without first
+    /// validating the peer's address". Then a challenge is armed (§8.2), because the
+    /// new path's viability in the *other* direction is still unknown.
+    pub fn migrate(self: *Connection, options: MigrateOptions) MigrateError!void {
+        if (self.role == .server) return error.ServerCannotMigrate;
+        if (!self.handshake_confirmed) return error.HandshakeNotConfirmed;
+        if (self.peer_parameters) |peer| {
+            if (peer.disable_active_migration) return error.MigrationDisabled;
+        } else {
+            // No parameters means no handshake, which the check above already
+            // rejected; kept as an assertion because relying on that ordering
+            // silently would make this function wrong if it were ever called earlier.
+            return error.HandshakeNotConfirmed;
+        }
+        if (self.remote.active().len == 0) return error.ZeroLengthConnectionId;
+        if (self.validating != null) return error.ValidationInProgress;
+        // §9.5 needs an ID we have not sent from anywhere else. `retireActive` both
+        // moves off the current one and owes the peer the RETIRE_CONNECTION_ID that
+        // §5.1.2 wants, and it refuses when there is nothing to move to — which is
+        // the one case where migrating would leave us unable to be addressed.
+        _ = self.remote.retireActive() catch return error.ConnectionIdUnavailable;
+
+        if (!options.port_only) {
+            self.congestion = .init(max_datagram);
+            self.rtt = .{};
+        }
+        self.local_path = options.path;
+        self.migrations_initiated += 1;
+
+        // Cannot fail: `validating` was checked above, and this is the only place
+        // besides §9.3's response that starts one.
+        assert(self.beginPathValidation());
+    }
+
     /// Returns false when one is already in progress, which is not an error: the
     /// answer to "is this path good" is already being sought.
     pub fn beginPathValidation(self: *Connection) bool {
@@ -6385,4 +6488,138 @@ test "connection: a port-only move keeps the congestion state" {
     try exchange(gpa, cl, srv, 8);
     try testing.expect(srv.path_validated);
     try testing.expectEqual(smoothed, srv.rtt.smoothed);
+}
+
+test "connection: §9.2 a client moves to a new local address, and every rule it must obey" {
+    // The other half of migration. §9.3 — a peer that moved — was already here; this
+    // is the endpoint deciding to move, which is the only kind QUIC version 1 allows
+    // and the only kind a client behind a changing network can use.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xf1);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    // §9: not before the handshake is confirmed. A connection that has not reached
+    // that point could still be one an attacker is forging, so a fresh client — not
+    // this pair, which is already established — is what the rule applies to.
+    {
+        var fresh = try Connection.initClient(
+            testOptions(testCid(&.{ 3, 3, 3, 3 }), testCid(&.{ 4, 4, 4, 4, 4, 4, 4, 4 })),
+            @splat(0xf9),
+        );
+        defer fresh.deinit(gpa);
+        try testing.expect(!fresh.handshake_confirmed);
+        try testing.expectError(error.HandshakeNotConfirmed, fresh.migrate(.{ .path = 0x11 }));
+        try testing.expect(fresh.validating == null);
+    }
+
+    try exchange(gpa, cl, srv, 8);
+    try testing.expect(cl.handshake_confirmed);
+
+    // A spare connection ID from the server, which is what makes the move possible
+    // at all (§9.5) — and the reason §5.1.1 tells an endpoint whose peer might
+    // migrate to keep the pool stocked. `http3.server` issues these automatically;
+    // this layer takes them from the caller, so the test plays that part.
+    _ = try srv.issueConnectionId(testCid(&.{ 0xd1, 0xd2, 0xd3, 0xd4 }), @splat(0x5a));
+    try exchange(gpa, cl, srv, 4);
+    const before = cl.remote.active();
+    try testing.expect(cl.remote.len > 1);
+
+    try cl.migrate(.{ .path = 0x2222 });
+
+    // §9.5: a different connection ID, because reusing one across two local
+    // addresses lets an observer link the paths.
+    try testing.expect(!std.mem.eql(u8, before.slice(), cl.remote.active().slice()));
+    // §5.1.2: and the one we left is retired, since the address it was used for is
+    // gone. Owed as a frame rather than merely forgotten — the peer is holding the
+    // slot until it hears.
+    try testing.expectEqual(@as(usize, 1), cl.remote.pendingRetire().len);
+    // §9.4: the new path's capacity is not the old one's.
+    try testing.expect(cl.rtt.smoothed == null);
+    try testing.expectEqual(@as(u64, 1), cl.migrations_initiated);
+    try testing.expectEqual(@as(?u64, 0x2222), cl.local_path);
+    // §8.2: viability of the new path in the return direction is still unknown, so a
+    // challenge is armed. §9.2 does not make us wait for it before sending.
+    try testing.expect(cl.validating != null);
+
+    // One at a time, and reported: a caller that has just rebound a socket needs to
+    // know whether its challenge went out.
+    try testing.expectError(error.ValidationInProgress, cl.migrate(.{ .path = 0x3333 }));
+
+    // The challenge is answered, which is what §8.2.3 counts as validation.
+    try exchange(gpa, cl, srv, 8);
+    try testing.expect(cl.path_validated);
+    try testing.expect(cl.validating == null);
+    // And the RETIRE_CONNECTION_ID reached the server, which replaced the ID.
+    try testing.expectEqual(@as(usize, 0), cl.remote.pendingRetire().len);
+
+    // §5.1.1: "An endpoint SHOULD supply a new connection ID when the peer retires a
+    // connection ID" — and here is why that SHOULD matters rather than being
+    // politeness. Without a replacement the client has one ID left and cannot move
+    // again, so a peer that stops refilling the pool has taken migration away.
+    // `http3.server` refills automatically; this layer leaves it to the caller.
+    try testing.expectError(error.ConnectionIdUnavailable, cl.migrate(.{ .path = 0x4444 }));
+    _ = try srv.issueConnectionId(testCid(&.{ 0xe1, 0xe2, 0xe3, 0xe4 }), @splat(0x5b));
+
+    // A port-only move keeps the congestion state (§9.4), and the caller is the only
+    // one that can say so — this layer never sees an address.
+    try exchange(gpa, cl, srv, 4);
+    try testing.expect(cl.rtt.smoothed != null);
+    try cl.migrate(.{ .path = 0x4444, .port_only = true });
+    try testing.expect(cl.rtt.smoothed != null);
+    try testing.expectEqual(@as(u64, 2), cl.migrations_initiated);
+}
+
+test "connection: a peer that disabled active migration is not migrated to anyway" {
+    // §18.2: `disable_active_migration` says the peer's deployment cannot follow us,
+    // usually because it routes on addresses (§5.2.3). Moving would not be a
+    // performance question but a dropped connection, so the refusal is an error the
+    // caller must handle rather than a silently ignored request.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xf2);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    try exchange(gpa, cl, srv, 8);
+    try testing.expect(cl.handshake_confirmed);
+
+    cl.peer_parameters.?.disable_active_migration = true;
+    try testing.expectError(error.MigrationDisabled, cl.migrate(.{ .path = 0x55 }));
+    try testing.expectEqual(@as(u64, 0), cl.migrations_initiated);
+    try testing.expect(cl.validating == null);
+
+    // §9: and a server never initiates one at all. Version 1 gives it exactly one
+    // way to change address, `preferred_address`, which is not this.
+    try testing.expectError(error.ServerCannotMigrate, srv.migrate(.{ .path = 0x66 }));
+}
+
+test "connection: migrating without a spare connection id is refused, not fudged" {
+    // §9.5's MUST NOT is the constraint that can actually make a migration
+    // impossible: with one connection ID, moving means either reusing it from a
+    // second address or having no ID to send. Both are worse than staying put, so
+    // the caller is told.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xf3);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    try exchange(gpa, cl, srv, 8);
+    try testing.expect(cl.handshake_confirmed);
+
+    // Only the handshake ID, since nothing issued a spare: exactly the state §9.5
+    // makes a migration impossible from.
+    try testing.expectEqual(@as(usize, 1), cl.remote.len);
+
+    try testing.expectError(error.ConnectionIdUnavailable, cl.migrate(.{ .path = 0x77 }));
+    try testing.expectEqual(@as(u64, 0), cl.migrations_initiated);
+    // The ID in use is untouched: a refused migration must leave the connection
+    // exactly as usable as it was.
+    try testing.expect(cl.remote.active().len > 0);
+    try testing.expect(cl.validating == null);
 }
