@@ -33,9 +33,14 @@ const Kind = stream_mod.Kind;
 const Stream = stream_mod.Stream;
 
 pub const Error = error{
-    /// §4.6: the peer opened more streams than it was permitted, or a MAX_STREAMS
-    /// frame allows an ID that cannot be encoded.
+    /// §4.6: the peer opened more streams than it was permitted.
     StreamLimitError,
+    /// §19.11: a MAX_STREAMS frame allowing an ID that cannot be encoded. Separate
+    /// from `StreamLimitError` because the two describe different faults and §20.1
+    /// gives them different codes: one says the peer used too many streams, the
+    /// other that the frame itself is malformed. Collapsing them would send a peer
+    /// looking for a stream it never opened.
+    FrameEncodingError,
     /// §4.1: more data than the connection window allows.
     FlowControlError,
     /// §3.2: a frame for a stream that cannot exist, or for a direction that
@@ -325,8 +330,11 @@ pub const Streams = struct {
 
     /// Apply an inbound MAX_STREAMS frame (§19.11).
     pub fn receiveMaxStreams(self: *Streams, bidirectional: bool, streams: u64) Error!void {
-        // §4.6: above 2^60 the resulting stream ID would not fit a varint.
-        if (streams > stream_mod.max_streams) return error.StreamLimitError;
+        // §4.6 and §19.11: above 2^60 the resulting stream ID would not fit a
+        // varint, and the code for it is FRAME_ENCODING_ERROR — §4.6 names both that
+        // and TRANSPORT_PARAMETER_ERROR in one sentence, for the frame and the
+        // parameter respectively, and the parameter half is in `transport.zig`.
+        if (streams > stream_mod.max_streams) return error.FrameEncodingError;
         const i: usize = if (bidirectional) 0 else 1;
         if (streams > self.peer_max_streams[i]) self.peer_max_streams[i] = streams;
     }
@@ -555,9 +563,16 @@ test "streams: we may not exceed the peer's limit either" {
     try testing.expect(streams.canOpen(true));
     try testing.expectEqual(@as(u64, 3), (try streams.open(gpa, true)).index());
 
-    // §4.6: a count above 2^60 implies an unencodable stream ID.
+    // §4.6 with §19.11: a count above 2^60 implies an unencodable stream ID, and the
+    // code for it is FRAME_ENCODING_ERROR rather than STREAM_LIMIT_ERROR. This test
+    // asserted the latter until §19.11 was read against it: §20.1 defines
+    // STREAM_LIMIT_ERROR as "received a frame for a stream identifier that exceeded
+    // its advertised stream limit", which is not what happened — nothing opened a
+    // stream, the frame is simply malformed. §11 does permit a generic code in place
+    // of a specific one, but STREAM_LIMIT_ERROR is neither generic nor applicable,
+    // and it points the peer at its own stream usage instead of at its encoder.
     try testing.expectError(
-        error.StreamLimitError,
+        error.FrameEncodingError,
         streams.receiveMaxStreams(true, stream_mod.max_streams + 1),
     );
 

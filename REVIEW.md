@@ -266,6 +266,61 @@ short header addressed to a connection ID nobody issued and gets back 48 bytes w
 used to get silence — form bit clear, fixed bit set, smaller than the 64 bytes that
 triggered it, the token stable across two probes while the padding differs.
 
+## An audit of §10 and §19's MUSTs, and what it cost to look
+
+Reading a specification against the code — rather than reading the code — has found every
+protocol defect in this repository that the fuzzer did not. So RFC 9000 §10 (connection
+termination) and §19 (frame types) were gone through statement by statement. Most of it was
+already right, and saying which parts is the point of an audit: §10.1's idle timeout floor of
+three PTOs, including the subtle second rule that only the *first* ack-eliciting packet since
+a receive restarts the timer; §10.2's closing and draining periods and §10.2.1's exponential
+limit on answering packets while closing; §10.3.1's constant-time comparison before parsing;
+§12.4's unknown frame type; §19.7's empty NEW_TOKEN; §19.15's zero-length-ID contradiction;
+§19.16 and §19.20's role checks. Twelve of those were verified individually.
+
+Four things were not right, and the largest was not a missing branch but a missing habit.
+
+**§11.1: a protocol violation was detected and never signalled.** A malformed frame made
+`receive` return an error, the caller marked the connection finished, and *nothing was sent*.
+§11.1 is one sentence: errors that make the connection unusable "MUST be signaled using a
+CONNECTION_CLOSE frame". The peer's only way to learn was its own idle timeout, minutes
+later. This was established with a probe rather than by reading — the connection stayed in
+`.active` with no close queued, and the next `send` produced zero bytes — because the
+comment in `http3/client.zig` asserted the opposite ("the connection has already recorded
+the failure and queued the CONNECTION_CLOSE if one is owed"). A comment that describes what
+should happen is indistinguishable from one that describes what does.
+
+**The wire form of that close was malformed anyway.** §19.19 gives the transport variant
+(0x1c) a mandatory Frame Type field — "a value of 0 ... is used when the frame type is
+unknown" — and the application variant (0x1d) none. This file's parser had always read it
+that way. The encoder wrote it only when the caller supplied a value, and the send path
+supplies `null`. So every transport-level close was one varint short, and the reason phrase
+that followed would be read from the wrong bytes. Nothing caught it because nothing had ever
+encoded that shape: application closes (0x1d) are what the HTTP/3 layer sends, and the one
+test that encoded 0x1c happened to name a frame type. Fixing §11.1 turned this from
+unreachable into the common path, which is how it surfaced.
+
+**§10.2.3: an application close was not converted for early packets.** Type 0x1d "MUST be
+replaced by a CONNECTION_CLOSE of type 0x1c when sending the frame in Initial or Handshake
+packets", with the reason phrase cleared and APPLICATION_ERROR as the code, so that
+application state does not leak into packets with weaker protection.
+
+**§12.4: a packet with no frames at all was accepted.** The loop over frames had nothing to
+iterate and returned happily. It is the cheapest malformed packet there is.
+
+One finding was not a violation, and establishing that mattered as much as the fixes.
+`mapStreamError` collapsed every stream-layer fault into PROTOCOL_VIOLATION with a comment
+saying a later task would carry the specific codes. §11 explicitly permits this: "a generic
+error code ... can always be used in place of specific error codes". So it was never
+non-conforming — but §20.1 defines those codes so a peer can tell which of its own rules it
+broke, and a peer told PROTOCOL_VIOLATION for exceeding a flow control window looks for a
+different bug than one told FLOW_CONTROL_ERROR. The distinction already existed in the error
+type and was being discarded one line from the wire. It is carried now. The same reading
+corrected one code that *was* wrong: a MAX_STREAMS frame above 2^60 reported
+STREAM_LIMIT_ERROR, which §20.1 defines as a stream identifier exceeding an advertised
+limit — not what happened. §19.11 names FRAME_ENCODING_ERROR, and an existing test had
+frozen the wrong answer.
+
 ## Method## Method
 
 The review walked the call path rather than the file list: accept → register →

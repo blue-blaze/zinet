@@ -1471,6 +1471,48 @@ pub const Connection = struct {
     /// peers on one socket must use this rather than `receive`, or a peer that moves
     /// will go unnoticed.
     pub fn receiveOn(self: *Connection, gpa: Allocator, datagram: []const u8, path: u64) !void {
+        // §11.1: "Errors that result in the connection being unusable ... MUST be
+        // signaled using a CONNECTION_CLOSE frame." Every path out of the work below
+        // that reports an error is such an error, so the close is queued here rather
+        // than at each of the two dozen places one can be detected — which is also
+        // why it is here and not in the caller: a caller that forgot would leave the
+        // peer to discover the failure by idle timeout, and that is what used to
+        // happen.
+        self.receiveInner(gpa, datagram, path) catch |err| {
+            self.signalFailure(err);
+            return err;
+        };
+    }
+
+    /// Queue the CONNECTION_CLOSE that §11.1 requires for `err`, if one is owed.
+    ///
+    /// Three cases get no close, and each for a reason in the RFC rather than for
+    /// convenience: a code already recorded (a more specific one, from closer to the
+    /// fault, wins); a connection that is no longer active (§10.2.2 forbids sending
+    /// while draining, and §10.3.1 puts a stateless reset straight there); and a
+    /// failure there is no point signalling, which is version negotiation — §6.2 has
+    /// the client abandon the attempt, and a close written in a version the server
+    /// has just said it does not speak is a close it cannot read.
+    fn signalFailure(self: *Connection, err: anyerror) void {
+        if (self.state != .active) return;
+        if (self.close_info != null) return;
+        const code: u64 = switch (err) {
+            error.ProtocolViolation => 0x0a, // PROTOCOL_VIOLATION
+            error.CryptoBufferExceeded => 0x0d, // CRYPTO_BUFFER_EXCEEDED (§7.5)
+            // §7.3 names TRANSPORT_PARAMETER_ERROR or PROTOCOL_VIOLATION for a
+            // mismatch between the parameters and the packets that carried them.
+            error.ConnectionIdMismatch => 0x08, // TRANSPORT_PARAMETER_ERROR
+            // §20.1: "The endpoint encountered an internal error and cannot continue
+            // with the connection." Telling the peer PROTOCOL_VIOLATION because our
+            // allocator failed would send it looking for a bug it does not have.
+            error.OutOfMemory => 0x01, // INTERNAL_ERROR
+            error.VersionNegotiationFailed, error.StatelessReset, error.ConnectionClosed => return,
+            else => 0x0a,
+        };
+        self.close(code, false);
+    }
+
+    fn receiveInner(self: *Connection, gpa: Allocator, datagram: []const u8, path: u64) !void {
         switch (self.state) {
             .active => {},
             .closing => {
@@ -1786,6 +1828,13 @@ pub const Connection = struct {
             .one_rtt => .one_rtt,
         };
 
+        // §12.4: "The payload of a packet that contains frames MUST contain at least
+        // one frame, and ... an endpoint MUST treat receipt of a packet containing no
+        // frames as a connection error of type PROTOCOL_VIOLATION." The loop below
+        // would accept it silently, since a zero-length payload simply has nothing to
+        // iterate — the one shape of malformed packet that costs nothing to make.
+        if (payload.len == 0) return error.ProtocolViolation;
+
         var rest = payload;
         while (rest.len > 0) {
             const f = frame.parse(&rest) catch return error.ProtocolViolation;
@@ -2039,20 +2088,34 @@ pub const Connection = struct {
         }
     }
 
+    /// Turn a stream-layer fault into a connection error, recording the code §20.1
+    /// gives it on the way past.
+    ///
+    /// The code is recorded here rather than derived later because here is where the
+    /// distinction still exists: every one of these becomes `ProtocolViolation` to
+    /// the caller, since none of them leaves a way to continue, and the peer would
+    /// otherwise be told "protocol violation" for exceeding a flow control window it
+    /// was told the size of. §11 permits that — "a generic error code ... can always
+    /// be used in place of specific error codes" — but permitted is not the same as
+    /// useful: §20.1 defines these codes so a peer can tell which of its own rules it
+    /// broke, and a receiver of STREAM_LIMIT_ERROR looks somewhere quite different
+    /// from a receiver of FLOW_CONTROL_ERROR.
     fn mapStreamError(self: *Connection, result: streams_mod.Error!void) Error!void {
-        _ = self;
-        result catch |err| return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            // Every one of these is a connection error under §11.1. They differ in
-            // the code sent to the peer, which task 8 will carry; the effect here
-            // is the same.
-            error.FlowControlError,
-            error.StreamLimitError,
-            error.StreamStateError,
-            error.FinalSizeError,
-            error.ProtocolViolation,
-            error.ReassemblyBufferExceeded,
-            => error.ProtocolViolation,
+        result catch |err| {
+            const code: u64 = switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.FlowControlError => 0x03, // FLOW_CONTROL_ERROR
+                error.StreamLimitError => 0x04, // STREAM_LIMIT_ERROR
+                error.StreamStateError => 0x05, // STREAM_STATE_ERROR
+                error.FinalSizeError => 0x06, // FINAL_SIZE_ERROR
+                error.FrameEncodingError => 0x07, // FRAME_ENCODING_ERROR (§19.11)
+                // §21.7's mitigation, and a limit of ours rather than a rule of the
+                // peer's: it sent more out-of-order data than we will hold.
+                error.ReassemblyBufferExceeded => 0x03, // FLOW_CONTROL_ERROR
+                error.ProtocolViolation => 0x0a, // PROTOCOL_VIOLATION
+            };
+            if (self.state == .active and self.close_info == null) self.close(code, false);
+            return error.ProtocolViolation;
         };
     }
 
@@ -2698,12 +2761,26 @@ pub const Connection = struct {
 
         if (self.pending_close) |close_request| {
             if (self.highestSendLevel() == level) {
-                const f: frame.Frame = .{ .connection_close = .{
-                    .error_code = close_request.code,
-                    .is_application = close_request.application,
-                    .frame_type = null,
-                    .reason = &.{},
-                } };
+                // §10.2.3: an application close (type 0x1d) "MUST be replaced by a
+                // CONNECTION_CLOSE of type 0x1c when sending the frame in Initial or
+                // Handshake packets", because the application's error code would
+                // otherwise leak application state into packets whose protection is
+                // weaker, and endpoints "MUST clear the value of the Reason Phrase
+                // field and SHOULD use the APPLICATION_ERROR code when converting".
+                // The reason phrase is already always empty here; the code is not.
+                const early = level != .one_rtt;
+                const application = close_request.application and !early;
+                const f: frame.Frame = .{
+                    .connection_close = .{
+                        .error_code = if (close_request.application and early)
+                            0x0c // APPLICATION_ERROR
+                        else
+                            close_request.code,
+                        .is_application = application,
+                        .frame_type = null,
+                        .reason = &.{},
+                    },
+                };
                 const need = frame.encodedLen(f);
                 if (len + need <= dest.len) len += frame.encode(dest[len..], f);
             }
@@ -6622,4 +6699,160 @@ test "connection: migrating without a spare connection id is refused, not fudged
     // exactly as usable as it was.
     try testing.expect(cl.remote.active().len > 0);
     try testing.expect(cl.validating == null);
+}
+
+test "connection: §11.1 a protocol violation is signalled, not merely detected" {
+    // The audit's central finding. A malformed frame used to leave the connection in
+    // `.active` with nothing queued: `receive` returned an error, the caller marked
+    // the connection finished, and the peer learned about it by waiting out its idle
+    // timeout. §11.1 is explicit — "Errors that result in the connection being
+    // unusable ... MUST be signaled using a CONNECTION_CLOSE frame".
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xc9);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+    try exchange(gpa, cl, srv, 8);
+
+    // §19: an unknown frame type is a connection error, unlike HTTP/2.
+    const unknown: [1]u8 = .{0x3f};
+    try testing.expectError(
+        error.ProtocolViolation,
+        injectOneRttOn(gpa, cl, srv, &unknown, 0x1234),
+    );
+
+    // The close is queued with the code §20.1 gives this fault, and it goes out.
+    try testing.expect(srv.close_info != null);
+    try testing.expectEqual(@as(u64, 0x0a), srv.close_info.?.code); // PROTOCOL_VIOLATION
+    try testing.expect(!srv.close_info.?.application);
+
+    var out: [max_datagram]u8 = undefined;
+    const n = try srv.send(gpa, &out);
+    try testing.expect(n > 0);
+    // §10.2: sending it is what enters the closing state, where further packets are
+    // answered with the same close rather than processed.
+    try testing.expectEqual(LifeState.closing, srv.state);
+
+    // And the client, receiving it, reports the code rather than a timeout.
+    try cl.receive(gpa, out[0..n]);
+    try testing.expectEqual(LifeState.draining, cl.state);
+    var saw: ?u64 = null;
+    while (cl.nextEvent()) |event| switch (event) {
+        .peer_closed => |c| saw = c.code,
+        else => {},
+    };
+    try testing.expectEqual(@as(?u64, 0x0a), saw);
+}
+
+test "connection: a stream fault names itself rather than saying 'protocol violation'" {
+    // §20.1's codes exist so a peer can tell which of its own rules it broke. §11
+    // permits a generic code in place of a specific one, so this is a quality
+    // requirement rather than a conformance one — but the distinction was already in
+    // the error type and was being thrown away one line before the wire.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xca);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+    try exchange(gpa, cl, srv, 8);
+
+    // A STREAM frame on a stream the *server* must initiate, sent by the client:
+    // §19.8 makes that STREAM_STATE_ERROR, not a generic violation.
+    var frames: [16]u8 = undefined;
+    const len = frame.encode(&frames, .{
+        .stream = .{
+            .id = 3, // server-initiated unidirectional
+            .offset = 0,
+            .data = "x",
+            .fin = false,
+            .had_length = true,
+        },
+    });
+    try testing.expectError(
+        error.ProtocolViolation,
+        injectOneRttOn(gpa, cl, srv, frames[0..len], 0x1234),
+    );
+    try testing.expect(srv.close_info != null);
+    try testing.expectEqual(@as(u64, 0x05), srv.close_info.?.code); // STREAM_STATE_ERROR
+}
+
+test "connection: §12.4 a packet carrying no frames at all is a violation" {
+    // The cheapest malformed packet there is, and the loop over frames used to accept
+    // it because there was nothing to iterate.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0xcb);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+    try exchange(gpa, cl, srv, 8);
+
+    try testing.expectError(
+        error.ProtocolViolation,
+        injectOneRttOn(gpa, cl, srv, &.{}, 0x1234),
+    );
+    try testing.expectEqual(@as(u64, 0x0a), srv.close_info.?.code);
+}
+
+test "connection: §10.2.3 an application close is converted before the handshake ends" {
+    // §10.2.3: type 0x1d must not appear in an Initial or Handshake packet, because
+    // the application's error code would leak application state into packets with
+    // weaker protection. The conversion is to 0x1c with APPLICATION_ERROR and an
+    // empty reason phrase.
+    const gpa = testing.allocator;
+    initServerIdentity();
+    const dcid = testCid(&.{ 8, 8, 8, 8, 8, 8, 8, 8 });
+    var cl = try Connection.initClient(
+        testOptions(testCid(&.{ 5, 5, 5, 5 }), dcid),
+        @splat(0xcc),
+    );
+    defer cl.deinit(gpa);
+    try cl.start(gpa);
+
+    // An application close while only Initial keys exist.
+    cl.close(0x0102, true);
+    try testing.expect(cl.highestSendLevel() == .initial);
+
+    var out: [max_datagram]u8 = undefined;
+    const n = try cl.send(gpa, &out);
+    try testing.expect(n > 0);
+
+    // Read it back the way the peer would: Initial keys are derived from the
+    // connection ID, so the same keys that sealed this open it. Asserting on the
+    // bytes rather than on intent is the point — the conversion has to happen where
+    // the frame is encoded, not where it was decided.
+    const parsed = try packet.parse(out[0..n], dcid.len);
+    const protected = parsed.packet.protected;
+    var keys = cl.spaceFor(.initial).send.?;
+
+    var work: [max_datagram]u8 = undefined;
+    @memcpy(work[0..n], out[0..n]);
+    const buf = work[0..n];
+    const pn_len = crypto.unprotectHeader(buf, protected.pn_offset, &keys.header);
+    const pn = readPacketNumber(buf[protected.pn_offset..][0..pn_len]);
+    const header = buf[0 .. protected.pn_offset + pn_len];
+    const body = buf[protected.pn_offset + pn_len .. protected.pn_offset + protected.remainder_len];
+    var plain_buf: [max_datagram]u8 = undefined;
+    const plain_len = try keys.open(&plain_buf, pn, header, body);
+
+    // The close is written before the CRYPTO frame (see `writePacket`), so it is at
+    // the front. Parsing stops at the first frame this loop cannot read rather than
+    // insisting on the whole payload: what follows is a ClientHello, and re-deriving
+    // the TLS framing here would test the wrong thing.
+    var rest: []const u8 = plain_buf[0..plain_len];
+    var seen: ?frame.Frame = null;
+    while (rest.len > 0) {
+        const f = frame.parse(&rest) catch break;
+        if (f == .connection_close) {
+            seen = f;
+            break;
+        }
+    }
+    try testing.expect(seen != null);
+    const close = seen.?.connection_close;
+    try testing.expect(!close.is_application); // 0x1c, not 0x1d
+    try testing.expectEqual(@as(u64, 0x0c), close.error_code); // APPLICATION_ERROR
+    try testing.expectEqual(@as(usize, 0), close.reason.len);
 }

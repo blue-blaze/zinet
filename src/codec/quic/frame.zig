@@ -573,7 +573,14 @@ pub fn encodedLen(frame: Frame) usize {
         .connection_close => |f| blk: {
             var len: usize = 1 + varint.encodedLen(f.error_code) +
                 varint.encodedLen(f.reason.len) + f.reason.len;
-            if (f.frame_type) |ft| len += varint.encodedLen(ft);
+            // §19.19: the transport form (0x1c) always carries the Frame Type field,
+            // and "a value of 0 ... is used when the frame type is unknown". Only the
+            // application form (0x1d) omits it. Making it conditional on the caller
+            // having a value to put there produced a frame this file's own parser
+            // could not read — it reads the field whenever the type is 0x1c — which
+            // went unnoticed because every close ever encoded was either an
+            // application close or a test that happened to name a frame type.
+            if (!f.is_application) len += varint.encodedLen(f.frame_type orelse 0);
             break :blk len;
         },
     };
@@ -713,7 +720,7 @@ pub fn encode(dest: []u8, frame: Frame) usize {
             else
                 .connection_close_transport);
             i += varint.encode(dest[i..], f.error_code);
-            if (f.frame_type) |ft| i += varint.encode(dest[i..], ft);
+            if (!f.is_application) i += varint.encode(dest[i..], f.frame_type orelse 0);
             i += varint.encode(dest[i..], f.reason.len);
             @memcpy(dest[i..][0..f.reason.len], f.reason);
             i += f.reason.len;
@@ -1147,4 +1154,49 @@ test "frame: the gap arithmetic is its own inverse" {
             try testing.expectEqual(next_largest - length, range.smallest);
         }
     }
+}
+
+test "frame: §19.19 the transport close always carries a frame type, the application one never" {
+    // The field is mandatory in the 0x1c form and absent from 0x1d, and the parser in
+    // this file has always read it that way. The encoder wrote it only when the caller
+    // supplied one, so a transport close with no frame type to name — which is the
+    // ordinary case for a protocol violation detected outside frame parsing — encoded
+    // one varint short and desynchronised whatever read it. Nothing caught it because
+    // the only closes ever encoded were application closes, which omit the field
+    // correctly, and one test that happened to pass a frame type.
+    var buf: [64]u8 = undefined;
+
+    for ([_]?u64{ null, 0, 0x06 }) |frame_type| {
+        const transport_close: Frame = .{ .connection_close = .{
+            .error_code = 0x0a,
+            .frame_type = frame_type,
+            .reason = "why",
+            .is_application = false,
+        } };
+        const len = encode(&buf, transport_close);
+        try testing.expectEqual(encodedLen(transport_close), len);
+
+        var rest: []const u8 = buf[0..len];
+        const back = try parse(&rest);
+        try testing.expectEqual(@as(usize, 0), rest.len);
+        try testing.expect(!back.connection_close.is_application);
+        try testing.expectEqual(@as(u64, 0x0a), back.connection_close.error_code);
+        try testing.expectEqualStrings("why", back.connection_close.reason);
+        // A missing type reads back as §19.19's "unknown", which is the value 0.
+        try testing.expectEqual(@as(?u64, frame_type orelse 0), back.connection_close.frame_type);
+    }
+
+    const app_close: Frame = .{ .connection_close = .{
+        .error_code = 0x0102,
+        .frame_type = null,
+        .reason = "",
+        .is_application = true,
+    } };
+    const len = encode(&buf, app_close);
+    try testing.expectEqual(encodedLen(app_close), len);
+    var rest: []const u8 = buf[0..len];
+    const back = try parse(&rest);
+    try testing.expectEqual(@as(usize, 0), rest.len);
+    try testing.expect(back.connection_close.is_application);
+    try testing.expectEqual(@as(?u64, null), back.connection_close.frame_type);
 }
