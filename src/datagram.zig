@@ -399,6 +399,28 @@ pub const DatagramChannel = struct {
         var scratch: ?Buffer = null;
         defer if (scratch) |*pending| channel.releaseBuffer(pending);
 
+        // Two independent absolute deadlines, following `Channel.readLoop`.
+        //
+        // They were one relative deadline — the nearer of the two intervals, recomputed
+        // after every datagram — and both halves of that were wrong. A tick fired on *any*
+        // expiry, so a 2 ms `close_poll` turned a one-second `tick_interval` into a 2 ms
+        // one: hundreds of pipeline events a second the application never asked for. And
+        // because the deadline restarted from "now" on every arrival, a peer sending
+        // steadily postponed ticks indefinitely — an idle timer a busy peer can suppress is
+        // the timer nobody wants.
+        //
+        // Absolute deadlines fix both: each cadence keeps its own next-due time, expiry is
+        // attributed by comparing the clock against each, and a datagram arriving does not
+        // move either one.
+        var next_tick: ?Io.Timestamp = if (channel.options.tick_interval) |interval|
+            Io.Timestamp.now(io, .awake).addDuration(interval)
+        else
+            null;
+        var next_poll: ?Io.Timestamp = if (channel.options.close_poll) |interval|
+            Io.Timestamp.now(io, .awake).addDuration(interval)
+        else
+            null;
+
         while (channel.isOpen()) {
             if (scratch == null) {
                 scratch = channel.acquireBuffer() catch |err| {
@@ -410,27 +432,36 @@ pub const DatagramChannel = struct {
             assert(destination.len > 0);
 
             const incoming = receive: {
-                // The nearer of the two optional deadlines: close polling and
-                // ticks share the mechanism, they differ in what happens when
-                // the deadline passes (nothing vs. a pipeline event).
-                const wait: ?Io.Duration = nearest(
-                    channel.options.close_poll,
-                    channel.options.tick_interval,
-                );
-                if (wait) |poll| {
-                    const deadline = Io.Timestamp.now(io, .awake)
-                        .addDuration(poll)
-                        .withClock(.awake);
+                // The nearer of the two deadlines bounds the read; which one *fired* is
+                // decided afterwards by the clock, because they mean different things —
+                // nothing versus a pipeline event — and both can be due at once.
+                if (earlier(next_tick, next_poll)) |deadline| {
                     break :receive channel.socket.receiveTimeout(io, destination, .{
-                        .deadline = deadline,
+                        .deadline = deadline.withClock(.awake),
                     }) catch |err| switch (err) {
                         error.Timeout => {
-                            // A tick, if ticks were asked for. Delivered on the
-                            // reader task like every other pipeline event, which
-                            // is what keeps handler state lock free.
-                            if (channel.options.tick_interval != null) {
-                                var tick: Tick = .{ .at = Io.Timestamp.now(io, .awake) };
-                                channel.pipeline.fireEvent(.init(&tick));
+                            const now = Io.Timestamp.now(io, .awake);
+                            if (due(next_poll, now)) {
+                                // Nothing to deliver: waking up *is* the poll. The loop's
+                                // own `isOpen()` check is what it woke up for.
+                                next_poll = if (channel.options.close_poll) |interval|
+                                    now.addDuration(interval)
+                                else
+                                    null;
+                            }
+                            if (due(next_tick, now)) {
+                                // Re-read the interval: a handler may have changed it since
+                                // the last tick.
+                                if (channel.options.tick_interval) |interval| {
+                                    next_tick = now.addDuration(interval);
+                                    // Delivered on the reader task like every other
+                                    // pipeline event, which is what keeps handler state
+                                    // lock free.
+                                    var tick: Tick = .{ .at = now };
+                                    channel.pipeline.fireEvent(.init(&tick));
+                                } else {
+                                    next_tick = null;
+                                }
                             }
                             continue;
                         },
@@ -533,10 +564,17 @@ pub const DatagramChannel = struct {
 /// A bound endpoint with its tasks running.
 ///
 /// The thin wrapper exists because a datagram endpoint is usually a single
-fn nearest(a: ?Io.Duration, b: ?Io.Duration) ?Io.Duration {
+/// The nearer of two optional deadlines, or whichever one exists.
+fn earlier(a: ?Io.Timestamp, b: ?Io.Timestamp) ?Io.Timestamp {
     const first = a orelse return b;
     const second = b orelse return first;
-    return if (first.nanoseconds <= second.nanoseconds) first else second;
+    return if (first.nanoseconds < second.nanoseconds) first else second;
+}
+
+/// Whether `deadline` exists and has passed.
+fn due(deadline: ?Io.Timestamp, now: Io.Timestamp) bool {
+    const at = deadline orelse return false;
+    return now.nanoseconds >= at.nanoseconds;
 }
 
 /// long-lived socket rather than one of many connections, so there is no
@@ -1068,4 +1106,124 @@ fn waitFor(io: Io, budget: Io.Duration, comptime ready: fn () bool) !void {
         if (Io.Timestamp.now(io, .awake).nanoseconds >= deadline.nanoseconds) return;
         try io.sleep(.fromMilliseconds(2), .awake);
     }
+}
+
+/// Counts `Tick` events for the test below.
+var tick_count: std.atomic.Value(u32) = .init(0);
+
+const TickCounter = struct {
+    pub fn onEvent(_: *TickCounter, ctx: *pipeline_mod.HandlerContext, event: pipeline_mod.Event) !void {
+        if (event.is(DatagramChannel.Tick)) _ = tick_count.fetchAdd(1, .monotonic);
+        ctx.fireEvent(event);
+    }
+};
+
+fn buildTickCounter(pipeline: *Pipeline) anyerror!void {
+    const handler = try pipeline.gpa.create(TickCounter);
+    handler.* = .{};
+    errdefer pipeline.gpa.destroy(handler);
+    _ = try pipeline.addLast("tick-counter", .initOwned(handler));
+}
+
+test "DatagramChannel: close polling does not set the tick cadence" {
+    // Two independent cadences sharing one deadline is the defect. `close_poll` exists so
+    // a caller holding neither the reader's task nor its future can stop it, and wants to
+    // be short; `tick_interval` is a protocol timer and may be minutes. The receive was
+    // bounded by the nearer of the two and then fired a tick on *any* expiry, so setting a
+    // 5 ms poll turned a 1-second tick into a 5 ms tick — two hundred pipeline events per
+    // second the application never asked for, each of them a handler callback.
+    //
+    // The second half of the same defect: the deadline was recomputed relative to "now"
+    // after every datagram, so a peer sending steadily could postpone ticks forever. An
+    // idle timer that a busy peer can suppress is exactly the timer nobody wants.
+    try channel_mod.skipIfReadDeadlinesAreBroken();
+    const gpa = testing.allocator;
+    var threaded = try backend.Runtime.init(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    tick_count.store(0, .release);
+
+    const channel = try DatagramChannel.open(.{ .ip4 = .loopback(0) }, .{
+        .gpa = gpa,
+        .io = io,
+        .initializer = .initFunction(buildTickCounter),
+        .close_poll = .fromMilliseconds(2),
+        .tick_interval = .fromMilliseconds(200),
+    });
+    channel.retain();
+    defer channel.release();
+
+    var future = try io.concurrent(DatagramChannel.serve, .{channel});
+
+    // Long enough for a hundred close polls and no more than one tick.
+    try io.sleep(.fromMilliseconds(150), .awake);
+    const during = tick_count.load(.acquire);
+
+    // `serve` consumes a reference on its way out, so the count returning to the one this
+    // test holds is the observable "the reader finished" — and waiting for it with a bound
+    // rather than `await` means a reader that ignores the poll fails this test instead of
+    // wedging the suite.
+    channel.requestClose();
+    const deadline = Io.Timestamp.now(io, .awake).addDuration(.fromSeconds(5));
+    while (channel.refs.load(.acquire) > 1) {
+        if (Io.Timestamp.now(io, .awake).nanoseconds >= deadline.nanoseconds) break;
+        try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    try testing.expectEqual(@as(u32, 1), channel.refs.load(.acquire));
+    future.cancel(io);
+
+    // One tick would be a scheduling accident near the boundary; seventy-five is the poll
+    // interval having become the tick interval.
+    try testing.expect(during <= 1);
+}
+
+test "DatagramChannel: a busy peer cannot postpone ticks" {
+    // The other half of the same defect. The receive deadline used to be computed as
+    // "now + interval" on every pass of the loop, so each arriving datagram pushed the next
+    // tick out by a full interval — a peer sending faster than the tick rate suppressed
+    // ticks entirely. Anything built on ticks is a timer, and a timer a busy peer can
+    // switch off is worse than no timer: the idle detection, the read timeout and QUIC's
+    // loss recovery all stop exactly when traffic is heaviest.
+    //
+    // With absolute deadlines, arrivals do not move the tick, so a steady flood still sees
+    // one tick per interval.
+    try channel_mod.skipIfReadDeadlinesAreBroken();
+    const gpa = testing.allocator;
+    var threaded = try backend.Runtime.init(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    tick_count.store(0, .release);
+
+    const channel = try DatagramChannel.open(.{ .ip4 = .loopback(0) }, .{
+        .gpa = gpa,
+        .io = io,
+        .initializer = .initFunction(buildTickCounter),
+        .tick_interval = .fromMilliseconds(40),
+    });
+    channel.retain();
+    defer channel.release();
+
+    var future = try io.concurrent(DatagramChannel.serve, .{channel});
+    const target = channel.localAddress();
+
+    var peer = try Peer.init(io);
+    defer peer.deinit(io);
+
+    // Faster than the tick interval, for several intervals' worth of time.
+    const stop = Io.Timestamp.now(io, .awake).addDuration(.fromMilliseconds(300));
+    while (Io.Timestamp.now(io, .awake).nanoseconds < stop.nanoseconds) {
+        try peer.sendTo(io, target, "keep busy");
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+    const during = tick_count.load(.acquire);
+
+    channel.requestClose();
+    // No `close_poll` here, so the reader is woken by cancellation rather than by noticing.
+    future.cancel(io);
+
+    // 300 ms of 40 ms ticks is seven in the ideal case; three is a generous floor that still
+    // cannot be reached if arrivals reset the timer, which produced none at all.
+    try testing.expect(during >= 3);
 }
