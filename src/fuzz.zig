@@ -349,11 +349,26 @@ fn withLeakCheck(
 
 /// Shared across iterations because spinning up an `Io` per input would
 /// dominate the run time. Nothing here is stateful with respect to the input.
+///
+/// The runtime comes from `backend`, which is what `-Dio=` selects — it used to be a
+/// `std.Io.Threaded` constructed here, so `zig build fuzz -Dio=zio` built the fiber backend
+/// and then fuzzed on threads anyway. Every target ran on the one backend regardless of the
+/// flag, while the README counted the fuzz targets among what runs on fibers. The harness
+/// self-check below already used `backend.Runtime`, which is how the two came to disagree:
+/// the only code path that named the backend correctly was the one testing the rig.
 const Harness = struct {
-    threaded: Io.Threaded,
+    runtime: backend.Runtime,
+
+    fn init(gpa: std.mem.Allocator) !Harness {
+        return .{ .runtime = try .init(gpa) };
+    }
+
+    fn deinit(self: *Harness) void {
+        self.runtime.deinit();
+    }
 
     fn io(self: *Harness) Io {
-        return self.threaded.io();
+        return self.runtime.io();
     }
 };
 
@@ -451,8 +466,8 @@ fn fuzzHttpBody(harness: *Harness, smith: *Smith, gpa: Allocator) anyerror!void 
 }
 
 test "fuzz: HTTP request decoder" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzHttp, .{ .corpus = &http_corpus });
 }
 
@@ -541,8 +556,8 @@ fn fuzzResponseBody(harness: *Harness, smith: *Smith, gpa: Allocator) anyerror!v
 }
 
 test "fuzz: HTTP response decoder" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzResponse, .{ .corpus = &response_corpus });
 }
 
@@ -613,8 +628,8 @@ fn fuzzFramingBody(harness: *Harness, smith: *Smith, gpa: Allocator) anyerror!vo
 }
 
 test "fuzz: framing decoders" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzFraming, .{ .corpus = &framing_corpus });
 }
 
@@ -664,8 +679,8 @@ fn fuzzJson(harness: *Harness, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: JSON value framing" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzJson, .{ .corpus = &json_corpus });
 }
 
@@ -903,8 +918,8 @@ fn fuzzHttp2(harness: *Harness, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: HTTP/2 connection" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzHttp2, .{ .corpus = &http2_corpus });
 }
 
@@ -1002,8 +1017,8 @@ fn fuzzHpack(harness: *Harness, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: HPACK round trip" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzHpack, .{ .corpus = &.{
         "",
         "\x82\x86\x84",
@@ -1046,8 +1061,8 @@ fn fuzzHuffman(harness: *Harness, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: Huffman round trip" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzHuffman, .{ .corpus = &.{
         "",
         "www.example.com",
@@ -1141,8 +1156,8 @@ fn fuzzWebSocketBody(harness: *Harness, smith: *Smith, gpa: Allocator) anyerror!
 }
 
 test "fuzz: WebSocket frame decoder" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzWebSocket, .{ .corpus = &websocket_corpus });
 }
 
@@ -1237,8 +1252,8 @@ fn fuzzBufferBody(_: *Harness, smith: *Smith, gpa: Allocator) anyerror!void {
 }
 
 test "fuzz: Buffer against a model" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzBuffer, .{ .corpus = &.{ "", "\x01\x02\x03\x04" } });
 }
 
@@ -1315,8 +1330,8 @@ fn fuzzWebSocketRoundTripBody(_: *Harness, smith: *Smith, gpa: Allocator) anyerr
 }
 
 test "fuzz: WebSocket frames survive an encode and decode" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzWebSocketRoundTrip, .{ .corpus = &.{ "", "\x01\x02" } });
 }
 
@@ -1389,8 +1404,8 @@ fn fuzzLengthFieldRoundTripBody(_: *Harness, smith: *Smith, gpa: Allocator) anye
 }
 
 test "fuzz: length-prefixed frames survive an encode and decode" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzLengthFieldRoundTrip, .{ .corpus = &.{ "", "\x03\x04" } });
 }
 
@@ -1491,8 +1506,8 @@ fn fuzzPoolBody(_: *Harness, smith: *Smith, gpa: Allocator) anyerror!void {
 }
 
 test "fuzz: BufferPool and SharedBuffer operation sequences" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzPool, .{ .corpus = &.{ "", "\x00\x01\x02\x03\x04\x05" } });
 }
 
@@ -1577,8 +1592,8 @@ fn fuzzUpgradeBody(harness: *Harness, smith: *Smith, gpa: Allocator) anyerror!vo
 }
 
 test "fuzz: WebSocket upgrade" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzUpgrade, .{ .corpus = &upgrade_corpus });
 }
 
@@ -1748,8 +1763,8 @@ fn fuzzRedisBody(harness: *Harness, smith: *Smith, gpa: Allocator) anyerror!void
 }
 
 test "fuzz: Redis RESP decoder" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzRedis, .{ .corpus = &redis_corpus });
 }
 
@@ -1850,8 +1865,8 @@ fn fuzzDeflateBody(harness: *Harness, smith: *Smith, gpa: Allocator) anyerror!vo
 }
 
 test "fuzz: WebSocket permessage-deflate decoder" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzDeflate, .{ .corpus = &deflate_corpus });
 }
 
@@ -1923,8 +1938,8 @@ fn runStress(
     comptime body: fn (harness: *Harness, smith: *Smith) anyerror!void,
     seed: u64,
 ) !void {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
 
     var prng: std.Random.DefaultPrng = .init(seed);
     const random = prng.random();
@@ -2048,8 +2063,8 @@ fn fuzzQuicVarint(harness: *Harness, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: QUIC varint round trip and arbitrary bytes" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzQuicVarint, .{ .corpus = &.{
         "",
         "\x00",
@@ -2093,8 +2108,8 @@ fn fuzzQuicFrame(harness: *Harness, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: QUIC frame parser on arbitrary bytes" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzQuicFrame, .{
         .corpus = &.{
             "\x01\x01\x01", // PING, PING, PING
@@ -2131,8 +2146,8 @@ fn fuzzQuicPacket(harness: *Harness, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: QUIC packet parser on arbitrary bytes" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzQuicPacket, .{
         .corpus = &.{
             "",
@@ -2200,8 +2215,8 @@ fn fuzzAckRanges(harness: *Harness, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: QUIC ACK ranges against a bitmap model" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzAckRanges, .{ .corpus = &.{
         "",
         "\x01\x02\x03\x04\x05\x06\x07\x08",
@@ -2576,8 +2591,8 @@ fn fuzzHttp3Connection(harness: *Harness, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: HTTP/3 connection state machine" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzHttp3Connection, .{
         .corpus = &.{
             "",
@@ -2697,8 +2712,8 @@ fn fuzzHttp3Frame(harness: *Harness, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: HTTP/3 frame parser chunk independence" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzHttp3Frame, .{
         .corpus = &.{
             "\x04\x00", // empty SETTINGS
@@ -2775,8 +2790,8 @@ fn fuzzQpack(harness: *Harness, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: QPACK sections round trip and survive arbitrary bytes" {
-    var harness: Harness = .{ .threaded = .init(std.testing.allocator, .{}) };
-    defer harness.threaded.deinit();
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
     try std.testing.fuzz(&harness, fuzzQpack, .{
         .corpus = &.{
             "",

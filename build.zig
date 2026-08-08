@@ -128,7 +128,21 @@ pub fn build(b: *std.Build) void {
     const fmt_check = b.addFmt(.{ .paths = fmt_paths, .check = true });
     b.step("fmt-check", "Check source formatting").dependOn(&fmt_check.step);
 
-    // `zig build` performs the checks that CI performs.
+    // `zig build check` is the one that matches CI, step for step: formatting, tests, fuzz
+    // targets, examples and benchmarks. It exists because the claim used to be attached to
+    // the default step, which depends on tests and examples only — so "the checks that CI
+    // performs" left out the fuzz targets and the benchmarks, and a change that broke either
+    // passed locally and failed on push.
+    const check_step = b.step("check", "Everything CI runs: fmt-check, test, fuzz, examples, bench");
+    check_step.dependOn(&fmt_check.step);
+    check_step.dependOn(test_step);
+    check_step.dependOn(fuzz_step);
+    check_step.dependOn(examples_step);
+    check_step.dependOn(bench_step);
+
+    // The default stays the fast pair rather than becoming `check`: the fuzz targets take
+    // minutes, and a default that people avoid running is worse than a default that says
+    // what it covers.
     b.getInstallStep().dependOn(test_step);
     b.getInstallStep().dependOn(examples_step);
 }

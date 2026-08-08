@@ -684,8 +684,13 @@ zig build test -Dio=zio # the same, on fibers instead of threads
 zig build fuzz          # fuzz targets: corpora plus seeded randomized runs
 zig build fmt           # format
 zig build fmt-check     # verify formatting (what CI runs)
-zig build               # test + examples, i.e. the full local check
+zig build               # test + examples: the quick pair
+zig build check         # fmt-check + test + fuzz + examples + bench, step for step what CI runs
 ```
+
+`zig build` used to be described as "the full local check" and was not: it depends on
+tests and examples, so the fuzz targets and the benchmarks — both of which CI runs — were
+outside it. `check` is the complete one; the default stays quick on purpose.
 
 The fuzz targets assert properties, not merely the absence of a crash. The
 central one is **chunk independence**: a stream decoder must produce identical

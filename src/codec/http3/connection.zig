@@ -1108,20 +1108,26 @@ pub const Connection = struct {
         // CANCEL_PUSH becoming permanently unreachable while the connection continues as
         // if nothing had happened.
         //
-        // Checked after classification, because the FIN can ride with the very bytes that
-        // name the stream's type. A stream closed *before* its type arrives is a
-        // different case that §6.2 requires tolerating, and it returns above.
-        if (fin and self.isCriticalStream(id)) return self.fail(0x0104);
+        // §6.2.1 and RFC 9204 §4.2: closing one of these streams is a connection error, and
+        // it is checked *after* the bytes in this delivery have been processed.
+        //
+        // The order matters and the fuzzer proved it. Checking first meant a control stream
+        // whose GOAWAY and FIN arrived in one delivery failed the connection without ever
+        // parsing the GOAWAY, while the same bytes split across two deliveries produced the
+        // GOAWAY event and then failed — the two disagreed about what the peer had said,
+        // which is the chunk-independence invariant this codebase is built around. Data that
+        // arrived before the close is data that was received; the close is what happens
+        // next.
+        const critical = fin and self.isCriticalStream(id);
 
-        if (matches(self.control_in, id)) return self.onControlData(gpa, id);
-        if (matches(self.qpack_encoder_in, id)) {
+        if (matches(self.control_in, id)) {
+            try self.onControlData(gpa, id);
+        } else if (matches(self.qpack_encoder_in, id)) {
             const bytes = self.transport.read(id);
             // RFC 9204 §3.2.3: we advertised zero table capacity, so the
             // peer's encoder stream must stay empty.
             qpack.onEncoderStreamData(bytes) catch |err| return self.failQpack(err);
-            return;
-        }
-        if (matches(self.qpack_decoder_in, id)) {
+        } else if (matches(self.qpack_decoder_in, id)) {
             var bytes = self.transport.read(id);
             const before = bytes.len;
             while (true) {
@@ -1131,8 +1137,9 @@ pub const Connection = struct {
                 qpack.applyDecoderInstruction(parsed) catch |err| return self.failQpack(err);
             }
             self.transport.consume(gpa, id, before - bytes.len);
-            return;
         }
+
+        if (critical) return self.fail(0x0104);
     }
 
     fn onControlData(self: *Connection, gpa: Allocator, id: u64) !void {
@@ -3196,6 +3203,33 @@ test "http3: closing a critical stream ends the connection" {
         const len = quic.varint.encode(&bytes, 0x03); // qpack decoder
         try testing.expectError(error.H3Error, h3.inject(gpa, 11, 0, bytes[0..len], true));
         try testing.expectEqual(@as(?u64, 0x0104), h3.conn.close_code);
+    }
+
+    // Frames delivered together with the FIN are still processed. The close is a connection
+    // error, but it is what happens *after* the bytes that arrived with it — otherwise the
+    // same GOAWAY produces an event when it arrives alone and no event when it arrives in
+    // the same delivery as the FIN, and the connection's view of what the peer said depends
+    // on how the network fragmented it. The fuzzer's chunk-independence check found exactly
+    // that, one commit after this rule was added.
+    {
+        var h3 = try establishH3(gpa, 0x96);
+        defer h3.deinit(gpa);
+        var bytes: [64]u8 = undefined;
+        var len: usize = quic.varint.encode(&bytes, 0x00);
+        len += frame.writeSettings(bytes[len..], &.{});
+        try h3.inject(gpa, 3, 0, bytes[0..len], false);
+
+        var goaway: [16]u8 = undefined;
+        const goaway_len = frame.writeGoaway(&goaway, 0);
+        try testing.expectError(error.H3Error, h3.inject(gpa, 3, len, goaway[0..goaway_len], true));
+        try testing.expectEqual(@as(?u64, 0x0104), h3.conn.close_code);
+
+        // The GOAWAY was seen, not swallowed by the close.
+        var saw_goaway = false;
+        while (h3.conn.nextEvent()) |event| {
+            if (event == .goaway) saw_goaway = true;
+        }
+        try testing.expect(saw_goaway);
     }
 
     // A stream closed *before* its type arrived is explicitly tolerated (§6.2), because
