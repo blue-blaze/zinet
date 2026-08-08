@@ -52,6 +52,19 @@ pub const ChildConfig = struct {
     /// Longest a queued write waits while the connection is blocked reading.
     write_poll: Io.Duration = .fromMilliseconds(10),
     pool: ?*BufferPool = null,
+    /// How long a client has to finish its handshake, measured from the moment the
+    /// connection was admitted. Null waits forever, which is what this used to do.
+    ///
+    /// A bound rather than a preference: a connection still handshaking holds a task — two
+    /// OS threads on the threaded backend — and no application code has run yet, so a peer
+    /// that opens sockets and then says nothing spends a server's scarcest resource without
+    /// ever identifying itself. Nothing else ended such a connection; the operating system
+    /// was the only backstop.
+    ///
+    /// One deadline for the whole handshake rather than one per read. A per-read deadline
+    /// lets a peer send a byte before each expiry and hold the connection open forever,
+    /// which is a bound that does not bind.
+    handshake_timeout: ?Io.Duration = .fromSeconds(10),
 };
 
 /// One accepted connection: a socket, a `ServerSession`, a pipeline, one task.
@@ -267,9 +280,21 @@ pub const Connection = struct {
     /// Reads until the client's Finished has been verified. A server sends
     /// nothing first, so this is a plain receive loop.
     fn handshake(connection: *Connection) !void {
+        // Absolute, computed once. `readSocket` reports a timeout as zero bytes, which is
+        // also how a peer that closed reads, so the clock is what distinguishes them.
+        const deadline: ?Io.Timestamp = if (connection.options.handshake_timeout) |timeout|
+            Io.Timestamp.now(connection.io, .awake).addDuration(timeout)
+        else
+            null;
+
         var scratch: [16 * 1024]u8 = undefined;
         while (!connection.session.isEstablished()) {
-            const n = try driver.readSocket(connection, &scratch, null);
+            const n = try driver.readSocket(connection, &scratch, deadline);
+            if (deadline) |d| {
+                if (Io.Timestamp.now(connection.io, .awake).nanoseconds >= d.nanoseconds) {
+                    return error.HandshakeTimeout;
+                }
+            }
             try connection.session.receive(connection.gpa, scratch[0..n]);
             try driver.flushOutput(connection);
         }
@@ -755,4 +780,47 @@ test "tls13 server: the standard library's TLS client handshakes against our ser
     try testing.expectEqualStrings(expected, test_collector.buf[0..seen]);
 
     client.shutdown();
+}
+
+test "tls13: a peer that accepts and then says nothing does not hold a task forever" {
+    // The bound that was missing. A TLS handshake here is a plain read loop, and it used
+    // to be handed no deadline at all — so a peer that completes the TCP handshake and then
+    // stays silent held a connection, and with it a task and two OS threads on the threaded
+    // backend, until the operating system intervened. Concurrency is this framework's
+    // scarcest resource, which makes that the cheapest denial of service available against
+    // a TLS endpoint.
+    //
+    // Written from the client's side because it is the side that can be made to wait with
+    // nothing but a listening socket: a bare TCP listener that accepts and never speaks is
+    // exactly the shape of the problem, and needs no certificate to arrange.
+    try channel_mod.skipIfReadDeadlinesAreBroken();
+    const gpa = testing.allocator;
+    var threaded = try backend.Runtime.init(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var silent = try (Io.net.IpAddress{ .ip4 = .loopback(0) }).listen(io, .{ .reuse_address = true });
+    defer silent.deinit(io);
+    const address = silent.socket.address;
+
+    // No accept task at all: the kernel's backlog completes the TCP handshake, and nothing
+    // above it ever answers. That is indistinguishable, from the client's side, from a
+    // server that accepted and then hung.
+    const started = Io.Timestamp.now(io, .awake);
+    const result = client_mod.Client.connect(.{
+        .gpa = gpa,
+        .io = io,
+        .address = address,
+        .host = "example.test",
+        .verification = null,
+        .initializer = .initFunction(buildCollector),
+        .seed = @splat(0x51),
+        .handshake_timeout = .fromMilliseconds(200),
+    });
+    const elapsed = Io.Timestamp.now(io, .awake).nanoseconds - started.nanoseconds;
+
+    try testing.expectError(error.HandshakeTimeout, result);
+    // And it gave up on its own schedule rather than the operating system's: comfortably
+    // under a second, which no TCP-level timeout would manage.
+    try testing.expect(elapsed < std.time.ns_per_s);
 }

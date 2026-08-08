@@ -91,6 +91,18 @@ pub const Connection = struct {
         /// Handshake seed; null draws from the Io's CSPRNG. Injectable so a
         /// test can reproduce a connection.
         seed: ?[64]u8 = null,
+        /// How long the server has to complete the handshake, from the moment `connect`
+        /// sends the ClientHello. Null waits forever, which is what this used to do.
+        ///
+        /// The client's exposure is smaller than the server's — it chose to connect — but
+        /// the failure is worse to diagnose: a server that accepts the TCP connection and
+        /// then never answers leaves `connect` blocked with no error to report, so an
+        /// application that opens connections on demand accumulates stuck tasks and looks
+        /// like it is doing nothing.
+        ///
+        /// One deadline for the whole handshake rather than one per read, for the same
+        /// reason as on the server: a per-read deadline can be reset forever by a byte.
+        handshake_timeout: ?Io.Duration = .fromSeconds(10),
         pool: ?*BufferPool = null,
     };
 
@@ -119,17 +131,17 @@ pub const Connection = struct {
         }
         defer std.crypto.secureZero(u8, &seed);
 
-        var session: ClientSession = try .init(.{
-            .host = options.host,
-            .alpn = options.alpn,
-            .verification = options.verification,
-        }, seed);
-        errdefer session.deinit(gpa);
-
         var address = options.address;
         const stream = try address.connect(io, .{ .mode = .stream });
         errdefer stream.close(io);
 
+        // The session is built in place rather than built locally and copied. The copy is
+        // what made the previous shape wrong: `errdefer session.deinit(gpa)` on a local
+        // that has since been assigned into `connection` tears down the state the session
+        // *started* with, while everything the handshake below allocated lives in
+        // `connection.session` and was simply leaked. Nothing exercised it, because no test
+        // had ever made `connect` fail after this point — a handshake timeout is the first
+        // way to do that.
         connection.* = .{
             .gpa = gpa,
             .io = io,
@@ -137,7 +149,11 @@ pub const Connection = struct {
             .stream = stream,
             .stream_writer = undefined,
             .socket_write_buffer = socket_write_buffer,
-            .session = session,
+            .session = try .init(.{
+                .host = options.host,
+                .alpn = options.alpn,
+                .verification = options.verification,
+            }, seed),
             .pipeline = undefined,
             .outbound_storage = outbound_storage,
             .outbound = .init(outbound_storage),
@@ -147,6 +163,7 @@ pub const Connection = struct {
             .finished = .init(false),
             .refs = .init(1),
         };
+        errdefer connection.session.deinit(gpa);
         connection.stream_writer = connection.stream.writer(io, socket_write_buffer);
 
         // The handshake, here and now: a failure to establish trust is a plain
@@ -167,10 +184,24 @@ pub const Connection = struct {
         try connection.session.start(gpa);
         try connection.flushOutput();
 
+        // Absolute, computed once: `readSocket` reports a timeout as zero bytes, and so
+        // does a peer that closed, so the clock is what tells them apart.
+        const deadline: ?Io.Timestamp = if (connection.options.handshake_timeout) |timeout|
+            Io.Timestamp.now(connection.io, .awake).addDuration(timeout)
+        else
+            null;
+
         var scratch: [16 * 1024]u8 = undefined;
         while (!connection.session.isEstablished()) {
-            const n = try connection.readSocket(&scratch, null);
-            if (n == 0) return error.ConnectionResetByPeer;
+            const n = try connection.readSocket(&scratch, deadline);
+            if (n == 0) {
+                if (deadline) |d| {
+                    if (Io.Timestamp.now(connection.io, .awake).nanoseconds >= d.nanoseconds) {
+                        return error.HandshakeTimeout;
+                    }
+                }
+                return error.ConnectionResetByPeer;
+            }
             try connection.session.receive(gpa, scratch[0..n]);
             try connection.flushOutput();
         }

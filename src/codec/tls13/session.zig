@@ -50,6 +50,10 @@ pub const Error = error{
     PlaintextBufferFull,
     /// A post-handshake handshake message violated the protocol.
     UnexpectedMessage,
+    /// §5: a record arrived in the clear that §4.4.4 requires to be protected, or a
+    /// change_cipher_spec that is not the single byte 0x01, or one outside the window
+    /// §5 permits it in. The peer gets an unexpected_message alert.
+    UnexpectedRecord,
 } || record.Error || Allocator.Error;
 
 pub const Options = struct {
@@ -79,6 +83,49 @@ pub const State = enum {
 /// else fatal is. One implementation for both roles, because getting it wrong
 /// in one direction means a clean shutdown looks like an error to exactly half
 /// the connections.
+/// §5's rules for a plaintext record, which are the same for both roles and therefore
+/// live in one place.
+///
+/// `keyed` is whether read keys have been installed, and `complete` whether the peer's
+/// Finished has been processed. Both matter:
+///
+///   * A plaintext **alert** is legitimate only while no read key exists. Before that it
+///     is how a peer refuses a Hello; after it, §4.4.4 requires every record to be
+///     protected, and an unprotected one is unauthenticated — acting on it lets anyone who
+///     can inject a segment terminate the connection, or truncate it with a forged
+///     close_notify, which is what §6.1's close handshake exists to prevent.
+///   * A plaintext **change_cipher_spec** is compatibility theatre (§D.4), but §5 still
+///     bounds it: it must consist of "the single byte value 0x01", and it may appear only
+///     "after the first ClientHello message has been sent or received and before the peer's
+///     Finished message has been received". Any other value, and any CCS outside that
+///     window, "MUST be treated as an unexpected record type". Skipping the record without
+///     reading it accepts arbitrary bytes under a content type nobody parses.
+const PlaintextVerdict = enum { accept, drop, refuse };
+
+fn plaintextVerdict(
+    content_type: record.ContentType,
+    body: []const u8,
+    keyed: bool,
+    complete: bool,
+) PlaintextVerdict {
+    return switch (content_type) {
+        .change_cipher_spec => blk: {
+            if (complete) break :blk .refuse;
+            if (body.len != 1 or body[0] != 0x01) break :blk .refuse;
+            break :blk .drop;
+        },
+        .alert => if (keyed) .refuse else .accept,
+        .handshake => .accept,
+        // A protected record: this function judges what may appear *in the clear*, and the
+        // caller's own branch decides what to do with the ciphertext.
+        .application_data => .accept,
+        // The framer already rejects unknown outer content types, so this is unreachable
+        // in practice — but a pure function that answers for every input is testable, and
+        // `unreachable` here would be a promise about a different file's behaviour.
+        _ => .refuse,
+    };
+}
+
 fn handleAlertInto(state: *State, close_alert: *?record.Alert, alert: record.Alert) Error!void {
     close_alert.* = alert;
     if (alert.description == record.Alert.close_notify) {
@@ -188,11 +235,18 @@ pub const ClientSession = struct {
     }
 
     fn handleRecord(self: *ClientSession, gpa: Allocator, rec: *const record.Record) !void {
+        switch (plaintextVerdict(
+            rec.content_type,
+            rec.body(),
+            self.read_keys != null,
+            self.client.isComplete(),
+        )) {
+            .drop => return,
+            .refuse => return error.UnexpectedRecord,
+            .accept => {},
+        }
         switch (rec.content_type) {
-            // §D.4: a change_cipher_spec during the handshake is compatibility
-            // theatre and is dropped without so much as a length check beyond
-            // the framer's.
-            .change_cipher_spec => return,
+            .change_cipher_spec => unreachable, // dropped or refused above
             .alert => return self.handleAlert(try record.Alert.decode(rec.body())),
             .handshake => {
                 // Plaintext handshake: only legitimate before handshake keys
@@ -463,9 +517,18 @@ pub const ServerSession = struct {
     }
 
     fn handleRecord(self: *ServerSession, gpa: Allocator, rec: *const record.Record) !void {
+        switch (plaintextVerdict(
+            rec.content_type,
+            rec.body(),
+            self.read_keys != null,
+            self.server.isComplete(),
+        )) {
+            .drop => return,
+            .refuse => return error.UnexpectedRecord,
+            .accept => {},
+        }
         switch (rec.content_type) {
-            // §D.4: the client's compatibility-mode change_cipher_spec.
-            .change_cipher_spec => return,
+            .change_cipher_spec => unreachable, // dropped or refused above
             .alert => return handleAlertInto(&self.state, &self.close_alert, try record.Alert.decode(rec.body())),
             .handshake => {
                 // Plaintext handshake: the ClientHello, and nothing else.
@@ -1216,4 +1279,112 @@ test "session: close_notify from the client is a clean end, not a failure" {
     // And the server can still answer in kind.
     try server.close(gpa);
     try testing.expect(server.output().len > 0);
+}
+
+test "session: an unauthenticated record is refused once keys exist" {
+    // §4.4.4: "Any records following a Finished message MUST be encrypted under the
+    // appropriate application traffic key." A plaintext alert arriving after the read keys
+    // are installed carries no authentication at all, so acting on it lets anyone who can
+    // inject a segment into the TCP stream end the connection — or, with close_notify,
+    // truncate it, which is the attack §6.1 exists to prevent. Before any key exists a
+    // plaintext alert is the only way a server can refuse a ClientHello, so the window is
+    // exactly "no read keys yet".
+    const gpa = testing.allocator;
+
+    // The alert this test injects, byte for byte: fatal handshake_failure.
+    const fatal_alert = [_]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28 };
+
+    // Before keys: accepted, and it fails the session — which is the point of it.
+    {
+        var session = try testSession(&.{"h2"});
+        defer session.deinit(gpa);
+        try session.start(gpa);
+        try testing.expectError(error.AlertReceived, session.receive(gpa, &fatal_alert));
+    }
+
+    // After the ServerHello has installed handshake read keys: refused as a record that
+    // has no business being in the clear.
+    {
+        var session = try testSession(&.{"h2"});
+        defer session.deinit(gpa);
+        var server: RecordServer = .init(31);
+        try session.start(gpa);
+        var reply_buf: [8192]u8 = undefined;
+        const reply = try server.respond(&reply_buf, session.output(), "h2");
+        session.consumeOutput(session.output().len);
+
+        var parser: record.Parser = .{};
+        const hello = (try parser.next(reply)).?;
+        try session.receive(gpa, reply[0..hello.consumed]);
+        try testing.expect(session.read_keys != null);
+
+        try testing.expectError(error.UnexpectedRecord, session.receive(gpa, &fatal_alert));
+    }
+}
+
+test "session: change_cipher_spec is checked, not merely skipped" {
+    // §5: an implementation "may receive an unencrypted record of type change_cipher_spec
+    // consisting of the single byte value 0x01" within a window, and "which receives any
+    // other change_cipher_spec value ... MUST abort the handshake with an
+    // unexpected_message alert". Dropping the record without reading it accepts a
+    // arbitrary-length payload under a content type nobody parses, which is a hole a
+    // middlebox or an attacker can push bytes through unexamined.
+    const gpa = testing.allocator;
+
+    const Case = struct { name: []const u8, record: []const u8, want: anyerror };
+    const bad = [_]Case{
+        // The right length, the wrong value.
+        .{
+            .name = "value 0x00",
+            .record = &[_]u8{ 0x14, 0x03, 0x03, 0x00, 0x01, 0x00 },
+            .want = error.UnexpectedRecord,
+        },
+        // Two bytes, the first of them correct — which is what a check on only the first
+        // byte would accept.
+        .{
+            .name = "0x01 plus a passenger",
+            .record = &[_]u8{ 0x14, 0x03, 0x03, 0x00, 0x02, 0x01, 0xff },
+            .want = error.UnexpectedRecord,
+        },
+        // Empty: refused by the framer before this rule is reached, under §5.1's ban on
+        // zero-length fragments. A different rule with the same consequence here, so the
+        // expectation records the error that actually arrives rather than pretending this
+        // check is what caught it.
+        .{
+            .name = "empty",
+            .record = &[_]u8{ 0x14, 0x03, 0x03, 0x00, 0x00 },
+            .want = error.BadRecord,
+        },
+    };
+
+    for (bad) |case| {
+        var session = try testSession(&.{"h2"});
+        defer session.deinit(gpa);
+        try session.start(gpa);
+        session.consumeOutput(session.output().len);
+        testing.expectError(case.want, session.receive(gpa, case.record)) catch |err| {
+            std.debug.print("case: {s}\n", .{case.name});
+            return err;
+        };
+    }
+
+    // And after the handshake completes the window has closed: §5 says a CCS "received
+    // ... after the peer's Finished message ... MUST be treated as an unexpected record
+    // type", so compatibility theatre stops being tolerated once there is nothing left to
+    // be compatible about.
+    {
+        var session = try testSession(&.{"h2"});
+        defer session.deinit(gpa);
+        var server: RecordServer = .init(32);
+        try session.start(gpa);
+        var reply_buf: [8192]u8 = undefined;
+        const reply = try server.respond(&reply_buf, session.output(), "h2");
+        session.consumeOutput(session.output().len);
+        try session.receive(gpa, reply);
+        try testing.expect(session.isEstablished());
+        try testing.expectError(
+            error.UnexpectedRecord,
+            session.receive(gpa, &record.change_cipher_spec_record),
+        );
+    }
 }
