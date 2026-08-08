@@ -24,6 +24,7 @@ zig build bench -Dio=zio                          # ... against the fiber backen
 
 ./zig-out/bin/echo_bench [connections] [payload] [seconds] [loops]
 ./zig-out/bin/http_bench [connections] [seconds] [loops]
+./zig-out/bin/tls_bench  [handshakes]
 ```
 
 Defaults are 32 connections, a 1 KiB payload, 3 seconds and 4 worker loops. In that form the
@@ -49,6 +50,20 @@ adds the HTTP request decoder and response encoder to that path.
 Both report the buffer pool hit rate, which is the check that recycling is
 actually working: a low rate means inbound buffers are being freed to the
 allocator instead of returning to the pool.
+
+`tls_bench` is the odd one: it opens no sockets. It runs the TLS 1.3 handshake engine in
+memory, charging each side's work to that side, and times a CertificateVerify signature in
+both schemes a server here can present. The socket half of a handshake's cost is already
+measurable with `openssl s_time` against the example server; what was missing was the split
+between that and this code's own computation. See [TLS.md](../TLS.md#what-a-handshake-costs).
+
+It exists as a benchmark for a specific reason. The handshake cost was first measured by
+pointing `openssl s_time` at `zig-out/bin/tls13_server`, which `zig build examples` builds
+according to `-Doptimize` — default **Debug**. The resulting 4.3 ms was compared against
+OpenSSL's optimized server and produced a conclusion that was wrong by a factor of five.
+Benchmarks registered in `build.zig` are built `.fast` whatever `-Doptimize` says, so a
+benchmark cannot make that mistake. Every server example now also prints its build mode on
+startup, which is the cheaper half of the same fix.
 
 ## Results
 
@@ -114,6 +129,11 @@ opposite of the assumption:
 * **Is the concurrency budget the binding constraint on threads?** No, not at these sizes:
   2048 connections is 4096 tasks and all of them were served. See `max_connections` in
   `ServerOptions`, which exists as a *policy* rather than as a guard against a cliff.
+* **How much of a TLS handshake is this code's own work?** About a fifth. Optimized, a full
+  handshake takes 0.83 ms as a client sees it, of which the server's engine is about 175 µs and
+  the CertificateVerify signature is some 128 µs of that. `openssl s_server` costs 0.91 ms on the same
+  loop, so the per-connection floor dominates both. The engine bench and the socket
+  measurement agree, independently, that switching ECDSA P-256 for Ed25519 saves 80 µs.
 * **Would eliding the per-connection writer task pay for itself?** No. A variant with no
   writer task and no outbound queue — writing straight to the socket from whichever task
   called `write` — was built and measured: 6 % better at one connection, nothing at

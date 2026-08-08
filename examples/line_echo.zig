@@ -122,6 +122,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     installSignalHandlers();
     try server.serve();
+    // Announced because a benchmark run against a Debug build of this example once produced a
+    // handshake cost four times the real one, and nothing in its output said which build it was.
+    log.info("build: {t}", .{@import("builtin").mode});
     log.info("line echo server listening on port {d}", .{server.port()});
     log.info("try: nc localhost {d}   (send \"quit\" to disconnect)", .{server.port()});
 

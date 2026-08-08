@@ -135,6 +135,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer server.deinit();
 
     installSignalHandlers();
+    // Announced because a benchmark run against a Debug build of this example once produced a
+    // handshake cost four times the real one, and nothing in its output said which build it was.
+    log.info("build: {t}", .{@import("builtin").mode});
     log.info("listening on https://127.0.0.1:{d} (HTTP/3 over QUIC)", .{server.port()});
 
     while (!shutdown_requested.load(.acquire)) {

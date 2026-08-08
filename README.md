@@ -38,7 +38,7 @@ handshake written here, because Netty binds Quiche and the standard library has 
 TLS server; see [HTTP3.md](HTTP3.md) and [TLS.md](TLS.md) — Redis RESP2/RESP3,
 datagram (UDP) endpoints, a DNS resolver, TLS 1.3 on both sides of a connection, a
 bounded client connection pool, and `EmbeddedChannel` for testing pipelines without
-sockets. 817 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
+sockets. 821 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
 all under a leak-checking allocator, plus twenty-two fuzz targets. The same suite
 also runs **on fibers** rather than threads — see [Choosing an `Io`](#choosing-an-io).
 
@@ -692,6 +692,7 @@ See [bench/README.md](bench/README.md) for numbers and how to read them.
 zig build bench
 ./zig-out/bin/echo_bench 64 4096 3 8
 ./zig-out/bin/http_bench 64 3 8
+./zig-out/bin/tls_bench 2000
 ```
 
 ## Development

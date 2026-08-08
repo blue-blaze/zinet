@@ -24,6 +24,7 @@ const examples: []const []const u8 = &.{
 const benches: []const []const u8 = &.{
     "echo_bench",
     "http_bench",
+    "tls_bench",
 };
 
 /// Which `std.Io` implementation the tests, examples and benchmarks run on.

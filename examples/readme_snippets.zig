@@ -102,6 +102,9 @@ pub fn main() !void {
     defer server.deinit();
 
     try server.serve();
+    // Announced because a benchmark run against a Debug build of this example once produced a
+    // handshake cost four times the real one, and nothing in its output said which build it was.
+    std.log.info("build: {t}", .{@import("builtin").mode});
     std.log.info("readme example listening on port {d}", .{server.port()});
     _ = server.shutdownGracefully(.{ .timeout = .fromSeconds(1) });
 }

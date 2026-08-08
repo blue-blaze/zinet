@@ -942,3 +942,26 @@ already reported an orderly zero-byte read as `error.EndOfStream`, so zero could
 mean the deadline and the comparison was both redundant and wrong. The flake was pointing at
 a real defect in the fix, one that would have mattered in production at exactly the moment a
 server was busiest.
+
+**A measurement's build mode is part of the measurement.** The cost of a TLS handshake was
+measured with `openssl s_time` against `zig-out/bin/tls13_server` and came out at 4.3 ms. That
+binary comes from `zig build examples`, which honours `-Doptimize`, whose default is Debug — so
+an unoptimized server was being compared against OpenSSL's optimized one. In `ReleaseFast` the
+same server does 0.83 ms and is slightly *faster* than `openssl s_server`. Two of the three
+conclusions in TLS.md were therefore wrong, including a "2.8 ms remainder where this
+implementation is actually slow" that does not exist, and a recommendation to go and profile it.
+Nothing in the server's output said which build it was, and nothing in the method required an
+optimized one.
+
+The correction is not "be careful". Benchmarks registered in `build.zig` are built `.fast`
+regardless of `-Doptimize`, so the same measurement expressed as `bench/tls_bench.zig` could not
+have gone wrong that way — which is why the handshake measurement now lives there, and why it
+reports the server's and the client's engine cost separately rather than one aggregate that hides
+which side is being paid for. Every server example additionally prints its build mode on startup.
+This is the same shape as `zig build mutate`: a habit that produced a wrong answer replaced by a
+build step that cannot.
+
+Worth stating because it is the reason to trust the new number: the engine benchmark and the
+socket measurement were taken through different paths, one of them with an external client, and
+they agree to within a microsecond on the one difference both can see — 80 µs saved by signing
+with Ed25519 instead of ECDSA P-256.

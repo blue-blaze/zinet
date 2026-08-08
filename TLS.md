@@ -170,9 +170,9 @@ Stated rather than left to be discovered:
 
 * **No TLS 1.2.** A peer that cannot do 1.3 is refused. The version negotiation
   extension is checked and nothing else is offered.
-* **No resumption or 0-RTT.** Tickets are ignored on receipt; none are issued. This one has
-  now been measured rather than merely deferred, and the measurement says it is not the first
-  thing to do — see [What a handshake costs](#what-a-handshake-costs).
+* **No resumption or 0-RTT.** Tickets are ignored on receipt; none are issued. Measured rather
+  than merely deferred — and the first measurement was wrong, which is written down along with
+  the right one in [What a handshake costs](#what-a-handshake-costs).
 * **No client certificates.** A `CertificateRequest` is not sent by the server, and
   a client `Certificate` message is refused as a peer inventing an exchange.
 * **One key exchange group: X25519.** A client offering only P-256 is refused with
@@ -185,45 +185,79 @@ Stated rather than left to be discovered:
 
 ## What a handshake costs
 
-Session resumption exists to avoid full handshakes, so the question of whether to implement it
-is really a question about what a full handshake costs here. Measured with `openssl s_time`
-driving this server on loopback, five seconds per run, same certificate where the algorithm is
-the same:
+Session resumption exists to avoid full handshakes, so whether to implement it is a question
+about what a full handshake costs here. This section had that number wrong by a factor of five,
+and the correction is worth more than the number.
 
-| Server | Certificate | Full handshakes | Per handshake |
-|---|---|---|---|
-| this one | ECDSA P-256 | 1406 in 6 s (≈ 234/s) | 4.3 ms |
-| this one | Ed25519 | 2132 in 6 s (≈ 355/s) | 2.8 ms |
-| `openssl s_server` | ECDSA P-256 | 5681 in 6 s (≈ 947/s) | 1.1 ms |
+**The first version of this measurement pointed `openssl s_time` at `zig-out/bin/tls13_server`.**
+That binary comes from `zig build examples`, which honours `-Doptimize` — and `-Doptimize`
+defaults to **Debug**. So an unoptimized server was compared against OpenSSL's optimized one, and
+the 4.3 ms per handshake it reported was mostly Debug-mode field arithmetic. Two of the three
+conclusions drawn from it were wrong, including the one that mattered: this section used to say
+there was a 2.8 ms remainder in which "this implementation is actually slow", and sent the reader
+off to find it. There is no such remainder.
 
-Three things follow, and together they decide the question.
+Re-measured, same loopback, same certificates, `s_time` running six seconds per configuration,
+with the *same* server built both ways so the difference is only the build:
 
-**Handshakes are expensive relative to everything else.** The plain HTTP benchmark serves about
-39 000 requests a second on persistent connections (see [bench/README.md](bench/README.md)), so
-one full handshake costs roughly what 170 requests cost. Any workload that opens short-lived
-TLS connections is paying for handshakes and almost nothing else.
+| Server | Certificate | Build | Full handshakes | Per handshake |
+|---|---|---|---|---|
+| this one | Ed25519 | Debug | 2185 in 6 s (364/s) | 2.7 ms |
+| this one | Ed25519 | **ReleaseFast** | 7969 in 6 s (1328/s) | **0.75 ms** |
+| this one | ECDSA P-256 | Debug | 1551 in 6 s (258/s) | 3.9 ms |
+| this one | ECDSA P-256 | **ReleaseFast** | 7247 in 6 s (1208/s) | **0.83 ms** |
+| `openssl s_server` | ECDSA P-256 | its own release build | 6588 in 6 s (1098/s) | 0.91 ms |
+| `openssl s_server` | Ed25519 | its own release build | 6552 in 6 s (1092/s) | 0.92 ms |
 
-**But the signature is not where most of it goes.** Swapping ECDSA P-256 for Ed25519 — a much
-cheaper signature — buys 1.5 ms of the 4.3 ms, about a third. The remaining 2.8 ms is key
-exchange, certificate handling, the key schedule and the record layer, and it is unaffected by
-which key signs.
+The Debug rows reproduce the old numbers, which is what identifies the mistake rather than
+merely replacing it. Optimized, this server is *slightly faster* than `openssl s_server` on the
+same loop — so the premise that there was a gap to close was an artifact of the build.
 
-**And that remainder is where this implementation is actually slow.** OpenSSL completes an
-entire ECDSA handshake in 1.1 ms — less than half of what is left here after the signature is
-made as cheap as possible. So the gap is not the crypto this code chose; it is something in the
-path around it.
+### Where the 0.83 ms goes
 
-Which is why resumption is not the next thing. Resumption removes the signature, the third
-that Ed25519 already shows is removable, and leaves the 2.8 ms untouched — while adding a
-long-lived ticket key, its rotation, PSK binder verification, ticket lifetime policy (§4.6.1),
-and the replay surface §8 describes if 0-RTT ever follows. Finding out what the 2.8 ms is spent
-on would plausibly recover more, for *every* handshake rather than only resumed ones, without a
-new persistent secret in the one component where a mistake is silent.
+`zig build bench-tls_bench` measures the engine with no sockets at all, charging each side's work
+to that side. Benchmarks are built `.fast` in `build.zig` regardless of `-Doptimize`, which is
+exactly why the measurement now lives there instead of in a shell command. Per handshake, 1000
+handshakes, ECDSA P-256:
 
-What would change this conclusion: a profile showing the remaining time is irreducible, or a
-deployment whose connections are short-lived enough that a third is worth the security surface.
-If resumption is implemented, `psk_dhe_ke` should be required rather than offered, so that a
-compromised ticket key cannot retroactively cost forward secrecy.
+| Item | Cost |
+|---|---|
+| server engine CPU | 175 µs |
+| — of which the CertificateVerify signature | 128 µs (about 73 %) |
+| client engine CPU | 45 µs |
+| an Ed25519 signature instead | 45 µs |
+
+Repeated runs land within a few microseconds of those: 174, 174 and 178 µs of server CPU with the
+signature between 126 and 130 µs. So of the 0.83 ms a client observes, about 175 µs is this
+server's own computation. The rest is
+TCP connection setup, task creation and kernel round trips — which is not a guess: OpenSSL's
+server, whose engine is certainly no slower than this one, costs 0.91 ms per handshake on the
+same loop. The per-connection floor dominates both.
+
+Two independent measurements agree on the one lever there is. The engine bench says a signature
+costs about 128 µs with ECDSA P-256 and 45 µs with Ed25519, a difference of some 83 µs; the socket
+measurement says Ed25519 beats ECDSA by 80 µs per handshake (0.83 ms against 0.75 ms). Nothing
+made them agree — they were taken through different paths, one with an external client — which is
+what makes the attribution believable.
+
+### Why resumption still is not the next thing
+
+The reasoning survives the correction, with different arithmetic. Resumption's saving is the
+signature and the certificate handling; the signature is about 73 % of a *server engine cost*
+that is itself around a fifth of what a client waits for. Against that it wants a long-lived ticket key and its
+rotation, PSK binder verification, ticket lifetime policy (§4.6.1), and the replay surface §8
+describes if 0-RTT ever follows — a persistent secret in the one component where a mistake is
+silent. Choosing Ed25519 already takes 80 µs of it with no new secret at all.
+
+What would change this: a deployment whose connections are short-lived enough that the
+per-connection floor is being paid anyway and a further 100 µs of server CPU matters, or a
+platform where that floor is much lower than loopback macOS. If resumption is implemented,
+`psk_dhe_ke` should be required rather than offered, so a compromised ticket key cannot
+retroactively cost forward secrecy.
+
+One thing worth naming rather than leaving implied: 128 µs for a P-256 signature is several
+times what OpenSSL spends, and it is `std.crypto`'s cost, not this code's. It is the largest
+single item in the server's engine and there is nothing here to fix about it.
 
 The cipher suites are the three RFC 8446 mandates and recommends:
 `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`.

@@ -177,6 +177,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer server.deinit();
     try server.serve();
 
+    // Announced because a benchmark run against a Debug build of this example once produced a
+    // handshake cost four times the real one, and nothing in its output said which build it was.
+    std.debug.print("build: {t}\n", .{@import("builtin").mode});
     std.debug.print("listening on https://localhost:{d} (alpn: {s})\n", .{ port, alpn_text });
 
     // Runs until interrupted; the example is meant to be driven by curl.
