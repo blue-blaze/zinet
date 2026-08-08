@@ -1259,6 +1259,11 @@ fn validResponseSection(section: *const qpack.FieldSection, is_trailers: bool) b
             for (field.value) |c| {
                 if (c < '0' or c > '9') return false;
             }
+            // §4.2: "HTTP/3 does not use the Upgrade header field", and 101 exists only
+            // to answer one — extended CONNECT (RFC 9220) is how a protocol switch is
+            // asked for here. So a 101 is an HTTP/1.1 response that was translated
+            // rather than read, and forwarding it announces a switch nobody negotiated.
+            if (std.mem.eql(u8, field.value, "101")) return false;
             seen_status = true;
             continue;
         }
@@ -3084,4 +3089,28 @@ test "http3: datagrams need the setting from both sides, and an open send side" 
         error.DatagramsUnsupported,
         client.sendDatagram(gpa, open_stream, "not fine"),
     );
+}
+
+test "http3: a 101 response is malformed, as it is in HTTP/2" {
+    // §4.2 removes the Upgrade header field, and 101 exists only to answer one; RFC 9220
+    // replaced it with extended CONNECT. A peer sending it has translated an HTTP/1.1
+    // response rather than read this section.
+    const gpa = testing.allocator;
+    // `Field` owns mutable slices because it normally holds decoded bytes, so the
+    // scratch here is an array rather than a literal.
+    var name: [7]u8 = "\u{3a}status".*;
+    var value: [3]u8 = "101".*;
+    var section: qpack.FieldSection = .{ .fields = .empty };
+    // Only the list is released: `FieldSection.deinit` frees every name and value, and
+    // these point at the stack.
+    defer section.fields.deinit(gpa);
+    try section.fields.append(gpa, .{ .name = &name, .value = &value });
+    try testing.expect(!validResponseSection(&section, false));
+
+    // Its neighbours stay legal, so this is about one code rather than about interim
+    // responses.
+    value = "100".*;
+    try testing.expect(validResponseSection(&section, false));
+    value = "102".*;
+    try testing.expect(validResponseSection(&section, false));
 }

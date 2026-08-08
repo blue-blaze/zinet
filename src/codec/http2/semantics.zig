@@ -236,6 +236,12 @@ pub fn validateResponse(fields: []const hpack.Field) Error!Response {
     if (text.len != 3) return error.MalformedMessage;
     const status = std.fmt.parseInt(u16, text, 10) catch return error.MalformedMessage;
     if (status < 100) return error.MalformedMessage;
+    // §8.3.2: "The 101 (Switching Protocols) informational status code is not used in
+    // HTTP/2." The mechanism it belongs to is the HTTP/1.1 upgrade, which §3.2 removed —
+    // extended CONNECT replaced it — so a 101 here is a response translated from
+    // HTTP/1.1 without being read, and a gateway that forwards it produces a protocol
+    // switch nobody negotiated.
+    if (status == 101) return error.MalformedMessage;
     return .{ .status = status };
 }
 
@@ -459,4 +465,18 @@ test "semantics: trailers carry no pseudo-headers" {
     try testing.expectError(error.MalformedMessage, validateTrailers(&.{
         .{ .name = "Connection", .value = "close" },
     }));
+}
+
+test "semantics: §8.3.2 has no 101" {
+    // "The 101 (Switching Protocols) informational status code is not used in HTTP/2":
+    // the upgrade mechanism it belongs to was removed, so a peer sending it has either
+    // translated an HTTP/1.1 response without reading §8.3.2 or is trying to get one
+    // through a gateway that will.
+    try testing.expectError(error.MalformedMessage, validateResponse(&.{
+        .{ .name = ":status", .value = "101" },
+    }));
+    // The neighbours stay legal, so this is a rule about one code rather than about
+    // informational responses.
+    _ = try validateResponse(&.{.{ .name = ":status", .value = "100" }});
+    _ = try validateResponse(&.{.{ .name = ":status", .value = "102" }});
 }

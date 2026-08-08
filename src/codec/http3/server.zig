@@ -243,9 +243,13 @@ pub const Handler = struct {
         // A tick is only a wakeup: whether a timer is due is each connection's
         // decision against its own injected clock.
         const moment = self.now();
-        var it = self.connections.valueIterator();
-        while (it.next()) |slot| {
-            const entry = slot.*;
+        // `entries()` rather than the map's own iterator: a connection with spare
+        // connection IDs is in the routing table under each of them (§5.1.1), so walking
+        // routes would advance one connection's timers several times per tick and pump it
+        // as many. The deduplicating iterator was written for exactly this and had two
+        // callers that both needed it; this was the third that did not use it.
+        var it = self.entries();
+        while (it.next()) |entry| {
             if (entry.finished) continue;
             entry.conn.setTime(moment);
             if (entry.conn.nextTimeout()) |deadline| {

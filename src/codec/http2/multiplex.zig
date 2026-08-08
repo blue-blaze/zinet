@@ -557,7 +557,7 @@ const Rig = struct {
         }
         if (rig.multiplexer.needs_flush) {
             rig.multiplexer.needs_flush = false;
-            var transitions: [16]Connection.Writability = undefined;
+            var transitions: [Connection.max_writability_transitions]Connection.Writability = undefined;
             rig.multiplexer.applyWritability(try rig.server.flush(rig.gpa, &transitions));
         }
         // Drain what the server said, so the client's own state keeps up.
@@ -614,7 +614,7 @@ test "multiplex: body bytes go to the stream they belong to" {
     try rig.request(3, "/b", false);
     try rig.pump();
 
-    var transitions: [4]Connection.Writability = undefined;
+    var transitions: [Connection.max_writability_transitions]Connection.Writability = undefined;
     _ = try rig.client.sendData(gpa, 1, "one-one", false);
     _ = try rig.client.sendData(gpa, 3, "three", false);
     _ = try rig.client.sendData(gpa, 1, "-more", false);
@@ -649,7 +649,7 @@ test "multiplex: inbound END_STREAM half-closes, it does not tear the stream dow
     try testing.expect(!recorders.made.items[1].inbound_complete);
 
     // Once this side ends the stream too, it is over and the pipeline goes.
-    var transitions: [4]Connection.Writability = undefined;
+    var transitions: [Connection.max_writability_transitions]Connection.Writability = undefined;
     try rig.server.sendHeaders(gpa, 1, &.{.{ .name = ":status", .value = "204" }}, false);
     _ = try rig.server.sendData(gpa, 1, "", true);
     _ = try rig.server.flush(gpa, &transitions);

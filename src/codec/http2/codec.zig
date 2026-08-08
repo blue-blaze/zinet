@@ -213,7 +213,7 @@ pub const Codec = struct {
         codec.multiplexer.needs_flush = false;
         while (true) {
             const before = codec.connection.out.readableLen();
-            var transitions: [32]Connection.Writability = undefined;
+            var transitions: [Connection.max_writability_transitions]Connection.Writability = undefined;
             const changed = try codec.connection.flush(gpa, &transitions);
             codec.multiplexer.applyWritability(changed);
             // Streams this side has just finished are torn down here rather than on

@@ -108,7 +108,10 @@ pub fn checkRequest(headers: *const multiplex.Headers, options: Options) Error!?
 
 /// The field lines for a client's CONNECT request (RFC 8441 §5).
 ///
-/// `buf` must hold at least six entries. Returned as a slice of the caller's buffer
+/// `buf` must hold at least eight entries: six field lines are unconditional and
+/// `subprotocols` and `origin` add one each. The contract covers the widest call rather
+/// than the narrowest, because a caller cannot know which arguments a future version
+/// will make optional. Returned as a slice of the caller's buffer
 /// because the field values are borrowed: the encoder serializes before `request`
 /// returns, which is the same contract every outbound field section here has.
 pub fn requestFields(
@@ -118,7 +121,7 @@ pub fn requestFields(
     origin: ?[]const u8,
     buf: []qpack.FieldLine,
 ) []const qpack.FieldLine {
-    assert(buf.len >= 6);
+    assert(buf.len >= 8);
     var n: usize = 0;
     buf[n] = .{ .name = ":method", .value = "CONNECT" };
     n += 1;
@@ -569,4 +572,20 @@ test "http3 websocket: bytes that arrive before the handshake do not reach the c
     channel.writeInbound(try Message.initBytes(gpa, frame_bytes));
     try testing.expectEqual(@as(usize, 1), peer.frames);
     try testing.expectEqualStrings("early", peer.last[0..peer.last_len]);
+}
+
+test "http3 websocket: requestFields fills every slot it can be asked for" {
+    // The buffer contract has to cover the *widest* call, not the narrowest. Six fields
+    // are unconditional and two more are optional, so a caller that supplies both
+    // options needs eight — and the assertion said six, which in a build with safety off
+    // is a write past the end of a buffer the caller was told was big enough.
+    var buf: [8]qpack.FieldLine = undefined;
+    const with_both = requestFields("example.test", "/chat", "chat, superchat", "https://example.test", &buf);
+    try testing.expectEqual(@as(usize, 8), with_both.len);
+    try testing.expectEqualStrings("sec-websocket-protocol", with_both[6].name);
+    try testing.expectEqualStrings("origin", with_both[7].name);
+
+    // And the narrow call still uses only what it needs.
+    const minimal = requestFields("example.test", "/chat", null, null, &buf);
+    try testing.expectEqual(@as(usize, 6), minimal.len);
 }

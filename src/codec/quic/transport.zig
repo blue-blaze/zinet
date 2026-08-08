@@ -462,7 +462,12 @@ fn decodePreferredAddress(value: []const u8) Error!PreferredAddress {
         .stateless_reset_token = @splat(0),
     };
     const cid_len = value[24];
-    if (cid_len > packet.max_cid_len) return error.TransportParameterError;
+    // §18.2 bounds this at both ends, and the lower bound is the one easy to drop: the
+    // field is a connection ID the peer wants used *for the new address*, and §5.1 gives
+    // a zero-length ID the meaning "this endpoint does not need one to route" — which is
+    // the opposite of what an endpoint publishing a second address is saying. Accepting
+    // zero would mean migrating to an address whose packets carry nothing to route by.
+    if (cid_len == 0 or cid_len > packet.max_cid_len) return error.TransportParameterError;
     const expected = 25 + @as(usize, cid_len) + stateless_reset_token_len;
     if (value.len != expected) return error.TransportParameterError;
     address.connection_id = ConnectionId.init(value[25..][0..cid_len]) catch
@@ -883,4 +888,18 @@ test "transport: encodedLen and encode cannot disagree" {
         try testing.expectEqual(params.active_connection_id_limit, decoded.active_connection_id_limit);
         try testing.expectEqual(params.disable_active_migration, decoded.disable_active_migration);
     }
+}
+
+test "transport: §18.2 a preferred address must carry a usable connection ID" {
+    // The length is bounded above by `max_cid_len` and below by *one*: §18.2 gives the
+    // field a "Connection ID Length (8)" and then a connection ID of that length, and a
+    // preferred address exists to be migrated to — an address reachable only by a
+    // zero-length connection ID cannot be, because §5.1 makes a zero-length ID mean
+    // "this endpoint does not need one to route" and the peer has just said it does.
+    var value: [4 + 2 + 16 + 2 + 1 + stateless_reset_token_len]u8 = @splat(0);
+    value[24] = 0; // the length byte
+    try testing.expectError(
+        error.TransportParameterError,
+        decodePreferredAddress(&value),
+    );
 }

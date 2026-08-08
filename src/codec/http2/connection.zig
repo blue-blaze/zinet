@@ -387,6 +387,15 @@ pub const Connection = struct {
         const previous_window = connection.remote_settings.initial_window_size;
         var iterator = frame.settings(payload);
         while (iterator.next()) |setting| {
+            // §6.5.2: SETTINGS_ENABLE_PUSH is a client's to send, because push travels
+            // server to client — a client receiving it is being told something the
+            // sender has no standing to say. Checked here rather than in
+            // `frame.Settings.apply`, which owns the value ranges: the range belongs to
+            // the setting, but who may send it belongs to the connection, and this is
+            // the layer that knows which end it is.
+            if (setting.id == .enable_push and connection.role == .client) {
+                return connection.fatal(gpa, .protocol_error, "server sent ENABLE_PUSH");
+            }
             connection.remote_settings.apply(setting) catch |err| {
                 return connection.fatal(gpa, frame.errorCode(err), "bad setting");
             };
@@ -992,10 +1001,17 @@ pub const Connection = struct {
     /// Runs the scheduler once, moving as much queued body as the windows allow
     /// into `out`. Returns the streams whose writability changed, written into
     /// `transitions`.
+    /// Runs write passes and reports every writability edge they produced.
+    ///
+    /// `transitions` is a pointer to an array of exactly `max_writability_transitions`
+    /// rather than a slice, so a caller that supplies a smaller one does not compile.
+    /// It used to be a slice and the report stopped at its length, which silently
+    /// dropped edges past 32 while the streams' internal state had already changed —
+    /// see `max_writability_transitions` for why a dropped edge never comes back.
     pub fn flush(
         connection: *Connection,
         gpa: Allocator,
-        transitions: []Writability,
+        transitions: *[max_writability_transitions]Writability,
     ) Error![]Writability {
         var candidates: std.ArrayList(flow.Candidate) = .empty;
         defer candidates.deinit(gpa);
@@ -1034,7 +1050,8 @@ pub const Connection = struct {
         // A stable order, so round robin means something across passes.
         std.mem.sort(flow.Candidate, candidates.items, {}, lessByStreamId);
 
-        var grants: [64]flow.Allocation = undefined;
+        // One place, so the caller's buffer and this array cannot disagree.
+        var grants: [max_writability_transitions]flow.Allocation = undefined;
         const granted = connection.scheduler.run(
             &connection.send_window,
             candidates.items,
@@ -1056,7 +1073,7 @@ pub const Connection = struct {
                 stream.onData(.local, true) catch {};
             }
             const transition = stream.sends.drained(grant.bytes);
-            if (transition != .unchanged and changed < transitions.len) {
+            if (transition != .unchanged) {
                 transitions[changed] = .{ .stream_id = grant.stream_id, .writable = stream.sends.writable };
                 changed += 1;
             }
@@ -1069,6 +1086,17 @@ pub const Connection = struct {
         stream_id: u31,
         writable: bool,
     };
+
+    /// The most writability transitions one `flush` can produce, and therefore the
+    /// smallest buffer `flush` accepts.
+    ///
+    /// A transition is an *edge*: `flush` makes a stream writable and the event is the
+    /// only announcement it will ever get, because the crossing does not happen twice.
+    /// So a report that silently stops at the caller's capacity does not postpone a
+    /// notification — it loses it, and an application obeying the high-water mark then
+    /// stops writing to that stream for good. Asserted rather than truncated for that
+    /// reason, and the grant array below is sized from the same constant.
+    pub const max_writability_transitions = 64;
 
     fn lessByStreamId(_: void, a: flow.Candidate, b: flow.Candidate) bool {
         return a.stream_id < b.stream_id;
@@ -1332,7 +1360,7 @@ test "connection: a request and a response cross the wire" {
     }
     try testing.expectEqual(@as(u31, 1), pair.server.last_remote_processed);
 
-    var transitions: [8]Connection.Writability = undefined;
+    var transitions: [Connection.max_writability_transitions]Connection.Writability = undefined;
     try pair.server.sendHeaders(gpa, id, &.{
         .{ .name = ":status", .value = "200" },
         .{ .name = "content-type", .value = "text/plain" },
@@ -1365,7 +1393,7 @@ test "connection: trailers are a second header block and must end the stream" {
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = "/upload" },
     }, false);
-    var transitions: [8]Connection.Writability = undefined;
+    var transitions: [Connection.max_writability_transitions]Connection.Writability = undefined;
     _ = try pair.client.sendData(gpa, id, "body", false);
     _ = try pair.client.flush(gpa, &transitions);
     try pair.client.sendHeaders(gpa, id, &.{.{ .name = "x-checksum", .value = "abc" }}, true);
@@ -1794,7 +1822,7 @@ test "connection: the same bytes decode the same however they are fragmented" {
             .{ .name = ":authority", .value = "example.test" },
             .{ .name = "content-type", .value = "application/json" },
         }, false);
-        var transitions: [4]Connection.Writability = undefined;
+        var transitions: [Connection.max_writability_transitions]Connection.Writability = undefined;
         _ = try client.sendData(gpa, 1, "{\"a\":1}", false);
         _ = try client.flush(gpa, &transitions);
         try client.sendHeaders(gpa, 1, &.{.{ .name = "x-sum", .value = "9" }}, true);
@@ -1839,7 +1867,7 @@ test "connection: a response with no body still ends its stream" {
     // Headers, then nothing but END_STREAM. An empty DATA frame is not waiting for
     // credit — §6.9 charges the payload and this one has none — so it must not go
     // through the scheduler, which skips anything with nothing pending.
-    var transitions: [4]Connection.Writability = undefined;
+    var transitions: [Connection.max_writability_transitions]Connection.Writability = undefined;
     try pair.server.sendHeaders(gpa, 1, &.{.{ .name = ":status", .value = "204" }}, false);
     _ = try pair.server.sendData(gpa, 1, "", true);
     _ = try pair.server.flush(gpa, &transitions);
@@ -1882,7 +1910,7 @@ test "connection: §8.5 a CONNECT tunnel carries DATA and nothing else" {
     try testing.expect(pair.server.registry.get(id).?.tunnel);
 
     // Tunnel bytes are what the stream is for.
-    var transitions: [8]Connection.Writability = undefined;
+    var transitions: [Connection.max_writability_transitions]Connection.Writability = undefined;
     _ = try pair.client.sendData(gpa, id, "tunnelled", false);
     _ = try pair.client.flush(gpa, &transitions);
     try pair.transfer();
@@ -2025,4 +2053,39 @@ test "connection: §8.5 no PUSH_PROMISE on a connected stream" {
     try testing.expect(event == null); // not delivered to the application
     const header: frame.Header = .parse(pair.client.out.readableSlice()[0..frame.header_len]);
     try testing.expectEqual(frame.FrameType.rst_stream, header.frame_type);
+}
+
+test "connection: §6.5.2 a client refuses SETTINGS_ENABLE_PUSH from a server" {
+    // Push travels server to client, so the setting that permits it is a *client's* to
+    // send: "A client MUST treat receipt of a SETTINGS frame with SETTINGS_ENABLE_PUSH
+    // set to a value other than 0 as a connection error", and §8.4 leaves a server no
+    // reason to send 0 either — it would be describing a capability it does not have.
+    const gpa = testing.allocator;
+    var client: Connection = .init(gpa, .client, .{});
+    defer client.deinit(gpa);
+    try client.start(gpa);
+
+    var input: Buffer = .empty;
+    defer input.deinit(gpa);
+    try frame.writeSettings(&input, gpa, &.{.{ .id = .enable_push, .value = 1 }});
+    try testing.expectError(error.ConnectionError, client.poll(gpa, &input, 0));
+    try testing.expect(client.goaway_sent);
+}
+
+test "connection: §6.5.2 a server still accepts SETTINGS_ENABLE_PUSH from a client" {
+    // The other half, so this is a rule about direction rather than a blanket ban: a
+    // client saying it will not accept pushes is ordinary, and this endpoint declines to
+    // push anyway.
+    const gpa = testing.allocator;
+    var server: Connection = .init(gpa, .server, .{});
+    defer server.deinit(gpa);
+    try server.start(gpa);
+
+    var input: Buffer = .empty;
+    defer input.deinit(gpa);
+    try input.writeBytes(gpa, frame.client_preface);
+    try frame.writeSettings(&input, gpa, &.{.{ .id = .enable_push, .value = 0 }});
+    _ = try server.poll(gpa, &input, 0);
+    try testing.expect(!server.remote_settings.enable_push);
+    try testing.expect(!server.goaway_sent);
 }
