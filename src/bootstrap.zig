@@ -71,8 +71,17 @@ pub const ServerOptions = struct {
     /// Address to bind. Use port 0 to let the kernel pick one and read it back
     /// from `Server.boundAddress`.
     address: Io.net.IpAddress,
-    /// Loops that will serve accepted connections. When null, the server
-    /// creates and owns a group of `worker_count` loops.
+    /// Loops that will serve accepted connections. When null, the server creates and owns
+    /// a group of `worker_count` loops.
+    ///
+    /// Sharing a group across listeners is supported, with one consequence worth knowing
+    /// before choosing it: **a server does not cancel a group it does not own.** `Io.Group`
+    /// cancels all or nothing, so there is no way to end one server's connections without
+    /// ending its siblings'. `shutdown` and `deinit` therefore stop accepting, close the
+    /// listener and free the server, leaving established connections to be ended by
+    /// whoever owns the group — normally by `EventLoopGroup.shutdown` at process exit.
+    /// A server that must be able to cut its own connections should own its group, which
+    /// is the default.
     workers: ?*EventLoopGroup = null,
     /// Loop count for the server-owned worker group. Null means one per CPU.
     worker_count: ?usize = null,
@@ -233,13 +242,16 @@ pub const Server = struct {
 
         const drained = server.awaitQuiet(options);
         if (drained) {
-            // No connections left, so this only reaps task bookkeeping.
+            // No connections left — in a shared group, none belonging to anybody — so this
+            // only reaps task bookkeeping and cannot wait on a sibling's traffic. Guarding
+            // it on ownership was written first and no test could tell the difference,
+            // because reaching here means the group is already quiet by construction.
             server.workers.drain();
         } else {
             log.warn("shutdown deadline reached with {d} connections still open", .{
                 server.workers.activeCount(),
             });
-            server.workers.shutdown();
+            server.cancelOwnConnections();
         }
 
         server.state.store(.closed, .release);
@@ -249,6 +261,11 @@ pub const Server = struct {
     /// Waits until no connection is being served, or the deadline passes.
     fn awaitQuiet(server: *Server, options: GraceOptions) bool {
         const timeout = options.timeout orelse {
+            // Unbounded: wait for the tasks themselves. With a shared group this waits for
+            // the whole group rather than this server's share of it, which is a limit of
+            // the primitive rather than a choice — `Io.Group` has no per-registrant view.
+            // A caller that needs its own bound should pass one, which the branch below
+            // honours by polling instead.
             server.workers.drain();
             return true;
         };
@@ -265,10 +282,32 @@ pub const Server = struct {
     }
 
     /// Stops accepting and cancels established connections. Idempotent.
+    ///
+    /// "Established connections" means *this server's*, and that is only achievable when
+    /// the worker group belongs to this server. `Io.Group` cancels all or nothing, so a
+    /// group shared with other listeners cannot be narrowed to one server's connections —
+    /// and cancelling it anyway would drop a sibling's live traffic, which is what this
+    /// used to do from `shutdown` and therefore from `deinit`. With a shared group the
+    /// group's owner is responsible for its connections; see `Options.workers`.
     pub fn shutdown(server: *Server) void {
         server.stopAccepting();
-        server.workers.shutdown();
+        server.cancelOwnConnections();
         server.state.store(.closed, .release);
+    }
+
+    /// Cancels the connections this server is entitled to cancel, which is all of them
+    /// when it owns its worker group and none of them when the group is shared.
+    fn cancelOwnConnections(server: *Server) void {
+        if (server.owned_workers) |*owned| {
+            owned.shutdown();
+            return;
+        }
+        if (server.workers.activeCount() > 0) {
+            log.info(
+                "leaving {d} connection(s) in the shared worker group to its owner",
+                .{server.workers.activeCount()},
+            );
+        }
     }
 
     fn acceptLoop(server: *Server) void {
@@ -943,4 +982,98 @@ test "connect: a refused connection leaks nothing" {
         .config = .{ .initializer = .initFunction(buildShoutPipeline) },
     });
     try testing.expectError(error.ConnectionRefused, result);
+}
+
+test "Server: shutting down one server does not cut another's connections" {
+    // `options.workers` lets several listeners share one `EventLoopGroup`. Every server
+    // then called `workers.shutdown()` from its own `shutdown` — and from `deinit`, which
+    // calls it — so tearing down one server cancelled the *group*, taking with it every
+    // connection the other servers had admitted. A "shut down my server" call that drops a
+    // sibling's live connections is the kind of thing that only shows up in production,
+    // under whichever traffic happened to be in flight.
+    //
+    // Nothing in this repository used the option, which is why the suite was green: it was
+    // an API whose only observable behaviour was the defect.
+    const gpa = testing.allocator;
+    var threaded = try backend.Runtime.init(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var shared = try EventLoopGroup.init(gpa, io, .{ .loop_count = 2 });
+    defer shared.deinit();
+
+    const keeper = try Server.listen(.{
+        .gpa = gpa,
+        .io = io,
+        .address = .{ .ip4 = .loopback(0) },
+        .workers = &shared,
+        .child = .{ .initializer = .initFunction(buildShoutPipeline) },
+    });
+    defer keeper.deinit();
+    try keeper.serve();
+
+    const departing = try Server.listen(.{
+        .gpa = gpa,
+        .io = io,
+        .address = .{ .ip4 = .loopback(0) },
+        .workers = &shared,
+        .child = .{ .initializer = .initFunction(buildShoutPipeline) },
+    });
+    try departing.serve();
+
+    // A live connection on the server that is staying.
+    var address = keeper.boundAddress();
+    var client = try address.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+
+    var write_buffer: [64]u8 = undefined;
+    var client_writer = client.writer(io, &write_buffer);
+    var read_buffer: [64]u8 = undefined;
+    var client_reader = client.reader(io, &read_buffer);
+
+    try client_writer.interface.writeAll("before");
+    try client_writer.interface.flush();
+    try testing.expectEqualStrings("BEFORE", try client_reader.interface.take(6));
+
+    // And one on the server that is leaving, which is the other half of the new contract:
+    // its connections outlive it, so nothing they hold may point back at it. A `Channel`
+    // copies what it needs out of the child config at creation, and the acceptor tasks that
+    // touch `server.stats` are cancelled — and waited for — by `stopAccepting`, so the
+    // connection below is not reading freed memory. Asserted rather than asserted-in-prose:
+    // this exchange happens after `departing` has been destroyed, under a leak- and
+    // use-after-free-checking allocator.
+    var departing_address = departing.boundAddress();
+    var orphan = try departing_address.connect(io, .{ .mode = .stream });
+    defer orphan.close(io);
+
+    var orphan_write_buffer: [64]u8 = undefined;
+    var orphan_writer = orphan.writer(io, &orphan_write_buffer);
+    var orphan_read_buffer: [64]u8 = undefined;
+    var orphan_reader = orphan.reader(io, &orphan_read_buffer);
+
+    try orphan_writer.interface.writeAll("mine");
+    try orphan_writer.interface.flush();
+    try testing.expectEqualStrings("MINE", try orphan_reader.interface.take(4));
+
+    // The graceful path has the same obligation, and reaches it differently: it waits, sees
+    // the group is not quiet — the count is group-wide, which with a shared group is the
+    // only view `Io.Group` offers — and must still not cancel on the way out.
+    try testing.expect(!departing.shutdownGracefully(.{ .timeout = .fromMilliseconds(50) }));
+
+    try client_writer.interface.writeAll("during");
+    try client_writer.interface.flush();
+    try testing.expectEqualStrings("DURING", try client_reader.interface.take(6));
+
+    // The other server goes away entirely.
+    departing.deinit();
+
+    // The connection that has nothing to do with it is still being served.
+    try client_writer.interface.writeAll("after");
+    try client_writer.interface.flush();
+    try testing.expectEqualStrings("AFTER", try client_reader.interface.take(5));
+
+    // As is the one it admitted itself.
+    try orphan_writer.interface.writeAll("orphan");
+    try orphan_writer.interface.flush();
+    try testing.expectEqualStrings("ORPHAN", try orphan_reader.interface.take(6));
 }
