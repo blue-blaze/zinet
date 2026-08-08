@@ -128,6 +128,28 @@ pub fn build(b: *std.Build) void {
     const fmt_check = b.addFmt(.{ .paths = fmt_paths, .check = true });
     b.step("fmt-check", "Check source formatting").dependOn(&fmt_check.step);
 
+    // `zig build mutate` runs the mutation catalogue: break a rule on purpose, require the
+    // suite to notice, put the file back. Its own step rather than part of `check`, because it
+    // rebuilds and reruns the tests once per mutation and that is minutes rather than seconds —
+    // a control worth having is not worth making every local build wait for.
+    const mutate_step = b.step("mutate", "Break each rule in the catalogue and require a test to fail");
+    const mutate_exe = b.addExecutable(.{
+        .name = "mutate",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/mutate.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_mutate = b.addRunArtifact(mutate_exe);
+    // The compiler running this build, not whichever `zig` is on PATH: a mutation checked
+    // against a different toolchain is not checked at all.
+    run_mutate.addArg(b.graph.zig_exe);
+    run_mutate.addPassthruArgs();
+    // The tests it spawns must not race the build system's own writes.
+    run_mutate.has_side_effects = true;
+    mutate_step.dependOn(&run_mutate.step);
+
     // `zig build check` is the one that matches CI, step for step: formatting, tests, fuzz
     // targets, examples and benchmarks. It exists because the claim used to be attached to
     // the default step, which depends on tests and examples only — so "the checks that CI

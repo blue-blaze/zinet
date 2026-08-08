@@ -704,11 +704,27 @@ zig build fmt           # format
 zig build fmt-check     # verify formatting (what CI runs)
 zig build               # test + examples: the quick pair
 zig build check         # fmt-check + test + fuzz + examples + bench, step for step what CI runs
+zig build mutate        # break each rule in the catalogue and require a test to notice
 ```
 
 `zig build` used to be described as "the full local check" and was not: it depends on
 tests and examples, so the fuzz targets and the benchmarks — both of which CI runs — were
 outside it. `check` is the complete one; the default stays quick on purpose.
+
+`zig build mutate` is the newest of these and the least usual. Every bound and rule in this
+repository is supposed to be enforced by a test, and the way that has been verified is by hand:
+break the fix on purpose, run the suite, require it to fail. That practice has repeatedly earned
+its keep — it is how a writability bound was found to be checked in the wrong place, how a DNS
+length ceiling was found to be unobservable, and how several checks were found that *no* input
+could distinguish, which were then deleted. It is now a build step with a catalogue of twelve
+mutations rather than a habit, because REVIEW.md's own thesis is that a reviewer's attention is
+not a control — and neither is a habit.
+
+The catalogue includes a thirteenth entry that must *survive*: a doc comment nothing can depend
+on. If breaking that one ever "fails" the suite, the harness is failing for its own reasons and
+every other result in the run is worthless. That is not hypothetical — the first version of the
+tool reported twelve out of twelve caught while running no tests at all, because the child build
+could not find its cache directory and exited before starting. The canary is what found it.
 
 The fuzz targets assert properties, not merely the absence of a crash. The
 central one is **chunk independence**: a stream decoder must produce identical
