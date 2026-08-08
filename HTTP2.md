@@ -8,13 +8,17 @@ the one that touches the rest of the framework. That is the order this was built
 and the last item did turn out to be the only one that changed anything outside
 `src/codec/http2/`.
 
-**What works:** the protocol, over cleartext, with prior knowledge. 7991 lines in
-`src/codec/http2/`, 119 tests, three fuzz targets, and a CI step that checks it against
-`curl` on every run.
+**What works:** the protocol, over cleartext with prior knowledge *and over TLS with `h2`
+negotiated by ALPN*. 8357 lines in `src/codec/http2/`, 126 tests, three fuzz targets, and CI
+steps that check both transports against `curl` with `nghttp2` underneath it on every run.
 
-**What does not:** `h2` over TLS, because it cannot be *negotiated*. That is the one
-thing still blocked upstream, and it is worth being precise about what it does and
-does not mean — see [Reachability](#reachability).
+**What did not, and now does:** `h2` over TLS. This section used to say it "cannot be
+*negotiated*", because RFC 9113 §3.1 identifies `h2` by ALPN and `std.crypto.tls.Client`
+offers no way to send one. That was true of the standard library's client and stopped being
+the whole story when the TLS 1.3 handshake here was written — QUIC needed it first, so it
+stopped being a choice and became a prerequisite. `tls13.client.Client` sends ALPN and
+`tls13.server.Server` selects it; see [Reachability](#reachability) for what the constraint
+was and [TLS.md](TLS.md) for what replaced it.
 
 ## Contents
 

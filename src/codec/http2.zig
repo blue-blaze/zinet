@@ -1,9 +1,10 @@
 //! HTTP/2 (RFC 9113) and HPACK (RFC 7541).
 //!
-//! Cleartext HTTP/2 with prior knowledge is what this speaks. `h2` over TLS is
-//! not reachable and the reason is upstream rather than here: RFC 9113 §3.1
-//! identifies `h2` by ALPN, and `std.crypto.tls.Client` offers no way to send it.
-//! See [HTTP2.md](../../HTTP2.md).
+//! Both transports RFC 9113 defines: cleartext with prior knowledge (§3.2) and `h2`
+//! negotiated by ALPN over TLS (§3.1). The second was unreachable for as long as
+//! `std.crypto.tls.Client` was the only TLS available — it offers no way to send an
+//! ALPN protocol — and became reachable when the TLS 1.3 handshake in
+//! `codec/tls13` was written for QUIC. See [HTTP2.md](../../HTTP2.md).
 
 pub const codec = @import("http2/codec.zig");
 pub const connection = @import("http2/connection.zig");

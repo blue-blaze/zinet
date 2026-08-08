@@ -347,7 +347,7 @@ bitmap indexed by parameter identifier, with `assert(id_value <= 0x10)` to say s
 instead of a bit silently shifting out of range, which is the difference between an
 assertion that documents an invariant and a comment that claims one.
 
-## Method## Method
+## Method
 
 The review walked the call path rather than the file list: accept → register →
 `Channel.serve` → the two per-connection tasks → pipeline propagation → codecs,
@@ -486,6 +486,36 @@ field for both directions, when the endpoint that starts a rotation writes in th
 generation a round trip before its peer follows. Both were resolved by splitting the
 name, and in both cases the split made a rule that had been awkward to write become
 obvious.
+
+### An assertion where a type would have done
+
+**Symptom: the mutation that should break it does not.** Making a bound explicit is only
+half the job; where it is enforced decides whether it can be got wrong again. HTTP/2's
+writability transitions were bounded by a runtime assertion, and shrinking the caller's
+buffer back to its old size failed *no test* — the assertion lived in the callee, and the
+caller's array was still whatever the caller said. Changing the signature to demand
+`*[max_writability_transitions]Writability` turned the same mutation into a compilation
+error: `expected type '*[64]T', found '*[8]T'`.
+
+The general form: when a caller and a callee must agree about a size, an assertion asks them
+to agree at run time and a type makes them agree at compile time. The second is the one that
+survives someone editing only one side. This was found by self-checking the fix rather than
+by review — the mutation not failing is what said the check was in the wrong place.
+
+### A rule enforced before the data it displaces
+
+**Symptom: the same bytes mean different things depending on how the network split them.**
+HTTP/3's critical-stream rule — §6.2.1 makes closing a control stream a connection error —
+was checked before the delivery's bytes were processed. A GOAWAY arriving with the FIN
+therefore failed the connection with the GOAWAY unparsed, while the identical bytes split
+across two deliveries produced the GOAWAY event *and then* failed. The connection's account
+of what its peer had said depended on fragmentation, which is exactly what this repository's
+central fuzz invariant forbids.
+
+Data that arrived before a close is data that was received; the close is what happens next.
+The general form: when a rule ends a connection, apply it *after* the input in hand, or the
+rule silently rewrites history. Found by the fuzzer within one run of `-Dio=` finally
+reaching the fuzz harness — which is its own finding, below.
 
 ## Fuzz findings
 
@@ -888,3 +918,27 @@ Verified rather than assumed:
   `PING` and empty-`DATA` floods by rate. The rate limits are a shape nothing else in
   this codebase needs, because what those attacks consume is work rather than a held
   resource.
+
+## Two lessons about the work rather than the code
+
+Recorded here because both cost real time in this round and neither is a property of Zinet.
+
+**A self-check needs its own backups, named for the file rather than its basename.**
+Mutation self-checking works by breaking the fix on purpose and requiring the new test to
+fail. That means copying files aside and restoring them, and copying to
+`/tmp/<basename>.bak` collided `http2/connection.zig` with `http3/connection.zig` — one
+overwrote the other, and the restore put HTTP/3's contents into HTTP/2's file. Worse, the
+recovery attempt used `git checkout <file>`, which discarded HTTP/3 changes that were
+finished but not yet committed. Both files were recovered from the surviving copies and the
+patches redone, but the rule is cheap and absolute: back up to an explicitly named path per
+file, and restore from the backup, never from git, while uncommitted work exists.
+
+**A flaky test is worse than a missing one, and its flakiness is usually the diagnosis.**
+The TLS handshake timeout added in this round passed, then failed on a loaded machine with
+`ConnectionResetByPeer` instead of `HandshakeTimeout`. The cause was not the machine: the
+client compared the clock to decide whether a zero-byte read meant a timeout, and a timer
+firing a hair before the nanosecond it was given made it conclude "reset". `readSocket`
+already reported an orderly zero-byte read as `error.EndOfStream`, so zero could only ever
+mean the deadline and the comparison was both redundant and wrong. The flake was pointing at
+a real defect in the fix, one that would have mattered in production at exactly the moment a
+server was busiest.

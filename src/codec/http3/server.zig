@@ -15,19 +15,21 @@
 //! concurrently" — the same guarantee with a wider scope. Nothing in a stream
 //! handler can tell the difference.
 //!
-//! Three things are deliberately absent:
+//! One thing is deliberately absent, and two things listed here used to be and are not:
 //!
-//! * **No connection migration.** §9 allows a client to change address, and
-//!   handling it means path validation with PATH_CHALLENGE. A connection is found
-//!   by connection ID and its address is *updated* rather than checked, which is
-//!   what §9.3 requires anyway before an address is validated — but the probing
-//!   that would confirm the new path is not done, so a NAT rebinding survives and
-//!   a deliberate migration is not verified.
-//! * **No stateless reset.** §10.3 wants an endpoint that has lost state to
-//!   answer with something the peer can recognise; that needs a key that survives
-//!   restarts, which is an operational input this layer does not yet take.
 //! * **No 0-RTT.** §4.6.1 of RFC 9001 needs a session ticket store and the replay
 //!   protection that goes with it.
+//! * ~~No connection migration.~~ Done: §9.3's three conditions are checked
+//!   together, the new path is validated with PATH_CHALLENGE before anything is
+//!   sent to it, and §9.4's congestion and RTT reset follows. Two named pieces
+//!   remain absent for stated reasons — §9.3.3's probe of the *old* path and
+//!   `preferred_address` (§9.6); see the table in HTTP3.md.
+//! * ~~No stateless reset.~~ Done, and the reason given for its absence was
+//!   wrong rather than merely outdated: the "key that survives restarts" was
+//!   already an option (`seed`), and the HMAC derivation §10.3.2 recommends was
+//!   already producing the tokens announced in NEW_CONNECTION_ID. What was
+//!   missing was one code path and the `stateless_reset_token` transport
+//!   parameter. See the note in README.
 
 const std = @import("std");
 const assert = std.debug.assert;
