@@ -157,13 +157,31 @@ dependency is marked lazy and is reached only from `src/backend/zio.zig`, the on
 file in the repository that imports it; a consumer of the `zinet` package gets the
 threaded seam and no third-party code.
 
-The fiber backend matters more than a build flag suggests, because it is the
-configuration the threading model was designed for. Zinet gives each connection
-its own task and lets it block in a read — which is what makes handler state lock
-free. On threads that is expensive: a plain connection costs two tasks, so the
-concurrency budget is the scarcest resource the framework has, and exhausting it
-shows up as refused connections. On fibers the same design costs almost nothing.
-Nothing in `src/` changes between the two.
+Zinet gives each connection its own task and lets it block in a read, which is what makes
+handler state lock free. That costs two tasks per connection — a reader and a writer — and
+this section used to claim two things about the cost that had never been measured: that it
+makes the concurrency budget "the scarcest resource the framework has" on threads, and that
+"on fibers the same design costs almost nothing". Both are now measured, and neither survived
+in the form it was written. See [bench/README.md](bench/README.md) for the numbers.
+
+What the measurement says, on an M-series laptop under macOS, server and load generator in
+separate processes:
+
+* **Threads do not run out.** 2048 connections is 4096 tasks, and they were all served with
+  zero refusals; throughput fell from 39 k to 25 k req/s, gracefully. The cost of the model on
+  threads is throughput, not refusal — at least at these sizes on this platform.
+* **Fibers are currently the slower of the two.** A fiber-backed server against a threaded
+  load generator serves about 20 % less and has a *reproducible multi-second* worst-case
+  latency at 512 connections, where the threaded server stays under 50 ms. That is a
+  statement about one third-party fiber runtime on one operating system — zio's `zig-0.17`
+  branch on macOS — and not about fibers as an idea; Linux with io_uring is the comparison
+  that would matter and has not been made.
+
+The design argument that survives is the one about *correctness*: one reader task per
+connection is what lets handler state be touched without locks, and that holds on either
+backend. The argument about cost is now a measurement rather than an assertion, and it points
+the other way for the moment. Nothing in `src/` changes between the two backends, which is
+both the point of injecting `Io` and the reason the comparison is possible at all.
 
 What runs on fibers, verified in CI: the whole test suite, the fuzz targets, and
 an HTTP exchange with `curl` against a fiber-backed server. Checked by hand as

@@ -55,9 +55,9 @@ pub const ChildConfig = struct {
     /// How long a client has to finish its handshake, measured from the moment the
     /// connection was admitted. Null waits forever, which is what this used to do.
     ///
-    /// A bound rather than a preference: a connection still handshaking holds a task — two
-    /// OS threads on the threaded backend — and no application code has run yet, so a peer
-    /// that opens sockets and then says nothing spends a server's scarcest resource without
+    /// A bound rather than a preference: a connection still handshaking holds a task — an OS
+    /// thread on the threaded backend — and no application code has run yet, so a peer that
+    /// opens sockets and then says nothing costs the server for as long as it likes without
     /// ever identifying itself. Nothing else ended such a connection; the operating system
     /// was the only backstop.
     ///
@@ -785,10 +785,9 @@ test "tls13 server: the standard library's TLS client handshakes against our ser
 test "tls13: a peer that accepts and then says nothing does not hold a task forever" {
     // The bound that was missing. A TLS handshake here is a plain read loop, and it used
     // to be handed no deadline at all — so a peer that completes the TCP handshake and then
-    // stays silent held a connection, and with it a task and two OS threads on the threaded
-    // backend, until the operating system intervened. Concurrency is this framework's
-    // scarcest resource, which makes that the cheapest denial of service available against
-    // a TLS endpoint.
+    // stays silent held a connection, and with it a task and an OS thread on the threaded
+    // backend, until the operating system intervened. Cheap for the peer, unbounded for the
+    // server, and invisible to the application — which never sees the connection at all.
     //
     // Written from the client's side because it is the side that can be made to wait with
     // nothing but a listening socket: a bare TCP listener that accepts and never speaks is
