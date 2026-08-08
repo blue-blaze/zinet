@@ -63,6 +63,17 @@ pub const Options = struct {
     attempts: usize = 2,
     /// Which address families to ask for, in order of preference.
     families: []const Family = &.{ .ip4, .ip6 },
+    /// Whether a truncated datagram reply is retried over TCP.
+    ///
+    /// §4.2.1 caps a UDP message and sets TC when the answer did not fit; §4.2.2 defines the
+    /// stream form that has no such cap. Without the retry a name with more records than fit
+    /// simply fails, which makes the resolver unusable for exactly the names that need it —
+    /// and the failure looks like a broken server rather than an unimplemented transport.
+    tcp_fallback: bool = true,
+    /// The largest stream reply this resolver will read. §4.2.2's length prefix is sixteen
+    /// bits, so a server may announce up to 64 KiB; this is the ceiling on what will be
+    /// allocated to hold one, because "the peer said so" is not a bound.
+    max_tcp_reply: usize = 16 * 1024,
 };
 
 pub const Family = enum {
@@ -157,6 +168,18 @@ pub const Resolver = struct {
                     // and believing a different answer is how a resolver ends up
                     // choosing whichever server lies fastest.
                     error.NameNotFound, error.NoAddress => return err,
+                    // Truncation belongs with those rather than with a lost datagram: it is
+                    // a fact about the answer, and asking the same server again gets the same
+                    // TC bit. It reaches here only when `tcp_fallback` is off, since
+                    // otherwise §4.2.2's transport has already been tried.
+                    //
+                    // It used to fall into the branch below, which means `error.Truncated`
+                    // was documented in this file's error set and unreachable through its
+                    // public API: every truncated answer was reported as `error.Timeout`. So
+                    // the old behaviour was not "fail with Truncated" but "fail with the
+                    // wrong error", which is worth knowing when judging what the retry is
+                    // worth.
+                    error.Truncated => return err,
                     else => continue,
                 };
                 return outcome;
@@ -231,7 +254,14 @@ pub const Resolver = struct {
             if (!answersOurQuestion(&message, id, host, family)) continue;
 
             // Only now is the reply ours to believe.
-            if (message.header.truncated) return error.Truncated;
+            if (message.header.truncated) {
+                // §4.2.1: the answer did not fit in a datagram. §4.2.2's stream transport is
+                // where it does fit, and asking again there is the whole remedy — the query
+                // is identical, including its transaction ID, because this is the same
+                // question to the same server by another road.
+                if (!self.options.tcp_fallback) return error.Truncated;
+                return self.askOverStream(server, out[0..query_len], id, host, port, family);
+            }
             switch (message.header.response_code) {
                 .no_error => {},
                 .name_error => return error.NameNotFound,
@@ -240,6 +270,106 @@ pub const Resolver = struct {
 
             return collect(&message, host, port, family);
         }
+    }
+
+    /// Asks `server` the same question over TCP, which is where an answer too large for a
+    /// datagram fits (§4.2.2).
+    ///
+    /// The reply is framed by a two-byte big-endian length that excludes itself, so the read is
+    /// two reads: the prefix, then exactly that many bytes. Bounded by `max_tcp_reply`, because
+    /// the prefix is a claim by the peer and sixteen bits of it.
+    ///
+    /// Everything after decoding is the datagram path's logic, deliberately: this is a different
+    /// transport for the same question, not a different question. A second copy of "is this our
+    /// reply" is how the two would come to disagree.
+    /// Fills `dest` from `stream`, giving up at `deadline` rather than trusting the peer to
+    /// send what it announced.
+    ///
+    /// `net_receive` is the one operation `std.Io` offers that takes a deadline, which is why
+    /// this reads through it rather than through a `Reader`: on this path a bounded read is
+    /// worth more than a buffered one, and the messages are small.
+    fn readStreamBytes(
+        self: *Resolver,
+        stream: *Io.net.Stream,
+        dest: []u8,
+        deadline: Io.Timestamp,
+    ) Error!void {
+        const io = self.options.io;
+        var filled: usize = 0;
+        while (filled < dest.len) {
+            if (Io.Timestamp.now(io, .awake).nanoseconds >= deadline.nanoseconds) {
+                return error.Timeout;
+            }
+            var incoming: Io.net.IncomingMessage = .init;
+            const result = io.operateTimeout(.{ .net_receive = .{
+                .socket_handle = stream.socket.handle,
+                .message_buffer = (&incoming)[0..1],
+                .data_buffer = dest[filled..],
+                .flags = .{},
+            } }, .{ .deadline = deadline.withClock(.awake) }) catch return error.Timeout;
+            const maybe_err, _ = result.net_receive;
+            if (maybe_err != null) return error.ServerFailure;
+            // Zero bytes on a stream is the orderly close: the server ended the connection
+            // without sending what it said it would.
+            if (incoming.data.len == 0) return error.ServerFailure;
+            filled += incoming.data.len;
+        }
+    }
+
+    fn askOverStream(
+        self: *Resolver,
+        server: Io.net.IpAddress,
+        question_bytes: []const u8,
+        id: u16,
+        host: []const u8,
+        port: u16,
+        family: Family,
+    ) Error!Answer {
+        const io = self.options.io;
+        const gpa = self.options.gpa;
+
+        var address = server;
+        var stream = address.connect(io, .{ .mode = .stream }) catch return error.ServerFailure;
+        defer stream.close(io);
+
+        const deadline = Io.Timestamp.now(io, .awake).addDuration(self.options.per_query_timeout);
+
+        var length_prefix: [2]u8 = undefined;
+        std.mem.writeInt(u16, &length_prefix, @intCast(question_bytes.len), .big);
+
+        var write_buffer: [dns.max_udp_message + 2]u8 = undefined;
+        var writer = stream.writer(io, &write_buffer);
+        writer.interface.writeAll(&length_prefix) catch return error.ServerFailure;
+        writer.interface.writeAll(question_bytes) catch return error.ServerFailure;
+        writer.interface.flush() catch return error.ServerFailure;
+
+        // Every read is bounded by the one deadline computed above. Checking the clock *after*
+        // reading — which is how this was written first — is not a bound at all: a server that
+        // announces sixty thousand bytes and sends a hundred leaves the resolver blocked
+        // forever, and the check it never reaches is the one that would have caught it. The
+        // fault was found by mutating the length ceiling and watching the suite wedge rather
+        // than fail.
+        var prefix_bytes: [2]u8 = undefined;
+        try self.readStreamBytes(&stream, &prefix_bytes, deadline);
+        const announced = std.mem.readInt(u16, &prefix_bytes, .big);
+        if (announced == 0) return error.ServerFailure;
+        if (announced > self.options.max_tcp_reply) return error.Truncated;
+
+        const reply = gpa.alloc(u8, announced) catch return error.ServerFailure;
+        defer gpa.free(reply);
+        try self.readStreamBytes(&stream, reply, deadline);
+
+        const message = dns.decode(reply) catch return error.ServerFailure;
+        if (!answersOurQuestion(&message, id, host, family)) return error.ServerFailure;
+        // TC on a stream reply means the server could not fit the answer in 64 KiB either, which
+        // is not something another transport fixes.
+        if (message.header.truncated) return error.Truncated;
+        switch (message.header.response_code) {
+            .no_error => {},
+            .name_error => return error.NameNotFound,
+            else => return error.ServerFailure,
+        }
+        return collect(&message, host, port, family);
     }
 };
 
@@ -739,4 +869,311 @@ test "resolver: a record in another class is not an address" {
     };
     message.answer_len = 2;
     try testing.expectError(error.NoAddress, collect(&message, "asked.test", 80, .ip4));
+}
+
+/// A server that answers the datagram query with TC set and nothing else, and answers the
+/// stream query in full. Both transports on the same port, which is what §4.2 requires of a
+/// name server and therefore what the retry depends on.
+const TruncatingServer = struct {
+    io: Io,
+    datagram: Io.net.Socket,
+    stream_listener: Io.net.Server,
+    address: Io.net.IpAddress,
+    /// How many addresses the stream answer carries. More than one, so that the test is
+    /// asserting the *whole* answer arrived rather than that something arrived.
+    answers: usize = 3,
+    /// What the stream reply looks like, so that each check on that path has an input that
+    /// exercises it.
+    mode: Mode = .full,
+    served_stream: std.atomic.Value(bool) = .init(false),
+
+    const Mode = enum {
+        /// A complete, correct answer.
+        full,
+        /// A length prefix claiming more than `max_tcp_reply`. The prefix is the peer's
+        /// claim, and this is what makes the ceiling on it load-bearing.
+        oversized_prefix,
+        /// A well-formed answer to a different transaction, which is what an off-path
+        /// attacker who reached the stream first would send.
+        wrong_id,
+    };
+
+    fn init(io: Io) !TruncatingServer {
+        // The datagram socket picks the port, and the stream listener is bound to the same
+        // one — a resolver retries the same server, not a different one.
+        var bind: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        const datagram = try bind.bind(io, .{ .mode = .dgram });
+        var stream_bind = datagram.address;
+        const listener = try stream_bind.listen(io, .{ .reuse_address = true });
+        return .{
+            .io = io,
+            .datagram = datagram,
+            .stream_listener = listener,
+            .address = datagram.address,
+        };
+    }
+
+    fn deinit(self: *TruncatingServer) void {
+        self.datagram.close(self.io);
+        self.stream_listener.deinit(self.io);
+    }
+
+    /// One datagram query answered with TC, then one stream query answered in full.
+    fn serve(self: *TruncatingServer) void {
+        var scratch: [dns.edns_udp_size]u8 = undefined;
+        var incoming: Io.net.IncomingMessage = .init;
+        const deadline = Io.Timestamp.now(self.io, .awake).addDuration(.fromSeconds(5));
+        const result = self.io.operateTimeout(.{ .net_receive = .{
+            .socket_handle = self.datagram.handle,
+            .message_buffer = (&incoming)[0..1],
+            .data_buffer = &scratch,
+            .flags = .{},
+        } }, .{ .deadline = deadline.withClock(.awake) }) catch return;
+        const maybe_err, _ = result.net_receive;
+        if (maybe_err != null) return;
+
+        const query = dns.decode(incoming.data) catch return;
+        if (query.question_len != 1) return;
+
+        // §4.2.1's truncated reply: the header says so, and the answer section is empty
+        // because that is what "it did not fit" looks like.
+        var out: [dns.max_udp_message]u8 = undefined;
+        const truncated_len = writeReply(&out, &query, 0, true) catch return;
+        var back = incoming.from;
+        self.datagram.send(self.io, &back, out[0..truncated_len]) catch return;
+
+        // And the same question over the stream, answered in full.
+        const connection = self.stream_listener.accept(self.io) catch return;
+        defer connection.close(self.io);
+
+        var read_buffer: [dns.edns_udp_size]u8 = undefined;
+        var reader = connection.reader(self.io, &read_buffer);
+        const announced = reader.interface.takeInt(u16, .big) catch return;
+        const request = reader.interface.take(announced) catch return;
+        const stream_query = dns.decode(request) catch return;
+
+        var reply_query = stream_query;
+        if (self.mode == .wrong_id) reply_query.header.id = stream_query.header.id ^ 0xffff;
+
+        var full: [dns.max_udp_message]u8 = undefined;
+        const full_len = writeReply(&full, &reply_query, self.answers, false) catch return;
+
+        var write_buffer: [dns.max_udp_message + 2]u8 = undefined;
+        var writer = connection.writer(self.io, &write_buffer);
+        var prefix: [2]u8 = undefined;
+        // An announced length the reply does not actually carry: the resolver must refuse on
+        // the claim alone, before allocating for it.
+        const announced_len: u16 = if (self.mode == .oversized_prefix) 60000 else @intCast(full_len);
+        std.mem.writeInt(u16, &prefix, announced_len, .big);
+        writer.interface.writeAll(&prefix) catch return;
+        writer.interface.writeAll(full[0..full_len]) catch return;
+        writer.interface.flush() catch return;
+        self.served_stream.store(true, .release);
+
+        // A server that announces more than it sends and then stalls, rather than closing.
+        // Closing would end the resolver's read promptly and hide what the length ceiling is
+        // for; holding the connection open is both the harder case and the realistic one,
+        // since a peer trying to spend someone else's memory has no reason to hang up.
+        if (self.mode == .oversized_prefix) {
+            var waited: usize = 0;
+            while (waited < 60) : (waited += 1) {
+                self.io.sleep(.fromMilliseconds(50), .awake) catch return;
+            }
+        }
+    }
+
+    /// Echoes the question and appends `answers` A records, all for the queried name.
+    fn writeReply(out: []u8, query: *const dns.Message, answers: usize, truncated: bool) !usize {
+        var header: dns.Header = .{
+            .id = query.header.id,
+            .response = true,
+            .recursion_available = true,
+            .truncated = truncated,
+            .question_count = 1,
+            .answer_count = @intCast(answers),
+        };
+        header.encode(out[0..dns.Header.wire_len]);
+        var cursor: usize = dns.Header.wire_len;
+        const name_at = cursor;
+        cursor += try dns.encodeName(out[cursor..], query.questions[0].name.slice());
+        std.mem.writeInt(u16, out[cursor..][0..2], @backingInt(query.questions[0].type), .big);
+        cursor += 2;
+        std.mem.writeInt(u16, out[cursor..][0..2], @backingInt(dns.Class.in), .big);
+        cursor += 2;
+
+        for (0..answers) |index| {
+            out[cursor] = 0xc0 | @as(u8, @intCast(name_at >> 8));
+            out[cursor + 1] = @intCast(name_at & 0xff);
+            cursor += 2;
+            std.mem.writeInt(u16, out[cursor..][0..2], @backingInt(dns.Type.a), .big);
+            cursor += 2;
+            std.mem.writeInt(u16, out[cursor..][0..2], @backingInt(dns.Class.in), .big);
+            cursor += 2;
+            std.mem.writeInt(u32, out[cursor..][0..4], 42, .big);
+            cursor += 4;
+            std.mem.writeInt(u16, out[cursor..][0..2], 4, .big);
+            cursor += 2;
+            @memcpy(out[cursor..][0..4], &[4]u8{ 192, 0, 2, @intCast(10 + index) });
+            cursor += 4;
+        }
+        return cursor;
+    }
+};
+
+test "resolver: a truncated datagram answer is asked again over TCP" {
+    // §4.2.1 caps a datagram reply and sets TC when the answer did not fit; §4.2.2 is the
+    // transport where it does. Before this the resolver returned `error.Truncated` and
+    // stopped, which fails exactly the names that have enough records to need the retry — and
+    // fails them in a way that looks like a broken server rather than a missing transport.
+    const gpa = testing.allocator;
+    var threaded = try backend.Runtime.init(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try TruncatingServer.init(io);
+
+    // Declared before `server.deinit` so that it runs *after* it: `Io.net.Server.accept`
+    // takes no deadline, so the only thing that reliably ends a task waiting in it is the
+    // listener closing. Cancelling first and closing second would leave the suite hung
+    // whenever the resolver decides not to connect — which is exactly what happens when the
+    // retry regresses, so the wrong order turns a failing test into a wedged one.
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    defer server.deinit();
+    try group.concurrent(io, TruncatingServer.serve, .{&server});
+
+    var r: Resolver = .init(.{
+        .gpa = gpa,
+        .io = io,
+        .servers = &.{server.address},
+        .per_query_timeout = .fromMilliseconds(3000),
+        .attempts = 1,
+        .families = &.{.ip4},
+    });
+
+    const answer = try r.resolve("truncated.test", 80);
+    // All three records, which is the point: a retry that returned one address would look
+    // like success while having lost most of the answer.
+    try testing.expectEqual(@as(usize, 3), answer.len);
+    try testing.expectEqual([4]u8{ 192, 0, 2, 10 }, answer.addresses[0].ip4.bytes);
+    try testing.expectEqual([4]u8{ 192, 0, 2, 12 }, answer.addresses[2].ip4.bytes);
+    try testing.expect(server.served_stream.load(.acquire));
+}
+
+test "resolver: the TCP retry can be declined, and then truncation is the answer" {
+    // The retry is an option because a deployment may not want its resolver opening streams —
+    // a firewall that permits port 53 over UDP and not over TCP is common enough that the
+    // failure is worth being able to choose. Declining it restores the old behaviour, which
+    // is now a decision rather than a limitation.
+    const gpa = testing.allocator;
+    var threaded = try backend.Runtime.init(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try TruncatingServer.init(io);
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    defer server.deinit();
+    try group.concurrent(io, TruncatingServer.serve, .{&server});
+
+    var r: Resolver = .init(.{
+        .gpa = gpa,
+        .io = io,
+        .servers = &.{server.address},
+        .per_query_timeout = .fromMilliseconds(1000),
+        .attempts = 1,
+        .families = &.{.ip4},
+        .tcp_fallback = false,
+    });
+
+    try testing.expectError(error.Truncated, r.resolve("truncated.test", 80));
+    try testing.expect(!server.served_stream.load(.acquire));
+}
+
+/// Runs one `resolve` so a test can wait for it with a bound of its own.
+const Probe = struct {
+    resolver: *Resolver,
+    accepted: bool = false,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *Probe) void {
+        if (self.resolver.resolve("truncated.test", 80)) |_| {
+            self.accepted = true;
+        } else |_| {}
+        self.done.store(true, .release);
+    }
+};
+
+test "resolver: a stream reply is bounded by what it claims, and checked like any other" {
+    // Two conditions on the TCP path that the successful case cannot exercise. Both are about
+    // trusting the peer exactly as far as a datagram peer is trusted: §4.2.2's length prefix
+    // is sixteen bits of *the server's claim*, and a stream reply is no more inherently ours
+    // than a datagram one.
+    // What is asserted is that the lookup does not *succeed*, rather than which error name
+    // comes out. That is the property with teeth: the wrong-transaction reply is otherwise a
+    // perfectly well-formed answer carrying A records, so a resolver missing the check returns
+    // addresses — and an assertion on an error name would be an assertion about how `query`
+    // classifies a bad server, which is a different subject.
+    const gpa = testing.allocator;
+    const modes = [_]TruncatingServer.Mode{ .oversized_prefix, .wrong_id };
+
+    for (modes) |mode| {
+        var threaded = try backend.Runtime.init(gpa);
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        var server = try TruncatingServer.init(io);
+        server.mode = mode;
+
+        var group: Io.Group = .init;
+        defer group.cancel(io);
+        defer server.deinit();
+        try group.concurrent(io, TruncatingServer.serve, .{&server});
+
+        var r: Resolver = .init(.{
+            .gpa = gpa,
+            .io = io,
+            .servers = &.{server.address},
+            .per_query_timeout = .fromMilliseconds(600),
+            .attempts = 1,
+            .families = &.{.ip4},
+        });
+
+        // On its own task, with a bound, so that anything which merely makes `resolve` slow
+        // is reported as a failure rather than as a hung suite.
+        //
+        // One regression is not caught this way and it is worth naming: deleting the deadline
+        // from the stream reads themselves. The probe then blocks in an unbounded receive, and
+        // a task in that state cannot be cancelled from outside — which is precisely why the
+        // deadline has to be on the receive rather than checked around it. That mutation
+        // wedges instead of failing, and the harness timeout is what catches it.
+        var probe: Probe = .{ .resolver = &r };
+        var probe_group: Io.Group = .init;
+        defer probe_group.cancel(io);
+        try probe_group.concurrent(io, Probe.run, .{&probe});
+
+        const started = Io.Timestamp.now(io, .awake);
+        const give_up = started.addDuration(.fromSeconds(3));
+        while (!probe.done.load(.acquire)) {
+            if (Io.Timestamp.now(io, .awake).nanoseconds >= give_up.nanoseconds) {
+                std.debug.print("mode {t}: resolve never returned\n", .{mode});
+                return error.ResolveDidNotReturn;
+            }
+            try io.sleep(.fromMilliseconds(5), .awake);
+        }
+        const elapsed = Io.Timestamp.now(io, .awake).nanoseconds - started.nanoseconds;
+
+        if (probe.accepted) {
+            std.debug.print("mode {t}: accepted an answer it should have refused\n", .{mode});
+            return error.AcceptedAnUnacceptableReply;
+        }
+
+        // Refused on what the reply *claimed*, not by waiting out the clock. Without the
+        // ceiling the resolver would sit for the whole per-query timeout waiting for sixty
+        // thousand bytes that are not coming — the same failure to the caller, arrived at by
+        // spending the budget and a 60 KB allocation. This is what makes the ceiling
+        // observable rather than merely present.
+        try testing.expect(elapsed < 400 * std.time.ns_per_ms);
+    }
 }
