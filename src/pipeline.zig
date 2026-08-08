@@ -244,6 +244,13 @@ pub const HandlerContext = struct {
     name: []const u8,
     /// Set when the context has been unlinked but not yet freed.
     removed: bool,
+    /// Set when freeing this context must *not* destroy its handler.
+    ///
+    /// Exists for one case: a handler that removes itself from its own `onAdded`.
+    /// The add has failed, and a failed add does not transfer ownership of an
+    /// `initOwned` instance — the caller's `errdefer` still covers it — so the
+    /// deferred free has to release the context and leave the handler alone.
+    retain_handler: bool = false,
     /// Intrusive link for the deferred-free list, so removing a handler during
     /// event propagation cannot fail on allocation.
     pending_next: ?*HandlerContext,
@@ -512,16 +519,32 @@ pub const Pipeline = struct {
     pub fn deinit(pipeline: *Pipeline) void {
         assert(pipeline.depth == 0); // Tearing down mid-callback is a bug.
 
+        // The depth is held across the whole walk, so an `onRemoved` that edits the
+        // chain defers its frees instead of releasing a node this loop is still holding.
+        // Freeing as it went meant the cached `ctx.next` could already be gone by the
+        // next iteration, which then read it and freed it a second time. Chain edits
+        // from callbacks are supported everywhere else in this file; teardown supporting
+        // them is the consistent rule rather than a special case.
+        pipeline.enter();
         var cursor = pipeline.head.next;
         while (cursor) |ctx| {
             cursor = ctx.next;
             if (ctx == pipeline.tail) break;
+            // An earlier callback may have removed this one, in which case `remove` has
+            // already run its `onRemoved` and queued it.
+            if (ctx.removed) continue;
             if (ctx.handler.vtable.onRemoved) |callback| {
                 callback(ctx.handler.context, ctx);
             }
-            pipeline.freeContext(ctx);
+            // Unless the callback removed it, in which case `remove` did all of this.
+            if (!ctx.removed) {
+                ctx.removed = true;
+                ctx.pending_next = pipeline.pending_free;
+                pipeline.pending_free = ctx;
+            }
         }
-        pipeline.drainPendingFree();
+        // Drains what the walk queued, the removals inside it included.
+        pipeline.leave();
         pipeline.gpa.destroy(pipeline.head);
         pipeline.gpa.destroy(pipeline.tail);
         pipeline.* = undefined;
@@ -554,8 +577,10 @@ pub const Pipeline = struct {
     }
 
     fn freeContext(pipeline: *Pipeline, ctx: *HandlerContext) void {
-        if (ctx.handler.vtable.destroy) |destroy_handler| {
-            destroy_handler(ctx.handler.context, pipeline.gpa);
+        if (!ctx.retain_handler) {
+            if (ctx.handler.vtable.destroy) |destroy_handler| {
+                destroy_handler(ctx.handler.context, pipeline.gpa);
+            }
         }
         pipeline.gpa.destroy(ctx);
     }
@@ -645,9 +670,31 @@ pub const Pipeline = struct {
         after.prev = ctx;
 
         if (handler.vtable.onAdded) |callback| {
+            // Entered *twice* on purpose. `remove` defers the free while the depth is
+            // non-zero, and the second `leave` is what drains it — so between the two
+            // leaves the context is unlinked, flagged, and still readable, which is the
+            // only way to learn whether the callback removed it. With one enter, `leave`
+            // frees the context and then this function has nothing but its address:
+            // returning it is a use-after-free and the error path below destroys it a
+            // second time. Every other self-removal in this file happens during a
+            // propagation, where nothing returns the context — `onAdded` is the one
+            // callback whose caller keeps the address.
+            pipeline.enter();
             pipeline.enter();
             const outcome = callback(handler.context, ctx);
             pipeline.leave();
+
+            const removed_itself = ctx.removed;
+            if (removed_itself) ctx.retain_handler = true;
+            pipeline.leave();
+
+            if (removed_itself) {
+                // A callback error says more about why than the removal does, so it
+                // wins. Either way the insertion is undone already: `remove` unlinked
+                // the context and the drain above freed it.
+                _ = outcome catch |err| return err;
+                return error.HandlerRemovedItself;
+            }
 
             _ = outcome catch |err| {
                 // A handler that could not be added must not be left in the
@@ -1440,4 +1487,101 @@ test "Pipeline: a handler whose onAdded fails is not left in the chain" {
     // context.
     fixture.pipeline.fireRead(try Message.initBytes(gpa, "after"));
     try testing.expectEqual(@as(usize, 1), fixture.pipeline.stats.unhandled_inbound);
+}
+
+test "Pipeline: a handler that removes itself from onAdded is refused rather than freed" {
+    // `link` calls `onAdded` between `enter` and `leave`, so a self-removal inside it
+    // is queued and then freed the moment `leave` drops the depth to zero — after
+    // which `link` still had a pointer to return. Every other self-removal in this
+    // file happens during a *propagation*, where the caller is the pipeline itself and
+    // nothing returns the context; `onAdded` is the one callback whose return value is
+    // an address the caller keeps.
+    const gpa = testing.allocator;
+    var fixture = try Fixture.init(gpa);
+    defer fixture.deinit();
+
+    const Suicidal = struct {
+        pub fn onAdded(_: *@This(), ctx: *HandlerContext) Error!void {
+            ctx.pipeline.remove(ctx);
+        }
+    };
+
+    var suicidal: Suicidal = .{};
+    try testing.expectError(
+        error.HandlerRemovedItself,
+        fixture.pipeline.addLast("suicidal", .init(&suicidal)),
+    );
+    try testing.expectEqual(@as(usize, 0), fixture.pipeline.count());
+
+    // The chain is intact afterwards: a read reaches the tail rather than a freed
+    // context.
+    fixture.pipeline.fireRead(try Message.initBytes(gpa, "after"));
+    try testing.expectEqual(@as(usize, 1), fixture.pipeline.stats.unhandled_inbound);
+}
+
+test "Pipeline: an owned handler that removes itself from onAdded is freed exactly once" {
+    // The ownership half of the rule above. `initOwned` transfers ownership on a
+    // *successful* add, so a refused add must leave the instance to the caller — and a
+    // self-removal must not have destroyed it on the way out. Under the leak-checking
+    // allocator, doing it twice and doing it never both fail.
+    const gpa = testing.allocator;
+    var fixture = try Fixture.init(gpa);
+    defer fixture.deinit();
+
+    const Owned = struct {
+        scratch: []u8,
+        pub fn deinit(self: *@This(), allocator: Allocator) void {
+            allocator.free(self.scratch);
+        }
+        pub fn onAdded(_: *@This(), ctx: *HandlerContext) Error!void {
+            ctx.pipeline.remove(ctx);
+        }
+    };
+
+    const owned = try gpa.create(Owned);
+    owned.* = .{ .scratch = try gpa.dupe(u8, "state") };
+    try testing.expectError(
+        error.HandlerRemovedItself,
+        fixture.pipeline.addLast("owned-suicidal", .initOwned(owned)),
+    );
+    // Ownership stayed here, so this is the only release.
+    owned.deinit(gpa);
+    gpa.destroy(owned);
+    try testing.expectEqual(@as(usize, 0), fixture.pipeline.count());
+}
+
+test "Pipeline: teardown tolerates an onRemoved that removes another handler" {
+    // `deinit` walks the chain caching `ctx.next`, then runs `onRemoved`, then frees.
+    // A callback that removes the cached neighbour leaves the walk holding a pointer
+    // to memory the removal already released — and then frees it again. The pipeline
+    // supports chain edits from callbacks everywhere else, so teardown supporting them
+    // is the consistent rule rather than a special case.
+    const gpa = testing.allocator;
+    var fixture = try Fixture.init(gpa);
+
+    const Remover = struct {
+        target: ?*HandlerContext = null,
+        pub fn onRemoved(self: *@This(), _: *HandlerContext) void {
+            const ctx = self.target orelse return;
+            self.target = null;
+            ctx.pipeline.remove(ctx);
+        }
+    };
+    const Plain = struct {
+        removed: usize = 0,
+        pub fn onRemoved(self: *@This(), _: *HandlerContext) void {
+            self.removed += 1;
+        }
+    };
+
+    var remover: Remover = .{};
+    var plain: Plain = .{};
+    _ = try fixture.pipeline.addLast("remover", .init(&remover));
+    remover.target = try fixture.pipeline.addLast("plain", .init(&plain));
+
+    // Explicit rather than deferred: the teardown is what is under test.
+    fixture.deinit();
+
+    // Removed once, by whichever path got there first — not twice.
+    try testing.expectEqual(@as(usize, 1), plain.removed);
 }
