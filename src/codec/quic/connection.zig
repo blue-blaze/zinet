@@ -2049,6 +2049,21 @@ pub const Connection = struct {
                                 } });
                             }
                         }
+                    } else if (sf.fin) {
+                        // The stream finished and was forgotten by `receiveStream`'s reap,
+                        // which happens as soon as nothing is left to deliver — for a
+                        // receive-only stream, that is the moment a FIN arrives after the
+                        // data was consumed. The close still has to be reported: a layer
+                        // above may attach meaning to it, and RFC 9114 §6.2.1 attaches the
+                        // strongest kind — closing a control stream is a connection error.
+                        // Without this the event was dropped and the rule unenforceable.
+                        //
+                        // Bidirectional streams hid it, because they are not reaped until
+                        // both directions are done, so the FIN always found a live stream.
+                        try self.events.append(gpa, .{ .stream_readable = .{
+                            .id = sf.id,
+                            .fin = true,
+                        } });
                     }
                 },
                 .reset_stream => |sf| {

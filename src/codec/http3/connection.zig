@@ -1032,8 +1032,15 @@ pub const Connection = struct {
         }
     }
 
+    /// Whether `id` is one of the three streams the connection cannot do without: the
+    /// peer's control stream (§6.2.1) and its two QPACK streams (RFC 9204 §4.2).
+    fn isCriticalStream(self: *const Connection, id: u64) bool {
+        return matches(self.control_in, id) or
+            matches(self.qpack_encoder_in, id) or
+            matches(self.qpack_decoder_in, id);
+    }
+
     fn onUniData(self: *Connection, gpa: Allocator, id: u64, fin: bool) !void {
-        _ = fin;
         // A stream being ignored: discard whatever arrives (§6.2.4 — data on
         // an unknown stream type is not an error, it is just not read).
         if (self.ignored_uni.contains(id)) {
@@ -1060,15 +1067,21 @@ pub const Connection = struct {
                     // is not "extra capacity", it is a peer whose bookkeeping
                     // disagrees with ours about something as basic as which
                     // stream carries SETTINGS.
-                    if (self.control_in != null) return self.fail(0x0104);
+                    //
+                    // H3_STREAM_CREATION_ERROR (0x0103), which is what §6.2.1 names for
+                    // "receipt of a second stream claiming to be a control stream". This
+                    // used to send 0x0104 — H3_CLOSED_CRITICAL_STREAM, the code for the
+                    // rule two sentences later — and a test asserted the wrong value with
+                    // a comment naming the right rule, which is how it survived.
+                    if (self.control_in != null) return self.fail(0x0103);
                     self.control_in = id;
                 },
                 @backingInt(frame.StreamType.qpack_encoder) => {
-                    if (self.qpack_encoder_in != null) return self.fail(0x0104);
+                    if (self.qpack_encoder_in != null) return self.fail(0x0103);
                     self.qpack_encoder_in = id;
                 },
                 @backingInt(frame.StreamType.qpack_decoder) => {
-                    if (self.qpack_decoder_in != null) return self.fail(0x0104);
+                    if (self.qpack_decoder_in != null) return self.fail(0x0103);
                     self.qpack_decoder_in = id;
                 },
                 @backingInt(frame.StreamType.push) => {
@@ -1087,6 +1100,18 @@ pub const Connection = struct {
                 },
             }
         }
+
+        // §6.2.1: "If either control stream is closed at any point, this MUST be treated
+        // as a connection error of type H3_CLOSED_CRITICAL_STREAM", and RFC 9204 §4.2
+        // says the same of the QPACK streams. These carry connection state rather than a
+        // message, so a FIN is not a stream ending — it is SETTINGS, GOAWAY and
+        // CANCEL_PUSH becoming permanently unreachable while the connection continues as
+        // if nothing had happened.
+        //
+        // Checked after classification, because the FIN can ride with the very bytes that
+        // name the stream's type. A stream closed *before* its type arrives is a
+        // different case that §6.2 requires tolerating, and it returns above.
+        if (fin and self.isCriticalStream(id)) return self.fail(0x0104);
 
         if (matches(self.control_in, id)) return self.onControlData(gpa, id);
         if (matches(self.qpack_encoder_in, id)) {
@@ -1658,7 +1683,10 @@ test "http3: the control stream's first frame must be SETTINGS, and only one con
         var second: [8]u8 = undefined;
         const second_len = quic.varint.encode(&second, 0x00);
         try testing.expectError(error.H3Error, h3.inject(gpa, 7, 0, second[0..second_len], false));
-        try testing.expectEqual(@as(?u64, 0x0104), h3.conn.close_code);
+        // H3_STREAM_CREATION_ERROR. This line said 0x0104 while the comment above it
+        // named H3_STREAM_CREATION_ERROR — the test agreed with the code rather than with
+        // the section it cited, which is the shape that keeps a wrong constant alive.
+        try testing.expectEqual(@as(?u64, 0x0103), h3.conn.close_code);
     }
 
     // A second SETTINGS on the (single) control stream: H3_FRAME_UNEXPECTED.
@@ -3113,4 +3141,69 @@ test "http3: a 101 response is malformed, as it is in HTTP/2" {
     try testing.expect(validResponseSection(&section, false));
     value = "102".*;
     try testing.expect(validResponseSection(&section, false));
+}
+
+test "http3: closing a critical stream ends the connection" {
+    // §6.2.1: "The sender MUST NOT close the control stream ... If either control stream
+    // is closed at any point, this MUST be treated as a connection error of type
+    // H3_CLOSED_CRITICAL_STREAM." RFC 9204 §4.2 says the same of the two QPACK streams.
+    // The reason is that these streams carry connection state rather than a message: a
+    // closed control stream means no further SETTINGS, GOAWAY or CANCEL_PUSH can ever
+    // arrive, so the connection cannot be reasoned about — it is not a stream ending, it
+    // is a capability disappearing.
+    const gpa = testing.allocator;
+
+    // The peer's control stream, closed with the SETTINGS still in the same frame.
+    {
+        var h3 = try establishH3(gpa, 0x91);
+        defer h3.deinit(gpa);
+        var bytes: [32]u8 = undefined;
+        var len: usize = quic.varint.encode(&bytes, 0x00);
+        len += frame.writeSettings(bytes[len..], &.{});
+        try testing.expectError(error.H3Error, h3.inject(gpa, 3, 0, bytes[0..len], true));
+        try testing.expectEqual(@as(?u64, 0x0104), h3.conn.close_code);
+    }
+
+    // And closed later, with the FIN arriving on its own — which is the ordinary shape,
+    // since QUIC can carry it in a packet after the data.
+    {
+        var h3 = try establishH3(gpa, 0x92);
+        defer h3.deinit(gpa);
+        var bytes: [32]u8 = undefined;
+        var len: usize = quic.varint.encode(&bytes, 0x00);
+        len += frame.writeSettings(bytes[len..], &.{});
+        try h3.inject(gpa, 3, 0, bytes[0..len], false);
+        try testing.expectError(error.H3Error, h3.inject(gpa, 3, len, &.{}, true));
+        try testing.expectEqual(@as(?u64, 0x0104), h3.conn.close_code);
+    }
+
+    // The QPACK encoder stream (RFC 9204 §4.2), which stays empty here but must stay
+    // *open*: zero table capacity makes it silent, not disposable.
+    {
+        var h3 = try establishH3(gpa, 0x93);
+        defer h3.deinit(gpa);
+        var bytes: [8]u8 = undefined;
+        const len = quic.varint.encode(&bytes, 0x02); // qpack encoder
+        try testing.expectError(error.H3Error, h3.inject(gpa, 7, 0, bytes[0..len], true));
+        try testing.expectEqual(@as(?u64, 0x0104), h3.conn.close_code);
+    }
+
+    // The QPACK decoder stream, same rule.
+    {
+        var h3 = try establishH3(gpa, 0x94);
+        defer h3.deinit(gpa);
+        var bytes: [8]u8 = undefined;
+        const len = quic.varint.encode(&bytes, 0x03); // qpack decoder
+        try testing.expectError(error.H3Error, h3.inject(gpa, 11, 0, bytes[0..len], true));
+        try testing.expectEqual(@as(?u64, 0x0104), h3.conn.close_code);
+    }
+
+    // A stream closed *before* its type arrived is explicitly tolerated (§6.2), because
+    // the receiver cannot know what it was and nothing has been promised.
+    {
+        var h3 = try establishH3(gpa, 0x95);
+        defer h3.deinit(gpa);
+        try h3.inject(gpa, 7, 0, &.{}, true);
+        try testing.expectEqual(@as(?u64, null), h3.conn.close_code);
+    }
 }
