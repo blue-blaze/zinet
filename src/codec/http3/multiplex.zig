@@ -249,7 +249,15 @@ pub const Multiplexer = struct {
                 multiplexer.reset(reset_event.stream, reset_event.code);
                 return true;
             },
-            .established, .goaway, .peer_closed, .idle_timeout => return false,
+            // `stream_credit` joins them: it says this endpoint may open more streams,
+            // which is a decision for whoever opens them and never for a stream that
+            // already exists.
+            .established,
+            .goaway,
+            .peer_closed,
+            .idle_timeout,
+            .stream_credit,
+            => return false,
         }
     }
 

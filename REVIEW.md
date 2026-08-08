@@ -965,3 +965,44 @@ Worth stating because it is the reason to trust the new number: the engine bench
 socket measurement were taken through different paths, one of them with an external client, and
 they agree to within a microsecond on the one difference both can see — 80 µs saved by signing
 with Ed25519 instead of ECDSA P-256.
+
+## What the HTTP/2 and HTTP/3 benchmarks found
+
+Three defects, none of which any test, fuzz target or interop run had reached, all found within
+an hour of pointing a load generator at the HTTP/3 server. They belong together because they
+share a cause: every existing check sends a handful of requests per connection, and all three
+faults need either a hundred requests or thirty-two of them at once.
+
+**An HTTP/3 connection stopped serving after exactly `initial_max_streams_bidi` requests.**
+§3.1 puts a stream's send side into `data_recvd` when its FIN is *acknowledged*, so the last
+moment a stream can become finished is inside `onPacketAcked` — and nothing reaped it there.
+`maxStreamsUpdate` decides how much credit to grant from how many streams are *live*, so a
+server that never forgot a finished stream never raised the peer's limit. The connection served
+100 requests, went silent, and sat there until its idle timeout. Nothing failed; the throughput
+was 31 req/s instead of 35 800. Fixed by reaping on acknowledgement, which also stops a
+long-lived connection accumulating every stream it ever served.
+
+**An application refused for want of stream credit could never learn it had some.** The
+delegate's events were all about streams that exist — `headers`, `body`, `stream_reset` — so a
+client whose every stream had closed had no callback left. The credit arrived and changed
+nothing observable. There is now a `stream_credit` event, emitted only when a MAX_STREAMS frame
+actually *raises* the limit, because a peer may repeat one it has already sent and that should
+wake nobody.
+
+**Asking for one stream too many destroyed the connection.** `openStream` handed its own local
+limit check to `mapStreamError`, which closes the connection — so an endpoint that wanted a
+stream the peer had not permitted yet told that peer it had violated STREAM_LIMIT_ERROR and shut
+down. It is the exact inversion of §4.6 and §19.14: the peer exceeding *our* limit is a
+connection error, and *us* wanting more than the peer has allowed is a wait, whose frame is
+STREAMS_BLOCKED. This was the worst of the three, because it is self-inflicted and because the
+peer is blamed for it.
+
+Two of the three are now unit tests at the transport level, both verified by reverting the fix
+and watching them fail. The third is exercised by the benchmark, and its event exists because
+the benchmark could not be written without it.
+
+The lesson is not about QUIC. Every one of these needed *volume* to appear, and the entire test
+suite is built from small, precise exchanges — which is the right shape for checking a protocol
+rule and the wrong shape for checking that a connection still works on its ten-thousandth
+request. A benchmark is a load test that happens to report numbers; that it reports numbers is
+why it gets run, and finding these was worth more than the numbers were.

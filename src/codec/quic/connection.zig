@@ -155,6 +155,19 @@ pub const Error = error{
     /// another connection ID. Not a protocol violation — it is the peer's stated
     /// limit being respected — but the caller asked for something impossible.
     ConnectionIdLimitError,
+    /// §4.6: the peer has not permitted another stream *yet*. Reported to the caller
+    /// and nothing more — no frame, no close — because the same condition arriving
+    /// from the peer is a connection error and this one is not: the application
+    /// asked for a stream it may have shortly, and §19.14's answer is to say so with
+    /// STREAMS_BLOCKED and wait for MAX_STREAMS.
+    ///
+    /// It is spelled out because it used to be neither: `openStream` handed a local
+    /// limit check to `mapStreamError`, which closed the connection with
+    /// STREAM_LIMIT_ERROR — so an application that asked for one stream too many
+    /// destroyed the connection it was about to use, and the peer was told it had
+    /// broken a rule it had not broken. A benchmark keeping 32 requests in flight
+    /// found it; one keeping 8 never reached the limit.
+    StreamLimitError,
 } || Allocator.Error;
 // Allocation failure is included rather than folded into a protocol error, for the
 // reason stream.zig gives: telling the peer PROTOCOL_VIOLATION because malloc
@@ -231,6 +244,18 @@ pub const Event = union(enum) {
     /// `stream_readable` carries only an ID: the bytes live in this connection's
     /// inbound queue, and `readDatagram` hands them out until `consumeDatagram`.
     datagram: struct { len: usize },
+    /// §19.11: the peer raised how many streams this endpoint may open. Surfaced
+    /// because it is the only thing that can unblock an application that wanted to
+    /// open one and could not — and without it, nothing ever tells that
+    /// application to try again.
+    ///
+    /// A benchmark found the gap rather than a reading of the specification: a
+    /// client that kept a fixed number of requests in flight stopped dead after
+    /// exactly `initial_max_streams_bidi` of them. Every one of its streams had
+    /// closed, so no stream event could arrive; the credit the peer then granted
+    /// changed nothing observable, and the connection sat idle until its timeout.
+    /// The credit is the event.
+    stream_credit: struct { bidirectional: bool, limit: u64 },
 };
 
 pub const Options = struct {
@@ -739,6 +764,13 @@ pub const Connection = struct {
     /// the information, not the frame).
     rearm_max_data: bool = false,
     rearm_max_streams: [2]bool = .{ false, false },
+    /// §19.14: this endpoint wanted to open a stream and the peer's limit said no, so it
+    /// owes a STREAMS_BLOCKED. Indexed bidi, uni. Cleared when the frame goes out; a
+    /// signal rather than an obligation, which is why losing it is not retransmitted.
+    blocked_streams: [2]bool = .{ false, false },
+    /// Whether a STREAMS_BLOCKED has ever arrived. Bookkeeping for tests and for anyone
+    /// asking whether the peer is starved; the frame itself demands nothing.
+    streams_blocked_seen: bool = false,
     credit_rearm: std.ArrayList(u64) = .empty,
 
     streams: streams_mod.Streams,
@@ -1156,9 +1188,20 @@ pub const Connection = struct {
     /// handshake has authenticated the peer's §4.6 limits, because before that we
     /// have no permission to open anything.
     pub fn openStream(self: *Connection, gpa: Allocator, bidirectional: bool) Error!u64 {
-        const id = self.streams.open(gpa, bidirectional) catch |err| {
-            try self.mapStreamError(err);
-            unreachable;
+        const id = self.streams.open(gpa, bidirectional) catch |err| switch (err) {
+            // Our own bookkeeping refused, before anything went on the wire: the caller
+            // wants a stream the peer has not permitted yet. §19.14 makes that a signal
+            // and never a connection error, so it is reported and the peer is asked for
+            // more credit — the opposite of what this did, which was to close the
+            // connection with the code reserved for the peer exceeding *our* limit.
+            error.StreamLimitError => {
+                self.blocked_streams[if (bidirectional) 0 else 1] = true;
+                return error.StreamLimitError;
+            },
+            else => {
+                try self.mapStreamError(err);
+                unreachable;
+            },
         };
         return id.value;
     }
@@ -1473,19 +1516,34 @@ pub const Connection = struct {
     }
 
     /// The packet was acknowledged: release what it carried.
-    fn onPacketAcked(self: *Connection, level: Level, meta: *const SentMeta) void {
+    ///
+    /// This is also the last moment a stream can become finished, and therefore the
+    /// only place its reaping can happen: §3.1's send side reaches `data_recvd` when
+    /// its FIN is *acknowledged*, so a stream whose response is written and read is
+    /// still live until this runs. Reaping was missing here, and the consequence was
+    /// not a leak but a stall — `maxStreamsUpdate` counts live streams to decide how
+    /// much credit to grant, so a server that never forgot a finished stream never
+    /// raised the peer's limit, and a connection stopped accepting requests after
+    /// exactly `initial_max_streams_bidi` of them. A benchmark that kept eight
+    /// requests in flight found it; nothing that sends a handful of requests can.
+    fn onPacketAcked(self: *Connection, gpa: Allocator, level: Level, meta: *const SentMeta) void {
         _ = level;
         for (meta.streams[0..meta.stream_count]) |range| {
-            const s = self.streams.get(.init(range.id)) orelse continue;
+            const id: stream_mod.Id = .init(range.id);
+            const s = self.streams.get(id) orelse continue;
             const sender = &(s.send orelse continue);
             sender.markRangeAcked(range.offset, range.len, range.fin);
+            // After the pointer above is done with: reaping invalidates it.
+            self.streams.reapIfFinished(gpa, id);
         }
-        for (meta.resets[0..meta.reset_count]) |id| {
-            const s = self.streams.get(.init(id)) orelse continue;
+        for (meta.resets[0..meta.reset_count]) |id_value| {
+            const id: stream_mod.Id = .init(id_value);
+            const s = self.streams.get(id) orelse continue;
             const sender = &(s.send orelse continue);
             // §3.1: RESET_STREAM acknowledged moves reset_sent to reset_recvd,
             // which is `markAcked`'s fin_acked path for a reset stream.
             sender.markAcked(sender.acked, true);
+            self.streams.reapIfFinished(gpa, id);
         }
         // CRYPTO, credit and retirement frames need nothing on acknowledgement:
         // their effect was already applied when they were written.
@@ -2116,12 +2174,25 @@ pub const Connection = struct {
                 .max_stream_data => |sf| try self.mapStreamError(
                     self.streams.receiveMaxStreamData(gpa, .init(sf.id), sf.limit),
                 ),
-                .max_streams_bidi => |n| try self.mapStreamError(
-                    self.streams.receiveMaxStreams(true, n),
-                ),
-                .max_streams_uni => |n| try self.mapStreamError(
-                    self.streams.receiveMaxStreams(false, n),
-                ),
+                // The comparison before and after is what makes this an event about a
+                // *change*: MAX_STREAMS is cumulative and a peer may repeat one it has
+                // already sent, which unblocks nothing and should wake nobody.
+                .max_streams_bidi => |n| {
+                    const before = self.streams.peerStreamLimit(true);
+                    try self.mapStreamError(self.streams.receiveMaxStreams(true, n));
+                    const after = self.streams.peerStreamLimit(true);
+                    if (after > before) try self.events.append(gpa, .{
+                        .stream_credit = .{ .bidirectional = true, .limit = after },
+                    });
+                },
+                .max_streams_uni => |n| {
+                    const before = self.streams.peerStreamLimit(false);
+                    try self.mapStreamError(self.streams.receiveMaxStreams(false, n));
+                    const after = self.streams.peerStreamLimit(false);
+                    if (after > before) try self.events.append(gpa, .{
+                        .stream_credit = .{ .bidirectional = false, .limit = after },
+                    });
+                },
                 .stream_data_blocked => |sf| try self.mapStreamError(
                     self.streams.receiveStreamDataBlocked(gpa, .init(sf.id)),
                 ),
@@ -2129,7 +2200,12 @@ pub const Connection = struct {
                 // They carry no obligation — a receiver must not wait for one
                 // before extending credit (§4.2) — so there is nothing to do but
                 // acknowledge the packet, which happens above.
-                .data_blocked, .streams_blocked_bidi, .streams_blocked_uni => {},
+                .data_blocked => {},
+                // §19.12 and §19.14 carry no obligation, but recording that one arrived is
+                // what lets a test check that this endpoint sends them — and an
+                // implementation that never sends one is indistinguishable, from the peer,
+                // from one whose credit logic is broken.
+                .streams_blocked_bidi, .streams_blocked_uni => self.streams_blocked_seen = true,
                 // §8.2.2: answering a PATH_CHALLENGE is unconditional. This used
                 // to be a PROTOCOL_VIOLATION here, with a comment claiming that
                 // answering an unvalidated path was worse than not answering —
@@ -2210,7 +2286,7 @@ pub const Connection = struct {
 
         for (resolution.acked) |p| {
             self.congestion.onAck(p, self.now_ns);
-            if (self.takeMeta(level, p.number)) |meta| self.onPacketAcked(level, &meta);
+            if (self.takeMeta(level, p.number)) |meta| self.onPacketAcked(gpa, level, &meta);
         }
 
         var latest_lost: ?recovery.Sent = null;
@@ -2668,6 +2744,7 @@ pub const Connection = struct {
             if (self.pending_stream_data and self.congestion.available() > 0) return true;
             if (self.rearm_max_data or self.rearm_max_streams[0] or
                 self.rearm_max_streams[1] or self.credit_rearm.items.len > 0) return true;
+            if (self.blocked_streams[0] or self.blocked_streams[1]) return true;
             if (self.streams.maxDataUpdate() != null) return true;
             if (self.streams.maxStreamsUpdate(true) != null) return true;
             if (self.streams.maxStreamsUpdate(false) != null) return true;
@@ -3207,6 +3284,19 @@ pub const Connection = struct {
         }
 
         for ([_]bool{ true, false }) |bidirectional| {
+            const blocked_index: usize = if (bidirectional) 0 else 1;
+            if (self.blocked_streams[blocked_index]) {
+                const at = self.streams.peerStreamLimit(bidirectional);
+                const f: frame.Frame = if (bidirectional)
+                    .{ .streams_blocked_bidi = at }
+                else
+                    .{ .streams_blocked_uni = at };
+                if (len + frame.encodedLen(f) <= dest.len) {
+                    len += frame.encode(dest[len..], f);
+                    self.blocked_streams[blocked_index] = false;
+                    meta.ack_eliciting = true;
+                }
+            }
             if (self.streams.maxStreamsUpdate(bidirectional)) |limit| {
                 const f: frame.Frame = if (bidirectional)
                     .{ .max_streams_bidi = limit }
@@ -5697,6 +5787,109 @@ fn roundTrip(gpa: Allocator, from: *Connection, to: *Connection, payload: []cons
     try exchange(gpa, from, to, 8);
     try testing.expectEqualStrings(payload, to.read(id));
     to.consume(gpa, id, payload.len);
+}
+
+test "connection: asking for a stream past the peer's limit is refused, not fatal" {
+    // §19.14 against §4.6, which is the distinction this used to get backwards. The peer
+    // exceeding *our* stream limit is a connection error (STREAM_LIMIT_ERROR); *us* wanting
+    // a stream the peer has not permitted yet is not an error at all — it is a wait, and
+    // §19.14 gives it a frame to say so with. `openStream` handed both to the same handler,
+    // so an application that asked for one stream too many closed the connection it was
+    // about to use, and told the peer it had broken a rule it had not broken.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0x78);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    const limit = cl.streams.peerStreamLimit(true);
+    try testing.expect(limit > 0);
+
+    // Open exactly the allowance, holding every one of them so none can be reaped and no
+    // credit can be granted.
+    var opened: usize = 0;
+    while (opened < limit) : (opened += 1) {
+        _ = try cl.openStream(gpa, true);
+    }
+
+    // One more. The old behaviour was `error.ProtocolViolation` and a closed connection.
+    try testing.expectError(error.StreamLimitError, cl.openStream(gpa, true));
+    try testing.expect(cl.state == .active);
+    try testing.expect(cl.close_info == null);
+
+    // And the connection still works, which is the part that matters: the stream that was
+    // refused is a stream not opened, not a connection lost.
+    try exchange(gpa, cl, srv, 8);
+    try testing.expect(cl.state == .active);
+    const id: u64 = 0; // the first stream opened above
+    _ = try cl.write(gpa, id, "still here");
+    try cl.finishStream(id);
+    try exchange(gpa, cl, srv, 8);
+    try testing.expectEqualStrings("still here", srv.read(id));
+    srv.consume(gpa, id, "still here".len);
+
+    // §19.14: the peer is told, so that a peer which only raises limits on demand does.
+    try testing.expect(srv.streams_blocked_seen);
+}
+
+test "connection: a finished stream is forgotten, so the peer keeps getting stream credit" {
+    // The defect this catches was found by a benchmark rather than by reading §4.6: a
+    // connection served exactly `initial_max_streams_bidi` requests and then stalled
+    // forever. `maxStreamsUpdate` decides how much credit to grant from how many
+    // streams are *live*, and a stream stays live until both directions are terminal —
+    // which, for the sending side, means its FIN has been acknowledged (§3.1). Nothing
+    // reaped a stream at that moment, so `live` never fell, the limit was never raised,
+    // and the peer ran out of streams it was allowed to open.
+    //
+    // Written at the transport level because that is where the rule lives, and phrased
+    // as "can the peer open more than the initial allowance" because that is the
+    // symptom an application sees.
+    const gpa = testing.allocator;
+    var pair = try establishedPair(gpa, 0x77);
+    const cl = &pair.a;
+    const srv = &pair.b;
+    defer cl.deinit(gpa);
+    defer srv.deinit(gpa);
+
+    const initial = cl.streams.peerStreamLimit(true);
+    try testing.expect(initial > 0);
+
+    // Complete more than half the allowance: §4.6 lets an implementation raise the
+    // limit as streams close, and this one waits until half of them have.
+    var opened: usize = 0;
+    while (opened < initial) : (opened += 1) {
+        const id = try cl.openStream(gpa, true);
+        _ = try cl.write(gpa, id, "ping");
+        try cl.finishStream(id);
+        try exchange(gpa, cl, srv, 8);
+        // The server's side of the exchange: read it, which is what makes its receive
+        // direction terminal, and answer with a FIN so its send side can finish too.
+        try testing.expectEqualStrings("ping", srv.read(id));
+        srv.consume(gpa, id, 4);
+        _ = try srv.write(gpa, id, "pong");
+        try srv.finishStream(id);
+        try exchange(gpa, cl, srv, 8);
+        try testing.expectEqualStrings("pong", cl.read(id));
+        cl.consume(gpa, id, 4);
+        try exchange(gpa, cl, srv, 8);
+    }
+
+    // The whole point: the client may now open streams it could not have opened at the
+    // start. Without reaping on acknowledgement this limit never moves and the loop
+    // below fails on its first iteration.
+    try testing.expect(cl.streams.peerStreamLimit(true) > initial);
+    const extra = try cl.openStream(gpa, true);
+    _ = try cl.write(gpa, extra, "after the allowance");
+    try cl.finishStream(extra);
+    try exchange(gpa, cl, srv, 8);
+    try testing.expectEqualStrings("after the allowance", srv.read(extra));
+    srv.consume(gpa, extra, "after the allowance".len);
+
+    // And the server is not holding every stream it ever served: the map is what
+    // `maxStreamsUpdate` counts, and a server that forgets nothing also grows without
+    // bound on a long-lived connection.
+    try testing.expect(srv.streams.map.count() < initial);
 }
 
 test "connection: a key update rotates both directions and traffic keeps flowing" {

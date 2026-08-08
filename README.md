@@ -38,7 +38,7 @@ handshake written here, because Netty binds Quiche and the standard library has 
 TLS server; see [HTTP3.md](HTTP3.md) and [TLS.md](TLS.md) — Redis RESP2/RESP3,
 datagram (UDP) endpoints, a DNS resolver, TLS 1.3 on both sides of a connection, a
 bounded client connection pool, and `EmbeddedChannel` for testing pipelines without
-sockets. 821 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
+sockets. 823 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
 all under a leak-checking allocator, plus twenty-two fuzz targets. The same suite
 also runs **on fibers** rather than threads — see [Choosing an `Io`](#choosing-an-io).
 
@@ -692,8 +692,20 @@ See [bench/README.md](bench/README.md) for numbers and how to read them.
 zig build bench
 ./zig-out/bin/echo_bench 64 4096 3 8
 ./zig-out/bin/http_bench 64 3 8
+./zig-out/bin/http2_bench 1 32 3 4     # connections x streams in flight
+./zig-out/bin/http3_bench 1 32 3       # connections x requests in flight
 ./zig-out/bin/tls_bench 2000
 ```
+
+All three HTTP versions are measured on the same axis, which makes the point of each protocol's
+machinery visible rather than assumed: one request at a time costs 77 µs on HTTP/1.1, 89 µs on
+HTTP/2 and 133 µs on HTTP/3, while 32 requests multiplexed onto a single HTTP/2 connection serve
+105 k req/s against HTTP/1.1's 42 k ceiling — because a connection here is one reader task, and
+multiplexing is what stops the syscall being a per-request cost. Writing those benchmarks found
+three HTTP/3 defects that no test, fuzz target or aioquic run had reached, each needing volume
+rather than a rule to appear: a connection that stopped serving after exactly 100 requests, an
+application that could never learn it had stream credit again, and `openStream` closing the
+connection when the *application* asked for one stream too many. See [REVIEW.md](REVIEW.md).
 
 ## Development
 

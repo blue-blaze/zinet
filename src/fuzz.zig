@@ -2583,6 +2583,15 @@ fn recordH3Events(
             try out.append(gpa, ';');
         },
         .idle_timeout => try out.appendSlice(gpa, "IDLE;"),
+        // Recorded for the reason `datagram` is: this target's alphabet is stream frames,
+        // so a MAX_STREAMS can never arrive from one and this can never fire today. Leaving
+        // it out would mean a future generator that does emit them produces transcripts
+        // comparing equal by omission, which is the one way this oracle can go quiet.
+        .stream_credit => |e| {
+            try out.appendSlice(gpa, "SC:");
+            try out.appendSlice(gpa, &std.mem.toBytes(e.limit));
+            try out.append(gpa, ';');
+        },
     };
 }
 

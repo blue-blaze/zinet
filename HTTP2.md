@@ -295,6 +295,26 @@ answered and forgotten, an empty `DATA` frame occupies no memory. What they cons
 work, and work is only bounded per unit of time. Time is injected rather than read, and
 a clock that goes backwards cannot open the gate.
 
+## What it costs
+
+`zig build bench-http2_bench` measures the two axes HTTP/2 has: connections, and requests in
+flight on each. The load generator speaks HTTP/2 over a raw socket — a pre-encoded HPACK block
+and frame headers only, no decoder — so the numbers are the server's cost rather than a round
+trip through this implementation twice.
+
+The result is a clean statement of what multiplexing is for here. Sixty-four connections with
+one stream each serve 41.5 k req/s, which is indistinguishable from HTTP/1.1 at the same
+concurrency: with one request in flight per connection, this framing costs nothing measurable
+and buys nothing either. Thirty-two streams on **one** connection serve 105 k, and 128 streams
+on one connection 115–137 k. The mechanism is not clever scheduling — it is that one read
+gathers many requests and one write scatters many responses, so the syscall stops being a
+per-request cost.
+
+Which also means the ceiling is one core: a connection here has exactly one reader task, so
+1 × 64 (125.7 k) beats 8 × 8 (88.3 k), and eight connections of 128 streams reach 142.8 k rather
+than eight times a single connection's figure. The tables are in
+[bench/README.md](bench/README.md).
+
 ## What found the defects
 
 Worth recording, because the three methods found different things and none of them

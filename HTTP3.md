@@ -287,10 +287,32 @@ exercise it is worse than one that is honestly absent.
 | ~~Key update~~ | Done. §6 is wired into the connection: the Key Phase bit, a rotation answered rather than merely tolerated, the previous generation's read keys held for three PTOs (§6.4), §6.5's minimum interval, and §6.6's usage limits triggering a rotation without being asked. The send phase and the receive phase are separate fields, because the endpoint that starts a rotation writes in the new generation a round trip before its peer follows. |
 | Server push | Refused in both directions. As a client, never sending MAX_PUSH_ID makes every push ID an H3_ID_ERROR (§4.6). As a server, a client's MAX_PUSH_ID is *accepted and never acted on* — §4.6 makes push optional and declining means never sending a PUSH_PROMISE, not failing the connection over a frame that conformant clients send by default. |
 
+## What it costs, and what measuring it found
+
+`zig build bench-http3_bench` puts HTTP/3 on the same axis as the other two protocols: same
+machine, same response body, same process shape. One connection with 32 requests in flight
+serves about 42 k req/s; a single request at a time costs 133 µs against HTTP/1.1's 77 µs and
+HTTP/2's 89 µs, which is the price of packet protection and acknowledgement bookkeeping. Adding
+connections does not add throughput here, because both endpoints are on the one machine and each
+datagram is protected twice. The tables are in [bench/README.md](bench/README.md).
+
+**The per-connection boundary is stream credit rather than CPU**, and the benchmark reports the
+refusals that show it: at 32 in flight a client is told "not yet" some 24 000 times in three
+seconds and still serves 42 k; at 128 in flight the refusals quadruple and throughput falls,
+because the connection spends its time asking. `initial_max_streams_bidi` is the knob.
+
+None of that was measurable until the benchmark found three defects, each of which needed
+volume — a hundred requests on one connection, or thirty-two at once — that no test, fuzz target
+or aioquic run had ever produced. A connection stopped serving after exactly 100 requests
+because finished streams were never reaped, so the credit that reaping enables was never granted;
+an application refused for want of credit had no event that could tell it to try again; and
+asking for one stream too many *closed the connection*, blaming the peer for a rule it had not
+broken. The write-up is in [REVIEW.md](REVIEW.md).
+
 ## Numbers
 
 The QUIC and HTTP/3 stack is roughly 28,000 lines across the two directories,
-carrying 308 of the repository's 793 tests plus seven of its 22 fuzz targets. All of
+carrying 310 of the repository's 823 tests plus seven of its 22 fuzz targets. All of
 it runs under the leak-checking allocator, on threads and on fibers, on Linux and
 macOS, in Debug, ReleaseSafe and ReleaseFast — and against aioquic in CI on every
 push, in both directions.

@@ -328,6 +328,11 @@ pub const Streams = struct {
         if (limit > self.send_max_data) self.send_max_data = limit;
     }
 
+    /// How many streams of one kind this endpoint may open, as the peer last said.
+    pub fn peerStreamLimit(self: *const Streams, bidirectional: bool) u64 {
+        return self.peer_max_streams[if (bidirectional) 0 else 1];
+    }
+
     /// Apply an inbound MAX_STREAMS frame (§19.11).
     pub fn receiveMaxStreams(self: *Streams, bidirectional: bool, streams: u64) Error!void {
         // §4.6 and §19.11: above 2^60 the resulting stream ID would not fit a

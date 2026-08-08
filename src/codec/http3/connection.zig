@@ -88,6 +88,11 @@ pub const Event = union(enum) {
     peer_closed: struct { code: u64, application: bool },
     /// The transport idled out (§10.1 of RFC 9000), silently.
     idle_timeout,
+    /// The peer raised how many request streams this endpoint may open (§19.11 of
+    /// RFC 9000). Delivered because it is the only thing that can unblock an
+    /// application whose `request` was refused for want of credit: every one of its
+    /// streams may have closed, in which case no other event can arrive.
+    stream_credit: struct { limit: u64 },
 };
 
 /// One request stream's receive state: §4.1's grammar as a state machine, so
@@ -796,6 +801,12 @@ pub const Connection = struct {
                     .peer_closed = .{ .code = e.code, .application = e.application },
                 }),
                 .idle_timeout => try self.emit(gpa, .idle_timeout),
+                // Only the bidirectional half: HTTP/3's unidirectional streams are the
+                // control, encoder and decoder streams, opened once at the start, so
+                // credit for them cannot unblock an application.
+                .stream_credit => |e| if (e.bidirectional) try self.emit(gpa, .{
+                    .stream_credit = .{ .limit = e.limit },
+                }),
                 .stateless_reset => try self.emit(gpa, .{
                     .peer_closed = .{ .code = 0, .application = false },
                 }),
