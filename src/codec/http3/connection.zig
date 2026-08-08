@@ -144,6 +144,11 @@ const Request = struct {
     /// Body bytes waiting for the application.
     body: std.ArrayList(u8) = .empty,
     fin_seen: bool = false,
+    /// Set when reading this stream stopped because `max_buffered_body` was reached, so the
+    /// next drain knows to come back to it. Without this the stream would wait for QUIC to
+    /// report it readable again — which a peer blocked by its own flow-control window has no
+    /// way of causing.
+    stalled: bool = false,
     /// Whether this side has finished sending on the stream. RFC 9297 §2.1 makes it
     /// the condition for sending a datagram: "HTTP/3 Datagrams MUST NOT be sent unless
     /// the corresponding stream's send side is open", and a datagram associated with a
@@ -188,6 +193,34 @@ pub const Options = struct {
     /// application that has no such extension gains nothing and would only "stick
     /// out" (§4).
     enable_datagram: bool = false,
+    /// The most body this connection will hold for one stream before it stops reading it.
+    ///
+    /// This is backpressure rather than a kill switch. When the buffer is full the
+    /// connection stops consuming the stream's bytes from QUIC, which leaves them in the
+    /// reassembly buffer and withholds the flow-control credit that would let the peer send
+    /// more — so the bound that actually stops the sender is the one QUIC already has, and
+    /// this only decides how much is staged above it. Reading resumes on the next `poll`
+    /// after the application has taken some with `consumeBody`.
+    ///
+    /// Without it, DATA was appended to the stream's buffer and the QUIC bytes were consumed
+    /// in the same breath, returning credit immediately: flow control was satisfied while
+    /// the peer could still make this side hold an entire upload in memory.
+    max_buffered_body: usize = 256 * 1024,
+    /// How many field sections may wait, per stream, for `takeSection`.
+    ///
+    /// Two or three is the honest maximum for a well-behaved exchange — a header section, a
+    /// trailer section, and interim responses before them — but §4.1 permits any number of
+    /// 1xx responses, each of which allocates. A peer sending thousands is
+    /// H3_EXCESSIVE_LOAD (§8.1: "behavior that might be generating excessive load"), which
+    /// is exactly what the code exists to name.
+    max_pending_sections: usize = 32,
+    /// How many events may wait for `nextEvent`.
+    ///
+    /// Events are produced by peer input and consumed by the application, so the queue is
+    /// bounded in practice by how much input QUIC's flow control admits between drains. This
+    /// is the explicit ceiling behind that reasoning, because "bounded in practice" is not
+    /// the same as bounded.
+    max_pending_events: usize = 4096,
 };
 
 pub const ServerOptions = struct {
@@ -211,6 +244,34 @@ pub const ServerOptions = struct {
     /// application that has no such extension gains nothing and would only "stick
     /// out" (§4).
     enable_datagram: bool = false,
+    /// The most body this connection will hold for one stream before it stops reading it.
+    ///
+    /// This is backpressure rather than a kill switch. When the buffer is full the
+    /// connection stops consuming the stream's bytes from QUIC, which leaves them in the
+    /// reassembly buffer and withholds the flow-control credit that would let the peer send
+    /// more — so the bound that actually stops the sender is the one QUIC already has, and
+    /// this only decides how much is staged above it. Reading resumes on the next `poll`
+    /// after the application has taken some with `consumeBody`.
+    ///
+    /// Without it, DATA was appended to the stream's buffer and the QUIC bytes were consumed
+    /// in the same breath, returning credit immediately: flow control was satisfied while
+    /// the peer could still make this side hold an entire upload in memory.
+    max_buffered_body: usize = 256 * 1024,
+    /// How many field sections may wait, per stream, for `takeSection`.
+    ///
+    /// Two or three is the honest maximum for a well-behaved exchange — a header section, a
+    /// trailer section, and interim responses before them — but §4.1 permits any number of
+    /// 1xx responses, each of which allocates. A peer sending thousands is
+    /// H3_EXCESSIVE_LOAD (§8.1: "behavior that might be generating excessive load"), which
+    /// is exactly what the code exists to name.
+    max_pending_sections: usize = 32,
+    /// How many events may wait for `nextEvent`.
+    ///
+    /// Events are produced by peer input and consumed by the application, so the queue is
+    /// bounded in practice by how much input QUIC's flow control admits between drains. This
+    /// is the explicit ceiling behind that reasoning, because "bounded in practice" is not
+    /// the same as bounded.
+    max_pending_events: usize = 4096,
 };
 
 pub const Connection = struct {
@@ -220,6 +281,10 @@ pub const Connection = struct {
     role: quic.transport.Role = .client,
     transport: quic.connection.Connection,
     max_field_section_size: u64,
+    /// See `Options.max_buffered_body`, `max_pending_sections` and `max_pending_events`.
+    max_buffered_body: usize,
+    max_pending_sections: usize,
+    max_pending_events: usize,
 
     // Our three unidirectional streams, opened once QUIC is established.
     control_out: ?u64 = null,
@@ -261,6 +326,12 @@ pub const Connection = struct {
 
     events: std.ArrayList(Event) = .empty,
     event_cursor: usize = 0,
+    /// The allocator the connection was last fed with, kept so that state can be released
+    /// from the application-facing accessors — `takeSection` and `consumeBody` — without
+    /// widening their signatures. Every one of those calls is preceded by a `receive` or
+    /// `poll` that supplied it, because that is what produced the event the application is
+    /// responding to.
+    reap_gpa: ?Allocator = null,
     /// Set once the H3 layer is up (streams opened, SETTINGS queued).
     h3_ready: bool = false,
     /// The H3_* code this endpoint closed with, if it closed. What `Error.H3Error`
@@ -290,6 +361,9 @@ pub const Connection = struct {
                 .token = options.token,
             }, seed),
             .max_field_section_size = options.max_field_section_size,
+            .max_buffered_body = options.max_buffered_body,
+            .max_pending_sections = options.max_pending_sections,
+            .max_pending_events = options.max_pending_events,
             .enable_connect_protocol = options.enable_connect_protocol,
             .enable_datagram = options.enable_datagram,
         };
@@ -313,6 +387,9 @@ pub const Connection = struct {
                 .after_retry = options.after_retry,
             }, seed),
             .max_field_section_size = options.max_field_section_size,
+            .max_buffered_body = options.max_buffered_body,
+            .max_pending_sections = options.max_pending_sections,
+            .max_pending_events = options.max_pending_events,
             .enable_connect_protocol = options.enable_connect_protocol,
             .enable_datagram = options.enable_datagram,
         };
@@ -347,8 +424,49 @@ pub const Connection = struct {
         return self.transport.onTimeout(gpa, now_ns);
     }
 
+    /// Reads again from streams that stopped because their buffer was full and now have
+    /// room. Driven from `drainTransport`, so an application that consumes a body and then
+    /// polls — which is what it does anyway, on every datagram and every tick — resumes the
+    /// stream. Nothing else can: the peer is blocked by its flow-control window, so no new
+    /// QUIC data will arrive to make the stream readable again.
+    fn resumeStalledStreams(self: *Connection, gpa: Allocator) !void {
+        var restart: ?u64 = null;
+        var iterator = self.requests.iterator();
+        while (iterator.next()) |entry| {
+            const req = entry.value_ptr;
+            if (!req.stalled) continue;
+            if (req.body.items.len >= self.max_buffered_body) continue;
+            // One per drain, and the map is not iterated across the call: `onRequestData`
+            // can insert and remove entries, which would invalidate this iterator.
+            restart = entry.key_ptr.*;
+            break;
+        }
+        if (restart) |id| try self.onRequestData(gpa, id, false);
+    }
+
+    /// Queues an event for the application, refusing to grow past `max_pending_events`.
+    ///
+    /// One helper rather than a check at each of the ten append sites: a bound enforced in
+    /// nine places out of ten is not a bound, and the tenth is the one a peer will find.
+    fn emit(self: *Connection, gpa: Allocator, event: Event) !void {
+        if (self.events.items.len - self.event_cursor >= self.max_pending_events) {
+            return self.fail(0x0107); // H3_EXCESSIVE_LOAD
+        }
+        try self.events.append(gpa, event);
+    }
+
     pub fn nextEvent(self: *Connection) ?Event {
-        if (self.event_cursor >= self.events.items.len) return null;
+        if (self.event_cursor >= self.events.items.len) {
+            // Drained: reuse the storage instead of walking a cursor away from a list that
+            // only ever grew. The cursor alone made every event the connection had *ever*
+            // produced live as long as the connection did — a few dozen bytes per exchange,
+            // which is nothing until a connection serves a million of them, and HTTP/3
+            // connections are meant to be long-lived (§3.3 asks clients not to close them).
+            // Capacity is kept, so a steady stream of requests reuses one allocation.
+            self.events.clearRetainingCapacity();
+            self.event_cursor = 0;
+            return null;
+        }
         const event = self.events.items[self.event_cursor];
         self.event_cursor += 1;
         return event;
@@ -466,7 +584,7 @@ pub const Connection = struct {
         const owned = try gpa.dupe(u8, rest);
         errdefer gpa.free(owned);
         try self.datagram_queue.append(gpa, .{ .stream = stream, .payload = owned });
-        try self.events.append(gpa, .{ .datagram = .{
+        try self.emit(gpa, .{ .datagram = .{
             .stream = stream,
             .len = owned.len,
         } });
@@ -495,6 +613,8 @@ pub const Connection = struct {
     }
 
     fn drainTransport(self: *Connection, gpa: Allocator) !void {
+        self.reap_gpa = gpa;
+        try self.resumeStalledStreams(gpa);
         while (self.transport.nextEvent()) |event| {
             switch (event) {
                 .established => try self.onEstablished(gpa),
@@ -507,16 +627,16 @@ pub const Connection = struct {
                     if (self.requests.getPtr(e.id)) |req| {
                         req.fin_seen = true;
                     }
-                    try self.events.append(gpa, .{ .stream_reset = .{
+                    try self.emit(gpa, .{ .stream_reset = .{
                         .stream = e.id,
                         .code = e.code,
                     } });
                 },
-                .peer_closed => |e| try self.events.append(gpa, .{
+                .peer_closed => |e| try self.emit(gpa, .{
                     .peer_closed = .{ .code = e.code, .application = e.application },
                 }),
-                .idle_timeout => try self.events.append(gpa, .idle_timeout),
-                .stateless_reset => try self.events.append(gpa, .{
+                .idle_timeout => try self.emit(gpa, .idle_timeout),
+                .stateless_reset => try self.emit(gpa, .{
                     .peer_closed = .{ .code = 0, .application = false },
                 }),
                 // Address tokens and Retry are transport bookkeeping the HTTP
@@ -583,7 +703,7 @@ pub const Connection = struct {
         _ = try self.transport.write(gpa, decoder, type_buf[0..dec_len]);
 
         self.h3_ready = true;
-        try self.events.append(gpa, .established);
+        try self.emit(gpa, .established);
     }
 
     // ── Sending requests ─────────────────────────────────────────────────────
@@ -661,6 +781,11 @@ pub const Connection = struct {
             // point a FIN leaves, because a flag that is right in two places out of
             // three is worse than none.
             if (self.requests.getPtr(id)) |req| req.fin_sent = true;
+            // Closing the send side can be the last thing an exchange was waiting for. On a
+            // server it usually is: the request was taken before the response was written,
+            // so the accessors have already emptied everything and this is the moment the
+            // state becomes releasable.
+            self.reapIfSpent(id);
         }
     }
 
@@ -694,6 +819,7 @@ pub const Connection = struct {
         if (fin) {
             try self.transport.finishStream(stream);
             if (self.requests.getPtr(stream)) |req| req.fin_sent = true;
+            self.reapIfSpent(stream);
         }
     }
 
@@ -823,6 +949,35 @@ pub const Connection = struct {
         const rest = req.body.items.len - n;
         std.mem.copyForwards(u8, req.body.items[0..rest], req.body.items[n..]);
         req.body.shrinkRetainingCapacity(rest);
+        self.reapIfSpent(stream);
+    }
+
+    /// Releases a request whose exchange is over and whose contents the application has
+    /// taken. Called from the two accessors that can empty it.
+    ///
+    /// Without this, `requests` grew for the life of the connection: only `cancel` ever
+    /// removed an entry, so a request that simply *finished* left its `Request` — a frame
+    /// parser, a section list and a body list, each with its own allocation — in the map
+    /// forever. A connection is supposed to carry many exchanges (§3.3), which turns
+    /// "forever" into the shape of a leak even though nothing is lost track of.
+    ///
+    /// Every condition is required, and the order they appear in is the order they become
+    /// true. `end_reported` is what the application was told; the two FIN flags are the two
+    /// directions of the stream; empty `sections` and `body` mean nothing is waiting to be
+    /// collected. Reaping earlier would answer a later `takeSection` with null and a later
+    /// `readBody` with nothing, which is indistinguishable from "the peer sent none" —
+    /// exactly the kind of silent difference this code refuses to introduce.
+    fn reapIfSpent(self: *Connection, stream: u64) void {
+        const gpa = self.reap_gpa orelse return;
+        const req = self.requests.getPtr(stream) orelse return;
+        if (!req.end_reported) return;
+        if (!req.fin_seen or !req.fin_sent) return;
+        if (req.sections.items.len != 0 or req.body.items.len != 0) return;
+
+        if (self.requests.fetchRemove(stream)) |entry| {
+            var state = entry.value;
+            state.deinit(gpa);
+        }
     }
 
     fn onReadable(self: *Connection, gpa: Allocator, id: u64, fin: bool) !void {
@@ -878,12 +1033,33 @@ pub const Connection = struct {
         const req = self.requests.getPtr(id) orelse return; // reset or unknown
         if (fin) req.fin_seen = true;
 
+        req.stalled = false;
         while (true) {
-            const bytes = self.transport.read(id);
-            if (bytes.len == 0) break;
+            // Backpressure, and the only kind that reaches the sender: leaving the bytes in
+            // QUIC's reassembly buffer withholds the flow-control credit that would let the
+            // peer send more. Consuming them first — which is what this did — returned the
+            // credit immediately and moved the peer's upload into this process's memory,
+            // where no window bounded it.
+            if (req.body.items.len >= self.max_buffered_body) {
+                req.stalled = true;
+                break;
+            }
+            const readable = self.transport.read(id);
+            if (readable.len == 0) break;
+            // Fed only as much as there is room to stage. A DATA payload is emitted without
+            // being copied (see `frame.Parser`: "no accumulation, no bound, no copy"), so a
+            // shorter slice leaves the remainder in the reassembly buffer with its credit
+            // withheld — and a frame header that this slicing splits is the ordinary
+            // partial-arrival case the parser already handles.
+            const room = self.max_buffered_body - req.body.items.len;
+            const bytes = readable[0..@min(readable.len, room)];
             const parse_result = req.parser.next(gpa, bytes) catch |err| return self.failFrame(err);
             const result = parse_result orelse {
                 self.transport.consume(gpa, id, bytes.len);
+                // A partial frame was taken into the parser's own buffer. If that was only
+                // part of what is readable — because the slice above was bounded — there is
+                // more to come once the application makes room.
+                if (bytes.len < readable.len) req.stalled = true;
                 break;
             };
             // The item is handled *before* the bytes are consumed, because it
@@ -898,7 +1074,11 @@ pub const Connection = struct {
             // been seen and nothing remains beyond what this item consumed.
             // `read(id)` cannot answer that here — the consume above is
             // deferred, so the buffer still contains this item's own bytes.
-            const stream_done = req.fin_seen and bytes.len == result.consumed;
+            //
+            // Measured against everything readable, not against the slice fed to the
+            // parser: with a truncated slice those differ, and using the slice would
+            // announce the end of a message whose remaining bytes are sitting right there.
+            const stream_done = req.fin_seen and readable.len == result.consumed;
 
             switch (result.item) {
                 .frame => |f| try self.onRequestFrame(gpa, id, req, f, stream_done),
@@ -911,7 +1091,7 @@ pub const Connection = struct {
                     try req.body.appendSlice(gpa, chunk.bytes);
                     if (chunk.last) {
                         if (stream_done) req.end_reported = true;
-                        try self.events.append(gpa, .{ .body = .{
+                        try self.emit(gpa, .{ .body = .{
                             .stream = id,
                             .fin = stream_done,
                         } });
@@ -926,7 +1106,15 @@ pub const Connection = struct {
         // clean end is what turns it into a promise the peer broke. Checked before
         // the end is reported, because the alternative is telling the application a
         // message finished when its sender never finished sending it.
-        if (req.fin_seen and req.parser.midFrame()) return self.failFrame(error.FrameError);
+        //
+        // "The last frame" means the last one there is, so this asks whether anything is
+        // still readable first. Backpressure makes the difference visible: when reading
+        // stopped because the application's buffer was full, the stream is finished and the
+        // parser is mid-frame and nothing is wrong — the rest of the payload is sitting in
+        // the reassembly buffer waiting for room, not missing.
+        if (req.fin_seen and req.parser.midFrame() and self.transport.read(id).len == 0) {
+            return self.failFrame(error.FrameError);
+        }
 
         // A FIN that arrives on its own, after the last frame was already consumed.
         // Nothing reported the end in that case, because the loop above only learns
@@ -942,7 +1130,7 @@ pub const Connection = struct {
         // not in the other.
         if (req.fin_seen and !req.end_reported) {
             req.end_reported = true;
-            try self.events.append(gpa, .{ .body = .{ .stream = id, .fin = true } });
+            try self.emit(gpa, .{ .body = .{ .stream = id, .fin = true } });
         }
     }
 
@@ -974,7 +1162,15 @@ pub const Connection = struct {
                 var section = qpack.decodeSection(gpa, section_bytes, .{
                     .max_field_section_size = self.max_field_section_size,
                 }) catch |err| return self.failQpack(err);
-                errdefer section.deinit(gpa);
+                // Armed until the section is handed to `req.sections`, and explicitly
+                // disarmed there. Appending transfers ownership, so an error *after* it —
+                // which became possible when the event queue gained a ceiling that can
+                // refuse — would otherwise free a section the request list still holds. That
+                // was a double free the suite reported as a segfault inside
+                // `Request.deinit`, and it was latent before: `events.append` could already
+                // fail on allocation.
+                var section_owned = true;
+                errdefer if (section_owned) section.deinit(gpa);
 
                 const is_trailers = req.saw_data;
                 // A server validates requests, a client validates responses.
@@ -1010,9 +1206,20 @@ pub const Connection = struct {
                         },
                     }
                 }
+                // §8.1's H3_EXCESSIVE_LOAD: "the endpoint detected that its peer is
+                // exhibiting a behavior that might be generating excessive load". A
+                // well-formed exchange has two or three sections; §4.1 permits any number of
+                // interim 1xx responses before the final one, each of which allocates a
+                // decoded section that waits for `takeSection`. Refusing beyond a stated
+                // ceiling is what keeps that from being a way to spend this side's memory.
+                // The section is released by the `errdefer` above rather than here: adding a
+                // second teardown on this path freed it twice, which the suite reported as a
+                // segfault in `FieldSection.deinit` on the very next test.
+                if (req.sections.items.len >= self.max_pending_sections) return self.fail(0x0107);
                 try req.sections.append(gpa, section);
+                section_owned = false;
                 if (stream_done) req.end_reported = true;
-                try self.events.append(gpa, .{ .headers = .{
+                try self.emit(gpa, .{ .headers = .{
                     .stream = id,
                     .fin = stream_done,
                 } });
@@ -1046,6 +1253,13 @@ pub const Connection = struct {
         if (self.ignored_uni.contains(id)) {
             const junk = self.transport.read(id);
             self.transport.consume(gpa, id, junk.len);
+            // And forget it once it ends. §6.2.3 invites a peer to open reserved streams
+            // freely — "they can be sent when application-layer padding is desired", and
+            // "MAY also be sent on connections where no data is currently being
+            // transferred" — so this set is fed by exactly the traffic a peer is encouraged
+            // to generate, and an entry that outlives its stream is a slow leak with a
+            // standards-blessed pump attached to it.
+            if (fin) _ = self.ignored_uni.remove(id);
             return;
         }
 
@@ -1093,9 +1307,13 @@ pub const Connection = struct {
                     // §6.2.4: unknown types (grease included) are ignored, not
                     // errors. Remember the decision so later bytes are drained
                     // rather than re-classified.
-                    try self.ignored_uni.put(gpa, id, {});
                     const junk = self.transport.read(id);
                     self.transport.consume(gpa, id, junk.len);
+                    // Only when more can arrive. A reserved stream that ends in the same
+                    // delivery — which is the common shape, since §6.2.3's padding streams
+                    // have no reason to stay open — has nothing left to re-classify, and
+                    // remembering it would be an entry with no stream behind it.
+                    if (!fin) try self.ignored_uni.put(gpa, id, {});
                     return;
                 },
             }
@@ -1193,7 +1411,7 @@ pub const Connection = struct {
                         if (goaway_id > previous) return self.fail(0x0108);
                     }
                     self.goaway_id = goaway_id;
-                    try self.events.append(gpa, .{ .goaway = .{ .id = goaway_id } });
+                    try self.emit(gpa, .{ .goaway = .{ .id = goaway_id } });
                 },
                 // §7.2.3: CANCEL_PUSH names a push. This endpoint never
                 // promises one in either direction, so any ID in it refers to
@@ -1960,6 +2178,9 @@ pub const TestPairOptions = struct {
     connect_protocol: bool = false,
     /// RFC 9297 §2.1.1's setting, and with it RFC 9221's transport parameter.
     datagram: bool = false,
+    /// Overrides `Options.max_buffered_body` on both sides, so a test can reach the
+    /// backpressure boundary with a handful of bytes instead of a quarter of a megabyte.
+    max_buffered_body: ?usize = null,
 };
 
 /// `connect_protocol` makes the server advertise RFC 9220's setting, which is the
@@ -1986,6 +2207,7 @@ pub fn testPairWith(gpa: Allocator, options: TestPairOptions) !TestPair {
         // server "does not have any impact", so a client advertising it says nothing,
         // and a test asserting the server saw nothing is asserting something real.
         .enable_datagram = options.datagram,
+        .max_buffered_body = options.max_buffered_body orelse (256 * 1024),
     }, @splat(0x71));
     errdefer client.deinit(gpa);
     var server = try Connection.initServer(.{
@@ -1996,6 +2218,7 @@ pub fn testPairWith(gpa: Allocator, options: TestPairOptions) !TestPair {
         .peer_cid = client_cid,
         .enable_connect_protocol = connect_protocol,
         .enable_datagram = options.datagram,
+        .max_buffered_body = options.max_buffered_body orelse (256 * 1024),
     }, @splat(0x72));
     errdefer server.deinit(gpa);
     try client.start(gpa);
@@ -3239,5 +3462,228 @@ test "http3: closing a critical stream ends the connection" {
         defer h3.deinit(gpa);
         try h3.inject(gpa, 7, 0, &.{}, true);
         try testing.expectEqual(@as(?u64, null), h3.conn.close_code);
+    }
+}
+
+test "http3: a connection serving many exchanges does not grow with their number" {
+    // HTTP/3 connections are meant to be long-lived — §3.3 asks clients not to close them
+    // until no further communication is expected — so state that survives an exchange
+    // survives for as long as the peer keeps talking. Three places kept it:
+    //
+    //   * `events` was only ever appended to, with a cursor walking away from the front, so
+    //     every event the connection had ever produced stayed allocated.
+    //   * `requests` was only ever removed from by `cancel`, so a request that *finished*
+    //     left its frame parser, section list and body list behind.
+    //   * `ignored_uni` was only ever inserted into, and §6.2.3 explicitly invites a peer to
+    //     open reserved streams for padding, "on connections where no data is currently
+    //     being transferred".
+    //
+    // None of these loses track of anything, so no leak checker complains and no test
+    // failed. What the shape of the defect asks for is a high-water measurement: run the
+    // same exchange many times over one connection and require that what is left over stops
+    // growing.
+    const gpa = testing.allocator;
+    var pair = try testPair(gpa);
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+
+    try pumpH3(gpa, client, server, 16);
+
+    const exchanges = 40;
+    var server_requests_after_first: usize = 0;
+    var client_events_after_first: usize = 0;
+
+    for (0..exchanges) |round| {
+        var buf: [8]qpack.FieldLine = undefined;
+        const fields = requestFields("GET", "https", "example.com", "/", &.{}, &buf);
+        const stream = try client.request(gpa, fields, true);
+        try pumpH3(gpa, client, server, 8);
+
+        while (server.nextEvent()) |event| switch (event) {
+            .headers => |h| {
+                var section = server.takeSection(h.stream).?;
+                section.deinit(gpa);
+            },
+            else => {},
+        };
+
+        try server.respond(gpa, stream, &.{.{ .name = ":status", .value = "200" }}, false);
+        try server.writeBody(gpa, stream, "body", true);
+        try pumpH3(gpa, client, server, 8);
+
+        while (client.nextEvent()) |event| switch (event) {
+            .headers => |h| {
+                var section = client.takeSection(h.stream).?;
+                section.deinit(gpa);
+            },
+            .body => |b| client.consumeBody(b.stream, client.readBody(b.stream).len),
+            else => {},
+        };
+
+        // A drained connection has nothing left to remember about a finished exchange.
+        if (round == 0) {
+            server_requests_after_first = server.requests.count();
+            client_events_after_first = client.events.items.len;
+        }
+    }
+
+    // Both sides forgot every completed request rather than accumulating forty of them.
+    try testing.expectEqual(@as(usize, 0), server.requests.count());
+    try testing.expectEqual(@as(usize, 0), client.requests.count());
+    // And the event list was reused rather than extended: drained to empty, capacity kept.
+    try testing.expectEqual(@as(usize, 0), client.events.items.len);
+    try testing.expectEqual(@as(usize, 0), server.events.items.len);
+    try testing.expectEqual(@as(usize, 0), server_requests_after_first);
+    try testing.expectEqual(@as(usize, 0), client_events_after_first);
+
+    // Reserved stream types, which §6.2.3 invites, are forgotten when their stream ends.
+    var junk: [16]u8 = undefined;
+    const junk_len = quic.varint.encode(&junk, 0x21); // 0x1f * 0 + 0x21: reserved
+    const reserved = try client.transport.openStream(gpa, false);
+    _ = try client.transport.write(gpa, reserved, junk[0..junk_len]);
+    try client.transport.finishStream(reserved);
+    try pumpH3(gpa, client, server, 8);
+    try testing.expectEqual(@as(u32, 0), server.ignored_uni.count());
+}
+
+test "http3: a body the application has not taken stops the peer instead of being buffered" {
+    // DATA used to be appended to the stream's buffer while the QUIC bytes were consumed in
+    // the same breath, which returned the flow-control credit immediately. Flow control was
+    // therefore satisfied at every moment and bounded nothing: a peer could hold this side's
+    // memory hostage for an entire upload, because the only limit it ever met was the one it
+    // had already been given back.
+    //
+    // With a bound in place the bytes stay in QUIC's reassembly buffer, the credit stays
+    // withheld, and the sender is the one that stops — which is what backpressure means. The
+    // application taking some with `consumeBody` is what lets reading resume.
+    const gpa = testing.allocator;
+    var pair = try testPairWith(gpa, .{ .max_buffered_body = 8 });
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+
+    try pumpH3(gpa, client, server, 16);
+
+    var buf: [8]qpack.FieldLine = undefined;
+    const fields = requestFields("POST", "https", "example.com", "/upload", &.{}, &buf);
+    const stream = try client.request(gpa, fields, false);
+    try client.writeBody(gpa, stream, "0123456789abcdefghij", true);
+    try pumpH3(gpa, client, server, 8);
+
+    while (server.nextEvent()) |event| switch (event) {
+        .headers => |h| {
+            var section = server.takeSection(h.stream).?;
+            section.deinit(gpa);
+        },
+        else => {},
+    };
+
+    // Staged up to the bound and no further. The rest is still in the transport, unread and
+    // uncredited, rather than copied in here.
+    const staged = server.readBody(stream).len;
+    try testing.expect(staged >= 8);
+    try testing.expect(staged < 20);
+
+    // More polling does not move it: nothing has been consumed, so there is no room.
+    try pumpH3(gpa, client, server, 4);
+    try testing.expectEqual(staged, server.readBody(stream).len);
+
+    // The application takes the lot, and the next drain brings the rest.
+    var collected: std.ArrayList(u8) = .empty;
+    defer collected.deinit(gpa);
+    var rounds: usize = 0;
+    while (rounds < 32) : (rounds += 1) {
+        const have = server.readBody(stream);
+        if (have.len > 0) {
+            try collected.appendSlice(gpa, have);
+            server.consumeBody(stream, have.len);
+        }
+        try pumpH3(gpa, client, server, 4);
+        while (server.nextEvent()) |_| {}
+        if (collected.items.len == 20) break;
+    }
+    try testing.expectEqualStrings("0123456789abcdefghij", collected.items);
+}
+
+test "http3: a peer that never lets the application catch up is refused" {
+    // The two queues an application drains — decoded field sections per stream, and events
+    // for the connection — are fed by the peer and emptied by the application. Neither had a
+    // ceiling, so "the application will keep up" was load-bearing and unstated. §8.1's
+    // H3_EXCESSIVE_LOAD exists for exactly this: "the endpoint detected that its peer is
+    // exhibiting a behavior that might be generating excessive load".
+    const gpa = testing.allocator;
+
+    // Interim responses, which §4.1 permits any number of, each one a decoded section
+    // waiting for `takeSection`. The application here never calls it.
+    {
+        var pair = try testPair(gpa);
+        const client = &pair.client;
+        const server = &pair.server;
+        defer client.deinit(gpa);
+        defer server.deinit(gpa);
+        try pumpH3(gpa, client, server, 16);
+
+        var buf: [8]qpack.FieldLine = undefined;
+        const fields = requestFields("GET", "https", "example.com", "/", &.{}, &buf);
+        const stream = try client.request(gpa, fields, true);
+        try pumpH3(gpa, client, server, 8);
+        while (server.nextEvent()) |event| switch (event) {
+            .headers => |h| {
+                var section = server.takeSection(h.stream).?;
+                section.deinit(gpa);
+            },
+            else => {},
+        };
+
+        // More 1xx responses than the client will hold, none of them collected.
+        var sent: usize = 0;
+        var failure: ?anyerror = null;
+        while (sent < client.max_pending_sections + 8) : (sent += 1) {
+            server.respond(gpa, stream, &.{.{ .name = ":status", .value = "103" }}, false) catch |err| {
+                failure = err;
+                break;
+            };
+            pumpH3(gpa, client, server, 4) catch |err| {
+                failure = err;
+                break;
+            };
+        }
+
+        try testing.expectEqual(@as(?anyerror, error.H3Error), failure);
+        try testing.expectEqual(@as(?u64, 0x0107), client.close_code);
+    }
+
+    // And the event queue, with an application that polls but never reads what it is told.
+    {
+        var pair = try testPair(gpa);
+        const client = &pair.client;
+        const server = &pair.server;
+        defer client.deinit(gpa);
+        defer server.deinit(gpa);
+        try pumpH3(gpa, client, server, 16);
+        // A ceiling low enough to reach with a handful of exchanges, set after the handshake
+        // so that the handshake's own events are not what trips it.
+        server.max_pending_events = 4;
+
+        var round: usize = 0;
+        var failure: ?anyerror = null;
+        while (round < 16) : (round += 1) {
+            var buf: [8]qpack.FieldLine = undefined;
+            const fields = requestFields("GET", "https", "example.com", "/", &.{}, &buf);
+            _ = client.request(gpa, fields, true) catch |err| {
+                failure = err;
+                break;
+            };
+            pumpH3(gpa, client, server, 4) catch |err| {
+                failure = err;
+                break;
+            };
+        }
+
+        try testing.expectEqual(@as(?anyerror, error.H3Error), failure);
+        try testing.expectEqual(@as(?u64, 0x0107), server.close_code);
     }
 }

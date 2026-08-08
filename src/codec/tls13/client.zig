@@ -184,8 +184,8 @@ pub const Connection = struct {
         try connection.session.start(gpa);
         try connection.flushOutput();
 
-        // Absolute, computed once: `readSocket` reports a timeout as zero bytes, and so
-        // does a peer that closed, so the clock is what tells them apart.
+        // Absolute, computed once, so that a server sending a byte at a time cannot keep
+        // extending it.
         const deadline: ?Io.Timestamp = if (connection.options.handshake_timeout) |timeout|
             Io.Timestamp.now(connection.io, .awake).addDuration(timeout)
         else
@@ -194,14 +194,13 @@ pub const Connection = struct {
         var scratch: [16 * 1024]u8 = undefined;
         while (!connection.session.isEstablished()) {
             const n = try connection.readSocket(&scratch, deadline);
-            if (n == 0) {
-                if (deadline) |d| {
-                    if (Io.Timestamp.now(connection.io, .awake).nanoseconds >= d.nanoseconds) {
-                        return error.HandshakeTimeout;
-                    }
-                }
-                return error.ConnectionResetByPeer;
-            }
+            // Zero means the deadline and nothing else: an orderly zero-byte read is
+            // reported as `error.EndOfStream` by the layer below, so there is no second
+            // meaning to disambiguate. Comparing the clock here instead — which is what
+            // this did first — made the handshake report a peer reset whenever the timer
+            // fired a hair before the nanosecond it had been given, and turned this into a
+            // test that passed on a quiet machine and failed on a busy one.
+            if (n == 0) return error.HandshakeTimeout;
             try connection.session.receive(gpa, scratch[0..n]);
             try connection.flushOutput();
         }

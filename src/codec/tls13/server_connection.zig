@@ -280,8 +280,8 @@ pub const Connection = struct {
     /// Reads until the client's Finished has been verified. A server sends
     /// nothing first, so this is a plain receive loop.
     fn handshake(connection: *Connection) !void {
-        // Absolute, computed once. `readSocket` reports a timeout as zero bytes, which is
-        // also how a peer that closed reads, so the clock is what distinguishes them.
+        // Absolute, computed once, so that a peer sending a byte at a time cannot keep
+        // extending it.
         const deadline: ?Io.Timestamp = if (connection.options.handshake_timeout) |timeout|
             Io.Timestamp.now(connection.io, .awake).addDuration(timeout)
         else
@@ -290,11 +290,11 @@ pub const Connection = struct {
         var scratch: [16 * 1024]u8 = undefined;
         while (!connection.session.isEstablished()) {
             const n = try driver.readSocket(connection, &scratch, deadline);
-            if (deadline) |d| {
-                if (Io.Timestamp.now(connection.io, .awake).nanoseconds >= d.nanoseconds) {
-                    return error.HandshakeTimeout;
-                }
-            }
+            // Zero means the deadline: `readSocket` reports an orderly zero-byte read as
+            // `error.EndOfStream`, so there is nothing else it can be. A peer that trickles
+            // bytes is caught by the same line — once the absolute deadline is behind us the
+            // next receive has a deadline in the past and returns immediately.
+            if (n == 0) return error.HandshakeTimeout;
             try connection.session.receive(connection.gpa, scratch[0..n]);
             try driver.flushOutput(connection);
         }
@@ -803,9 +803,24 @@ test "tls13: a peer that accepts and then says nothing does not hold a task fore
     defer silent.deinit(io);
     const address = silent.socket.address;
 
-    // No accept task at all: the kernel's backlog completes the TCP handshake, and nothing
-    // above it ever answers. That is indistinguishable, from the client's side, from a
-    // server that accepted and then hung.
+    // A task that accepts and then says nothing, which is the shape being tested: a server
+    // that completed the TCP handshake and never spoke.
+    //
+    // Leaving it to the kernel's backlog instead — no accept task at all — looked equivalent
+    // and was not: under load the connection can be reset rather than parked, and the client
+    // then reports `ConnectionResetByPeer` before its deadline. That made this test flaky
+    // once, which is worse than not having it, because a flake teaches people to re-run.
+    var silence: Io.Group = .init;
+    defer silence.cancel(io);
+    try silence.concurrent(io, struct {
+        fn accept(listener: *Io.net.Server, loop_io: Io) void {
+            const stream = listener.accept(loop_io) catch return;
+            defer stream.close(loop_io);
+            // Held open, unread, until this task is cancelled.
+            while (true) loop_io.sleep(.fromMilliseconds(50), .awake) catch return;
+        }
+    }.accept, .{ &silent, io });
+
     const started = Io.Timestamp.now(io, .awake);
     const result = client_mod.Client.connect(.{
         .gpa = gpa,
