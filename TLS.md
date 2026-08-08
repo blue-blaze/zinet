@@ -170,7 +170,9 @@ Stated rather than left to be discovered:
 
 * **No TLS 1.2.** A peer that cannot do 1.3 is refused. The version negotiation
   extension is checked and nothing else is offered.
-* **No resumption or 0-RTT.** Tickets are ignored on receipt; none are issued.
+* **No resumption or 0-RTT.** Tickets are ignored on receipt; none are issued. This one has
+  now been measured rather than merely deferred, and the measurement says it is not the first
+  thing to do — see [What a handshake costs](#what-a-handshake-costs).
 * **No client certificates.** A `CertificateRequest` is not sent by the server, and
   a client `Certificate` message is refused as a peer inventing an exchange.
 * **One key exchange group: X25519.** A client offering only P-256 is refused with
@@ -180,6 +182,48 @@ Stated rather than left to be discovered:
   no OCSP stapling.
 * **No certificate revocation checking.** Chain verification is signatures, names
   and validity dates.
+
+## What a handshake costs
+
+Session resumption exists to avoid full handshakes, so the question of whether to implement it
+is really a question about what a full handshake costs here. Measured with `openssl s_time`
+driving this server on loopback, five seconds per run, same certificate where the algorithm is
+the same:
+
+| Server | Certificate | Full handshakes | Per handshake |
+|---|---|---|---|
+| this one | ECDSA P-256 | 1406 in 6 s (≈ 234/s) | 4.3 ms |
+| this one | Ed25519 | 2132 in 6 s (≈ 355/s) | 2.8 ms |
+| `openssl s_server` | ECDSA P-256 | 5681 in 6 s (≈ 947/s) | 1.1 ms |
+
+Three things follow, and together they decide the question.
+
+**Handshakes are expensive relative to everything else.** The plain HTTP benchmark serves about
+39 000 requests a second on persistent connections (see [bench/README.md](bench/README.md)), so
+one full handshake costs roughly what 170 requests cost. Any workload that opens short-lived
+TLS connections is paying for handshakes and almost nothing else.
+
+**But the signature is not where most of it goes.** Swapping ECDSA P-256 for Ed25519 — a much
+cheaper signature — buys 1.5 ms of the 4.3 ms, about a third. The remaining 2.8 ms is key
+exchange, certificate handling, the key schedule and the record layer, and it is unaffected by
+which key signs.
+
+**And that remainder is where this implementation is actually slow.** OpenSSL completes an
+entire ECDSA handshake in 1.1 ms — less than half of what is left here after the signature is
+made as cheap as possible. So the gap is not the crypto this code chose; it is something in the
+path around it.
+
+Which is why resumption is not the next thing. Resumption removes the signature, the third
+that Ed25519 already shows is removable, and leaves the 2.8 ms untouched — while adding a
+long-lived ticket key, its rotation, PSK binder verification, ticket lifetime policy (§4.6.1),
+and the replay surface §8 describes if 0-RTT ever follows. Finding out what the 2.8 ms is spent
+on would plausibly recover more, for *every* handshake rather than only resumed ones, without a
+new persistent secret in the one component where a mistake is silent.
+
+What would change this conclusion: a profile showing the remaining time is irreducible, or a
+deployment whose connections are short-lived enough that a third is worth the security surface.
+If resumption is implemented, `psk_dhe_ke` should be required rather than offered, so that a
+compromised ticket key cannot retroactively cost forward secrecy.
 
 The cipher suites are the three RFC 8446 mandates and recommends:
 `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`.
