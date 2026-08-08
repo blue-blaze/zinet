@@ -41,6 +41,12 @@ pub const Error = error{
     /// because the remedy differs: this one is answered by waiting, or by not
     /// using the extension at all against this peer.
     ExtendedConnectNotEnabled,
+    /// More bytes were handed to a stream than `max_buffered_send` will hold while flow
+    /// control refuses them. The write did not happen: the caller must consume events (which
+    /// is what lets the peer's credit arrive) and try again. Reported rather than absorbed,
+    /// because silently keeping it would be an unbounded buffer and silently dropping it
+    /// would be the defect this bound exists to end.
+    SendBufferFull,
 } || quic.connection.Error || frame.Error || qpack.Error;
 
 /// What this connection reports upward. IDs only — see the module comment.
@@ -116,6 +122,25 @@ const RequestState = enum {
     headers_received,
     /// A second HEADERS after DATA: trailers. Nothing may follow (§4.1).
     trailers_received,
+};
+
+/// Bytes handed to a stream that QUIC's flow control has not accepted yet, and whether a FIN
+/// is waiting behind them.
+///
+/// `quic.Connection.write` returns how much it took — "a short write is normal and means flow
+/// control, not failure" — and this is where the difference lives until the peer grants more
+/// credit. An entry exists only for a stream that is actually behind, so the ordinary case
+/// allocates nothing.
+const Outbox = struct {
+    pending: std.ArrayList(u8) = .empty,
+    /// A FIN the application asked for, which must not be sent until `pending` is empty:
+    /// closing the stream with bytes still waiting would truncate the last frame on it, and
+    /// §7.1 makes that a connection error for the receiver to raise against us.
+    fin_wanted: bool = false,
+
+    fn deinit(self: *Outbox, gpa: Allocator) void {
+        self.pending.deinit(gpa);
+    }
 };
 
 const Request = struct {
@@ -206,6 +231,15 @@ pub const Options = struct {
     /// in the same breath, returning credit immediately: flow control was satisfied while
     /// the peer could still make this side hold an entire upload in memory.
     max_buffered_body: usize = 256 * 1024,
+    /// The most this connection will hold per stream while waiting for the peer's
+    /// flow-control credit.
+    ///
+    /// Needed because a write is not all-or-nothing at the transport: QUIC accepts what its
+    /// windows allow and reports the rest, and HTTP/3 cannot simply pass that back to the
+    /// application mid-frame — a frame header that went out with a length its payload never
+    /// reaches is corruption on the wire, not a partial write. So the remainder is staged
+    /// here, and this is the ceiling on it. Reaching it is `error.SendBufferFull`.
+    max_buffered_send: usize = 256 * 1024,
     /// How many field sections may wait, per stream, for `takeSection`.
     ///
     /// Two or three is the honest maximum for a well-behaved exchange — a header section, a
@@ -257,6 +291,15 @@ pub const ServerOptions = struct {
     /// in the same breath, returning credit immediately: flow control was satisfied while
     /// the peer could still make this side hold an entire upload in memory.
     max_buffered_body: usize = 256 * 1024,
+    /// The most this connection will hold per stream while waiting for the peer's
+    /// flow-control credit.
+    ///
+    /// Needed because a write is not all-or-nothing at the transport: QUIC accepts what its
+    /// windows allow and reports the rest, and HTTP/3 cannot simply pass that back to the
+    /// application mid-frame — a frame header that went out with a length its payload never
+    /// reaches is corruption on the wire, not a partial write. So the remainder is staged
+    /// here, and this is the ceiling on it. Reaching it is `error.SendBufferFull`.
+    max_buffered_send: usize = 256 * 1024,
     /// How many field sections may wait, per stream, for `takeSection`.
     ///
     /// Two or three is the honest maximum for a well-behaved exchange — a header section, a
@@ -281,8 +324,11 @@ pub const Connection = struct {
     role: quic.transport.Role = .client,
     transport: quic.connection.Connection,
     max_field_section_size: u64,
+    /// Streams with bytes waiting for flow-control credit. Empty in the ordinary case.
+    outboxes: std.AutoHashMapUnmanaged(u64, Outbox) = .empty,
     /// See `Options.max_buffered_body`, `max_pending_sections` and `max_pending_events`.
     max_buffered_body: usize,
+    max_buffered_send: usize,
     max_pending_sections: usize,
     max_pending_events: usize,
 
@@ -362,6 +408,7 @@ pub const Connection = struct {
             }, seed),
             .max_field_section_size = options.max_field_section_size,
             .max_buffered_body = options.max_buffered_body,
+            .max_buffered_send = options.max_buffered_send,
             .max_pending_sections = options.max_pending_sections,
             .max_pending_events = options.max_pending_events,
             .enable_connect_protocol = options.enable_connect_protocol,
@@ -388,6 +435,7 @@ pub const Connection = struct {
             }, seed),
             .max_field_section_size = options.max_field_section_size,
             .max_buffered_body = options.max_buffered_body,
+            .max_buffered_send = options.max_buffered_send,
             .max_pending_sections = options.max_pending_sections,
             .max_pending_events = options.max_pending_events,
             .enable_connect_protocol = options.enable_connect_protocol,
@@ -399,6 +447,9 @@ pub const Connection = struct {
         var it = self.requests.valueIterator();
         while (it.next()) |req| req.deinit(gpa);
         self.requests.deinit(gpa);
+        var outbox_iterator = self.outboxes.valueIterator();
+        while (outbox_iterator.next()) |box| box.deinit(gpa);
+        self.outboxes.deinit(gpa);
         for (self.datagram_queue.items) |entry| gpa.free(entry.payload);
         self.datagram_queue.deinit(gpa);
         self.ignored_uni.deinit(gpa);
@@ -442,6 +493,112 @@ pub const Connection = struct {
             break;
         }
         if (restart) |id| try self.onRequestData(gpa, id, false);
+    }
+
+    /// Hands `bytes` to `stream`, keeping whatever flow control will not take yet.
+    ///
+    /// This replaces ten `_ = try self.transport.write(...)` call sites that discarded the
+    /// accepted count. What they were discarding was not an optimisation detail: a HEADERS or
+    /// DATA header accepted while its payload was refused leaves the peer reading a length
+    /// that will never arrive, so the sender manufactures the corruption and the receiver is
+    /// obliged to fail the connection over it. Bytes were also simply lost, with no error
+    /// returned to whoever handed them over.
+    fn sendOnStream(self: *Connection, gpa: Allocator, stream: u64, bytes: []const u8) !void {
+        // Already behind: everything must queue behind what is waiting, or the stream's bytes
+        // arrive out of order — which is worse than not arriving.
+        if (self.outboxes.getPtr(stream)) |box| {
+            if (box.pending.items.len + bytes.len > self.max_buffered_send) {
+                return error.SendBufferFull;
+            }
+            try box.pending.appendSlice(gpa, bytes);
+            return self.flushStream(gpa, stream);
+        }
+
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const taken = try self.transport.write(gpa, stream, bytes[offset..]);
+            if (taken == 0) break; // flow control; the rest waits
+            offset += taken;
+        }
+        if (offset == bytes.len) return;
+
+        const residue = bytes[offset..];
+        if (residue.len > self.max_buffered_send) return error.SendBufferFull;
+        const entry = try self.outboxes.getOrPut(gpa, stream);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        errdefer if (!entry.found_existing) {
+            entry.value_ptr.deinit(gpa);
+            _ = self.outboxes.remove(stream);
+        };
+        try entry.value_ptr.pending.appendSlice(gpa, residue);
+    }
+
+    /// Ends our side of `stream`, after whatever is still waiting for credit.
+    fn finishOnStream(self: *Connection, gpa: Allocator, stream: u64) !void {
+        if (self.outboxes.getPtr(stream)) |box| {
+            box.fin_wanted = true;
+            return self.flushStream(gpa, stream);
+        }
+        try self.transport.finishStream(stream);
+        self.noteFinSent(stream);
+    }
+
+    /// What a FIN actually leaving means to the rest of the connection: RFC 9297 §2.1 gates
+    /// datagrams on the send side being open, and a finished exchange may now be releasable.
+    fn noteFinSent(self: *Connection, stream: u64) void {
+        if (self.requests.getPtr(stream)) |req| req.fin_sent = true;
+        self.reapIfSpent(stream);
+    }
+
+    /// Pushes as much of one stream's backlog into the transport as credit allows, and sends
+    /// the FIN once nothing is left.
+    fn flushStream(self: *Connection, gpa: Allocator, stream: u64) !void {
+        const box = self.outboxes.getPtr(stream) orelse return;
+        while (box.pending.items.len > 0) {
+            const taken = try self.transport.write(gpa, stream, box.pending.items);
+            if (taken == 0) break;
+            const rest = box.pending.items.len - taken;
+            std.mem.copyForwards(u8, box.pending.items[0..rest], box.pending.items[taken..]);
+            box.pending.shrinkRetainingCapacity(rest);
+        }
+        if (box.pending.items.len != 0) return;
+        if (box.fin_wanted) {
+            try self.transport.finishStream(stream);
+            box.fin_wanted = false;
+            self.noteFinSent(stream);
+        }
+    }
+
+    /// Retries every stream that is behind, and forgets the ones that have caught up.
+    ///
+    /// Driven from `drainTransport`, because that is where the peer's MAX_STREAM_DATA and
+    /// MAX_DATA frames have just been processed — the credit arriving is the event this is
+    /// waiting for.
+    fn flushOutboxes(self: *Connection, gpa: Allocator) !void {
+        {
+            var iterator = self.outboxes.iterator();
+            while (iterator.next()) |entry| {
+                // Values only: `flushStream` mutates this entry and nothing else, so the
+                // iterator stays valid. Removal is the pass below, for the same reason.
+                try self.flushStream(gpa, entry.key_ptr.*);
+            }
+        }
+        // An outbox with nothing waiting is an entry with nothing to remember. Restarted
+        // after each removal rather than removing under an iterator.
+        var removed = true;
+        while (removed) {
+            removed = false;
+            var iterator = self.outboxes.iterator();
+            while (iterator.next()) |entry| {
+                if (entry.value_ptr.pending.items.len != 0 or entry.value_ptr.fin_wanted) continue;
+                const stream = entry.key_ptr.*;
+                var box = entry.value_ptr.*;
+                box.deinit(gpa);
+                _ = self.outboxes.remove(stream);
+                removed = true;
+                break;
+            }
+        }
     }
 
     /// Queues an event for the application, refusing to grow past `max_pending_events`.
@@ -615,6 +772,9 @@ pub const Connection = struct {
     fn drainTransport(self: *Connection, gpa: Allocator) !void {
         self.reap_gpa = gpa;
         try self.resumeStalledStreams(gpa);
+        // Credit the peer granted while we were away is exactly what a backlog is waiting
+        // for, and this is where MAX_STREAM_DATA and MAX_DATA have just been applied.
+        try self.flushOutboxes(gpa);
         while (self.transport.nextEvent()) |event| {
             switch (event) {
                 .established => try self.onEstablished(gpa),
@@ -694,13 +854,13 @@ pub const Connection = struct {
             advertised_len += 1;
         }
         len += frame.writeSettings(buf[len..], advertised[0..advertised_len]);
-        _ = try self.transport.write(gpa, control, buf[0..len]);
+        try self.sendOnStream(gpa, control, buf[0..len]);
 
         var type_buf: [8]u8 = undefined;
         const enc_len = quic.varint.encode(&type_buf, @backingInt(frame.StreamType.qpack_encoder));
-        _ = try self.transport.write(gpa, encoder, type_buf[0..enc_len]);
+        try self.sendOnStream(gpa, encoder, type_buf[0..enc_len]);
         const dec_len = quic.varint.encode(&type_buf, @backingInt(frame.StreamType.qpack_decoder));
-        _ = try self.transport.write(gpa, decoder, type_buf[0..dec_len]);
+        try self.sendOnStream(gpa, decoder, type_buf[0..dec_len]);
 
         self.h3_ready = true;
         try self.emit(gpa, .established);
@@ -744,9 +904,10 @@ pub const Connection = struct {
             @backingInt(frame.FrameType.headers),
             encoded.items.len,
         );
-        _ = try self.transport.write(gpa, id, header[0..header_len]);
-        _ = try self.transport.write(gpa, id, encoded.items);
-        if (fin) try self.transport.finishStream(id);
+        // Header and payload as one transaction: both are staged together, so a peer never
+        // sees a length whose bytes are still queued here.
+        try self.sendOnStream(gpa, id, header[0..header_len]);
+        try self.sendOnStream(gpa, id, encoded.items);
 
         // Track it so the response has somewhere to land. §4.4: remember whether
         // this was a CONNECT, because a 2xx answer to one turns the stream into a
@@ -757,11 +918,14 @@ pub const Connection = struct {
                 sent_connect = std.mem.eql(u8, field.value, "CONNECT");
             }
         }
-        // `fin_sent` is recorded here rather than beside the `finishStream` above,
-        // because the entry does not exist yet at that point — RFC 9297 §2.1 reads this
-        // flag to decide whether a datagram may be sent, and a flag set on an absent
-        // entry is a flag that is always false.
-        try self.requests.put(gpa, id, .{ .sent_connect = sent_connect, .fin_sent = fin });
+        try self.requests.put(gpa, id, .{ .sent_connect = sent_connect });
+
+        // The FIN goes out after the entry exists, which is what lets `noteFinSent` land the
+        // flag on it — RFC 9297 §2.1 reads that flag to decide whether a datagram may be
+        // sent, and a flag set on an absent entry is a flag that is always false. It also
+        // means the FIN may leave later than this call, once a backlog ahead of it clears,
+        // and the flag follows the FIN rather than the intention.
+        if (fin) try self.finishOnStream(gpa, id);
         return id;
     }
 
@@ -773,20 +937,14 @@ pub const Connection = struct {
             @backingInt(frame.FrameType.data),
             bytes.len,
         );
-        _ = try self.transport.write(gpa, id, header[0..header_len]);
-        _ = try self.transport.write(gpa, id, bytes);
-        if (fin) {
-            try self.transport.finishStream(id);
-            // RFC 9297 §2.1 needs to know the send side has closed; recorded at every
-            // point a FIN leaves, because a flag that is right in two places out of
-            // three is worse than none.
-            if (self.requests.getPtr(id)) |req| req.fin_sent = true;
-            // Closing the send side can be the last thing an exchange was waiting for. On a
-            // server it usually is: the request was taken before the response was written,
-            // so the accessors have already emptied everything and this is the moment the
-            // state becomes releasable.
-            self.reapIfSpent(id);
-        }
+        try self.sendOnStream(gpa, id, header[0..header_len]);
+        try self.sendOnStream(gpa, id, bytes);
+        // `fin_sent` and the reap are `noteFinSent`'s business now, called from wherever the
+        // FIN actually leaves — which with a backlog is a later flush, not here. Setting the
+        // flag at the point the application *asked* would claim the send side was closed
+        // while bytes were still queued, and RFC 9297 §2.1 reads it to decide whether a
+        // datagram may be sent.
+        if (fin) try self.finishOnStream(gpa, id);
     }
 
     /// Send a response header section on a request stream.
@@ -814,13 +972,9 @@ pub const Connection = struct {
             @backingInt(frame.FrameType.headers),
             encoded.items.len,
         );
-        _ = try self.transport.write(gpa, stream, header[0..header_len]);
-        _ = try self.transport.write(gpa, stream, encoded.items);
-        if (fin) {
-            try self.transport.finishStream(stream);
-            if (self.requests.getPtr(stream)) |req| req.fin_sent = true;
-            self.reapIfSpent(stream);
-        }
+        try self.sendOnStream(gpa, stream, header[0..header_len]);
+        try self.sendOnStream(gpa, stream, encoded.items);
+        if (fin) try self.finishOnStream(gpa, stream);
     }
 
     /// §4.1.1: cancel an exchange, in whichever directions are still open.
@@ -880,7 +1034,7 @@ pub const Connection = struct {
         };
         var buf: [32]u8 = undefined;
         const len = frame.writeGoaway(&buf, value);
-        _ = try self.transport.write(gpa, self.control_out.?, buf[0..len]);
+        try self.sendOnStream(gpa, self.control_out.?, buf[0..len]);
         self.local_goaway_id = value;
 
         // §5.2: "Upon sending a GOAWAY frame, the endpoint SHOULD explicitly cancel
@@ -2181,6 +2335,10 @@ pub const TestPairOptions = struct {
     /// Overrides `Options.max_buffered_body` on both sides, so a test can reach the
     /// backpressure boundary with a handful of bytes instead of a quarter of a megabyte.
     max_buffered_body: ?usize = null,
+    /// The per-stream receive window each side announces, which is what bounds how much the
+    /// *other* side may write before flow control refuses. Small values are how a test
+    /// reaches the short-write path without moving hundreds of kilobytes.
+    initial_max_stream_data: ?u64 = null,
 };
 
 /// `connect_protocol` makes the server advertise RFC 9220's setting, which is the
@@ -2198,8 +2356,20 @@ pub fn testPairWith(gpa: Allocator, options: TestPairOptions) !TestPair {
         &.{ 0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7 },
     ) catch unreachable;
 
+    var client_parameters: quic.transport.Parameters = .client_defaults;
+    var server_parameters: quic.transport.Parameters = .server_defaults;
+    if (options.initial_max_stream_data) |window| {
+        client_parameters.initial_max_stream_data_bidi_local = window;
+        client_parameters.initial_max_stream_data_bidi_remote = window;
+        client_parameters.initial_max_stream_data_uni = window;
+        server_parameters.initial_max_stream_data_bidi_local = window;
+        server_parameters.initial_max_stream_data_bidi_remote = window;
+        server_parameters.initial_max_stream_data_uni = window;
+    }
+
     var client = try Connection.init(.{
         .host = "example.com",
+        .parameters = client_parameters,
         .verification = null,
         .local_cid = client_cid,
         .initial_destination = dcid,
@@ -2212,6 +2382,7 @@ pub fn testPairWith(gpa: Allocator, options: TestPairOptions) !TestPair {
     errdefer client.deinit(gpa);
     var server = try Connection.initServer(.{
         .identity = &h3_identity,
+        .parameters = server_parameters,
         .local_cid = server_cid,
         .destination = dcid,
         .original_destination = dcid,
@@ -3686,4 +3857,73 @@ test "http3: a peer that never lets the application catch up is refused" {
         try testing.expectEqual(@as(?anyerror, error.H3Error), failure);
         try testing.expectEqual(@as(?u64, 0x0107), server.close_code);
     }
+}
+
+test "http3: a body larger than the flow-control window arrives whole" {
+    // `quic.Connection.write` returns how many bytes it accepted — "a short write is normal
+    // and means flow control, not failure", as its own doc comment says — and every one of
+    // the ten call sites in this file discarded that with `_ = try`. The consequences are not
+    // subtle:
+    //
+    //   * A frame header is accepted and its payload is not, so the peer reads a length that
+    //     will never be satisfied. That is wire corruption produced by the sender, and the
+    //     receiver's only honest reaction is to fail the connection.
+    //   * Bytes the application handed over are dropped with no error returned to it.
+    //
+    // Neither showed up in the suite because the default window is 256 KiB and no test sent
+    // more than a few hundred bytes. This one shrinks the window instead of enlarging the
+    // body: same boundary, three orders of magnitude cheaper.
+    const gpa = testing.allocator;
+    var pair = try testPairWith(gpa, .{ .initial_max_stream_data = 256 });
+    const client = &pair.client;
+    const server = &pair.server;
+    defer client.deinit(gpa);
+    defer server.deinit(gpa);
+
+    try pumpH3(gpa, client, server, 32);
+
+    // Four times the window the peer announced, so the write cannot possibly be accepted in
+    // one go and the staging path is what carries it.
+    var body: [1024]u8 = undefined;
+    for (&body, 0..) |*byte, i| byte.* = @truncate(i);
+
+    var buf: [8]qpack.FieldLine = undefined;
+    const fields = requestFields("POST", "https", "example.com", "/upload", &.{}, &buf);
+    const stream = try client.request(gpa, fields, false);
+    try client.writeBody(gpa, stream, &body, true);
+
+    var collected: std.ArrayList(u8) = .empty;
+    defer collected.deinit(gpa);
+
+    var rounds: usize = 0;
+    var finished = false;
+    while (rounds < 200 and !finished) : (rounds += 1) {
+        try pumpH3(gpa, client, server, 8);
+        while (server.nextEvent()) |event| switch (event) {
+            .headers => |h| {
+                var section = server.takeSection(h.stream).?;
+                section.deinit(gpa);
+            },
+            .body => |b| {
+                const have = server.readBody(b.stream);
+                try collected.appendSlice(gpa, have);
+                server.consumeBody(b.stream, have.len);
+                if (b.fin) finished = true;
+            },
+            else => {},
+        };
+        const have = server.readBody(stream);
+        if (have.len > 0) {
+            try collected.appendSlice(gpa, have);
+            server.consumeBody(stream, have.len);
+        }
+    }
+
+    // No connection error on either side: the frame the receiver was promised is the frame
+    // it got.
+    try testing.expectEqual(@as(?u64, null), server.close_code);
+    try testing.expectEqual(@as(?u64, null), client.close_code);
+    // And every byte arrived, in order.
+    try testing.expectEqual(@as(usize, body.len), collected.items.len);
+    try testing.expectEqualSlices(u8, &body, collected.items);
 }
