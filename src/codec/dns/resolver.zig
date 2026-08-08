@@ -228,13 +228,7 @@ pub const Resolver = struct {
             if (!sameAddress(incoming.from, server)) continue;
 
             const message = dns.decode(incoming.data) catch continue;
-            if (!message.header.response) continue;
-            if (message.header.id != id) continue;
-            // The question must be the one we asked. A server that answers a
-            // different question is either confused or not the server.
-            if (message.question_len != 1) continue;
-            if (!message.questions[0].name.eqlText(host)) continue;
-            if (message.questions[0].type != family.recordType()) continue;
+            if (!answersOurQuestion(&message, id, host, family)) continue;
 
             // Only now is the reply ours to believe.
             if (message.header.truncated) return error.Truncated;
@@ -248,6 +242,38 @@ pub const Resolver = struct {
         }
     }
 };
+
+/// Whether a decoded reply is an answer to the question this query asked.
+///
+/// One predicate rather than a run of `continue`s in the receive loop, because every one
+/// of these conditions is the same rule — "this is our reply" — and a rule with one
+/// implementation can be tested without a socket.
+///
+/// Two of them were missing. The opcode was never looked at, so a STATUS or NOTIFY
+/// message that happened to carry our transaction ID was read as an answer to a QUERY.
+/// The question's class was never looked at either, so a reply asking about
+/// `example.com A` in class CH — a different namespace that shares the name space's
+/// spelling — satisfied every check we did make. Neither is a likely accident, which is
+/// precisely why they are worth refusing: an off-path attacker chooses the fields nobody
+/// compares.
+fn answersOurQuestion(
+    message: *const dns.Message,
+    id: u16,
+    host: []const u8,
+    family: Family,
+) bool {
+    if (!message.header.response) return false;
+    if (message.header.id != id) return false;
+    // A reply to a QUERY is a QUERY (§4.1.1: the opcode is copied into the response).
+    if (message.header.opcode != .query) return false;
+    // The question must be the one we asked. A server that answers a different question
+    // is either confused or not the server.
+    if (message.question_len != 1) return false;
+    if (!message.questions[0].name.eqlText(host)) return false;
+    if (message.questions[0].type != family.recordType()) return false;
+    if (message.questions[0].class != .in) return false;
+    return true;
+}
 
 /// Pull addresses out of an answer, following the CNAME chain by name rather than
 /// by position.
@@ -271,6 +297,7 @@ fn collect(
     while (hops <= message.answer_len) : (hops += 1) {
         var advanced = false;
         for (message.answerSlice()) |record| {
+            if (record.class != .in) continue;
             if (record.type != .cname) continue;
             if (!record.name.eqlText(answer.canonical.slice())) continue;
             answer.canonical = record.data.name;
@@ -282,6 +309,11 @@ fn collect(
 
     var min_ttl: u32 = std.math.maxInt(u32);
     for (message.answerSlice()) |record| {
+        // Class as well as type and name. We only ever ask in class IN, and a record in
+        // another class is an answer about a different namespace that happens to spell its
+        // names the same way — an `A` record in class CH is not an internet address, so
+        // handing its four bytes to a caller about to connect is handing it a guess.
+        if (record.class != .in) continue;
         if (record.type != family.recordType()) continue;
         if (!record.name.eqlText(answer.canonical.slice())) continue;
         if (answer.len == max_addresses) break;
@@ -602,4 +634,109 @@ test "resolver: a reply with the right transaction ID from the wrong address is 
     // The forged reply really was sent, so the test would have passed for the
     // wrong reason if it had not been.
     try testing.expect(server.answered.load(.acquire));
+}
+
+test "resolver: a reply is only ours if every field we asked with comes back" {
+    // Each case is a reply that is perfect except for one field, which is the position an
+    // off-path attacker occupies once the transaction ID is in hand: they cannot see the
+    // query, so they choose the fields they hope nobody compares.
+    const asked = "checked.test";
+    const Case = struct { name: []const u8, message: dns.Message, want: bool };
+    const cases = [_]Case{
+        .{
+            .name = "the reply we asked for",
+            .message = .{ .header = .{ .id = 7, .response = true }, .question_len = 1, .questions = blk: {
+                var q: [dns.max_records]dns.Question = undefined;
+                q[0] = .{ .name = dns.Name.init(asked) catch unreachable, .type = .a, .class = .in };
+                break :blk q;
+            } },
+            .want = true,
+        },
+        .{
+            .name = "a QUERY answered with a STATUS",
+            .message = .{ .header = .{ .id = 7, .response = true, .opcode = .status }, .question_len = 1, .questions = blk: {
+                var q: [dns.max_records]dns.Question = undefined;
+                q[0] = .{ .name = dns.Name.init(asked) catch unreachable, .type = .a, .class = .in };
+                break :blk q;
+            } },
+            .want = false,
+        },
+        .{
+            .name = "the right name and type in the wrong class",
+            .message = .{ .header = .{ .id = 7, .response = true }, .question_len = 1, .questions = blk: {
+                var q: [dns.max_records]dns.Question = undefined;
+                q[0] = .{ .name = dns.Name.init(asked) catch unreachable, .type = .a, .class = @fromBackingInt(@intCast(3)) };
+                break :blk q;
+            } },
+            .want = false,
+        },
+        .{
+            .name = "a different transaction",
+            .message = .{ .header = .{ .id = 8, .response = true }, .question_len = 1, .questions = blk: {
+                var q: [dns.max_records]dns.Question = undefined;
+                q[0] = .{ .name = dns.Name.init(asked) catch unreachable, .type = .a, .class = .in };
+                break :blk q;
+            } },
+            .want = false,
+        },
+        .{
+            .name = "a question about something else",
+            .message = .{ .header = .{ .id = 7, .response = true }, .question_len = 1, .questions = blk: {
+                var q: [dns.max_records]dns.Question = undefined;
+                q[0] = .{ .name = dns.Name.init("other.test") catch unreachable, .type = .a, .class = .in };
+                break :blk q;
+            } },
+            .want = false,
+        },
+        .{
+            .name = "a query rather than a response",
+            .message = .{ .header = .{ .id = 7, .response = false }, .question_len = 1, .questions = blk: {
+                var q: [dns.max_records]dns.Question = undefined;
+                q[0] = .{ .name = dns.Name.init(asked) catch unreachable, .type = .a, .class = .in };
+                break :blk q;
+            } },
+            .want = false,
+        },
+    };
+
+    for (cases) |case| {
+        const got = answersOurQuestion(&case.message, 7, asked, .ip4);
+        testing.expectEqual(case.want, got) catch |err| {
+            std.debug.print("case: {s}\n", .{case.name});
+            return err;
+        };
+    }
+}
+
+test "resolver: a record in another class is not an address" {
+    // Type and name match, class does not. Class CH is a separate namespace that spells
+    // its names the same way, so four bytes from it are not an internet address.
+    var message: dns.Message = .{ .header = .{ .id = 1, .response = true } };
+    message.answers[0] = .{
+        .name = try dns.Name.init("asked.test"),
+        .type = .a,
+        .class = @fromBackingInt(@intCast(3)), // CH
+        .ttl = 60,
+        .data = .{ .a = .{ 203, 0, 113, 9 } },
+    };
+    message.answer_len = 1;
+    try testing.expectError(error.NoAddress, collect(&message, "asked.test", 80, .ip4));
+
+    // And a CNAME in another class does not redirect the chain either.
+    message.answers[0] = .{
+        .name = try dns.Name.init("asked.test"),
+        .type = .cname,
+        .class = @fromBackingInt(@intCast(3)),
+        .ttl = 60,
+        .data = .{ .name = try dns.Name.init("evil.test") },
+    };
+    message.answers[1] = .{
+        .name = try dns.Name.init("evil.test"),
+        .type = .a,
+        .class = .in,
+        .ttl = 60,
+        .data = .{ .a = .{ 203, 0, 113, 66 } },
+    };
+    message.answer_len = 2;
+    try testing.expectError(error.NoAddress, collect(&message, "asked.test", 80, .ip4));
 }

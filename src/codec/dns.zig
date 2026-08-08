@@ -398,6 +398,22 @@ pub fn decode(bytes: []const u8) Error!Message {
     return message;
 }
 
+/// A record whose RDATA holds a name is parsed with a cursor over the whole message,
+/// because §4.1.4's pointers are message-relative and legitimately reach outside the
+/// record. What must still hold is §3.2.1: RDLENGTH is the length of the RDATA, so the
+/// bytes physically read from inside it have to end exactly where it does.
+///
+/// Neither direction is harmless. Reading past the end returns a name assembled from the
+/// following record while the outer cursor steps over exactly RDLENGTH, so the decoder and
+/// the sender disagree about every record after this one. Stopping short leaves bytes that
+/// are neither name nor padding, which means the record is not the record it claims to be.
+///
+/// `inner.at` is where `decodeName` says a caller resumes — past the first pointer, or
+/// past the root label — which is exactly the count of RDATA octets the name occupied.
+fn requireRdataConsumed(inner: *const Cursor, rdata_start: usize, rdlength: u16) Error!void {
+    if (inner.at != rdata_start + rdlength) return error.BadRecord;
+}
+
 fn decodeRecord(cursor: *Cursor) Error!Record {
     const name = try decodeName(cursor);
     const kind: Type = @fromBackingInt(@intCast(try cursor.u16be()));
@@ -425,13 +441,17 @@ fn decodeRecord(cursor: *Cursor) Error!Record {
             // inside RDATA may themselves be compressed, and pointers are
             // relative to the message rather than to the record.
             var inner: Cursor = .{ .message = cursor.message, .at = rdata_start };
-            break :blk .{ .name = try decodeName(&inner) };
+            const target = try decodeName(&inner);
+            try requireRdataConsumed(&inner, rdata_start, rdlength);
+            break :blk .{ .name = target };
         },
         .mx => blk: {
             if (rdata.len < 3) return error.BadRecord;
             var inner: Cursor = .{ .message = cursor.message, .at = rdata_start };
             const preference = try inner.u16be();
-            break :blk .{ .mx = .{ .preference = preference, .exchange = try decodeName(&inner) } };
+            const exchange = try decodeName(&inner);
+            try requireRdataConsumed(&inner, rdata_start, rdlength);
+            break :blk .{ .mx = .{ .preference = preference, .exchange = exchange } };
         },
         else => .{ .raw = rdata },
     };
@@ -789,4 +809,113 @@ test "dns: record counts beyond the bound are refused rather than trusted" {
     var header: Header = .{ .id = 6, .response = true, .answer_count = max_records + 1 };
     header.encode(&buf);
     try testing.expectError(error.TooManyRecords, decode(&buf));
+}
+
+test "decode: a name inside RDATA must end where RDLENGTH says it does" {
+    // §3.2.1: RDLENGTH "specifies the length in octets of the RDATA field". A name is
+    // read with a cursor of its own so that compression pointers can reach back into the
+    // message — pointers legitimately target bytes outside this record — but the labels
+    // physically present in the RDATA cannot run past the length the record declared.
+    //
+    // Left unchecked, the record's content and its declared length disagree, and the two
+    // are read by different parties: this decoder returns a name assembled from the next
+    // record's bytes while the outer cursor steps over exactly RDLENGTH and carries on as
+    // if nothing happened. Every later record then describes something other than what
+    // the sender wrote.
+
+    const header = [_]u8{
+        0x00, 0x01, // id
+        0x80, 0x00, // response
+        0x00, 0x00, // qdcount
+        0x00, 0x01, // ancount
+        0x00, 0x00, 0x00, 0x00, // nscount, arcount
+    };
+
+    // A CNAME whose RDLENGTH is 2 but whose RDATA holds a five-byte name plus root.
+    {
+        var wire: [64]u8 = undefined;
+        var len: usize = 0;
+        @memcpy(wire[0..header.len], &header);
+        len += header.len;
+        const record = [_]u8{
+            0x01, 'a', 0x00, // name: "a."
+            0x00, 0x05, // type CNAME
+            0x00, 0x01, // class IN
+            0x00, 0x00, 0x00, 0x3c, // ttl
+            0x00, 0x02, // RDLENGTH: two octets
+            0x03, 'w', 'w', 'w', 0x00, // RDATA: five, which is three too many
+        };
+        @memcpy(wire[len..][0..record.len], &record);
+        len += record.len;
+        try testing.expectError(error.BadRecord, decode(wire[0..len]));
+    }
+
+    // The same overrun through an MX exchange, which starts two bytes into the RDATA.
+    {
+        var wire: [64]u8 = undefined;
+        var len: usize = 0;
+        @memcpy(wire[0..header.len], &header);
+        len += header.len;
+        const record = [_]u8{
+            0x01, 'a', 0x00,
+            0x00, 0x0f, // type MX
+            0x00, 0x01,
+            0x00, 0x00,
+            0x00, 0x3c,
+            0x00, 0x04, // RDLENGTH: preference plus two
+            0x00, 0x0a, // preference
+            0x03, 'w', 'w', 'w', 0x00, // a name needing five
+        };
+        @memcpy(wire[len..][0..record.len], &record);
+        len += record.len;
+        try testing.expectError(error.BadRecord, decode(wire[0..len]));
+    }
+
+    // The other direction: RDATA longer than the name in it. Trailing bytes inside a
+    // CNAME's RDATA are not a name and not padding, so the record is not what it claims.
+    {
+        var wire: [64]u8 = undefined;
+        var len: usize = 0;
+        @memcpy(wire[0..header.len], &header);
+        len += header.len;
+        const record = [_]u8{
+            0x01, 'a', 0x00,
+            0x00, 0x05, // type CNAME
+            0x00, 0x01,
+            0x00, 0x00,
+            0x00, 0x3c,
+            0x00, 0x07, // RDLENGTH: two more than the name needs
+            0x03, 'w',
+            'w',  'w',
+            0x00, 0xff,
+            0xff,
+        };
+        @memcpy(wire[len..][0..record.len], &record);
+        len += record.len;
+        try testing.expectError(error.BadRecord, decode(wire[0..len]));
+    }
+
+    // And the well-formed case still decodes, including a compressed exchange whose
+    // pointer reaches outside the RDATA — which is the whole point of compression.
+    {
+        var wire: [64]u8 = undefined;
+        var len: usize = 0;
+        @memcpy(wire[0..header.len], &header);
+        len += header.len;
+        const name_at: u8 = @intCast(len);
+        const record = [_]u8{
+            0x03, 'w', 'w', 'w', 0x00, // name: "www."
+            0x00, 0x05, // type CNAME
+            0x00, 0x01,
+            0x00, 0x00,
+            0x00, 0x3c,
+            0x00, 0x02, // RDLENGTH: exactly a pointer
+            0xc0, name_at, // RDATA: back to the record's own name
+        };
+        @memcpy(wire[len..][0..record.len], &record);
+        len += record.len;
+        const message = try decode(wire[0..len]);
+        try testing.expectEqual(@as(usize, 1), message.answer_len);
+        try testing.expect(message.answers[0].data.name.eqlText("www"));
+    }
 }
