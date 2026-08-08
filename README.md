@@ -725,7 +725,11 @@ Design constraints the code holds itself to:
   `Io`. Both are parameters, which is what makes the framework testable without
   sockets and lets the application choose its I/O backend.
 * **Bounded resources.** Every buffer, queue and protocol limit has an explicit,
-  caller-visible maximum. A peer cannot make Zinet allocate without bound.
+  caller-visible maximum. A peer cannot make Zinet allocate without bound. That now includes
+  the one resource a peer can exhaust by doing nothing but connecting: `max_connections`
+  refuses past a stated ceiling and counts the refusals separately from failures, because
+  "at the capacity you configured" and "unable to serve" are different facts. It was the last
+  unbounded resource in a codebase whose whole argument is that there are none.
 * **Assertions.** Invariants, preconditions and postconditions are asserted;
   they compile away in `ReleaseFast`.
 * **Explicit state machines.** Protocol parsers are flat state machines rather

@@ -85,6 +85,27 @@ pub const ServerOptions = struct {
     workers: ?*EventLoopGroup = null,
     /// Loop count for the server-owned worker group. Null means one per CPU.
     worker_count: ?usize = null,
+    /// The most connections this server will serve at once. Null accepts as many as the
+    /// runtime will start tasks for.
+    ///
+    /// This is the bound that was missing while every other resource had one. `src/root.zig`
+    /// states that "every buffer, queue and protocol limit has an explicit, caller-visible
+    /// maximum" — and the one resource a peer can actually exhaust, the task budget, had
+    /// none. Without it a server accepts until `Io.concurrent` refuses, which turns a
+    /// capacity decision into whatever the runtime happens to do under pressure, at the
+    /// moment it is already under pressure.
+    ///
+    /// Measured behaviour, for choosing a value: on `std.Io.Threaded` a connection costs two
+    /// tasks and 2048 of them were served with no refusals, throughput declining from 39 k
+    /// to 25 k req/s (bench/README.md). So the ceiling is a *policy* about the service you
+    /// want, not a workaround for a cliff — at these sizes there is no cliff. Above it,
+    /// connections are closed immediately and counted in `stats.refused_at_capacity`, which
+    /// is how a load balancer learns to send traffic elsewhere.
+    ///
+    /// Counted against the connections this server's worker group is serving. With a shared
+    /// group that is the group's total rather than this server's share, for the same reason
+    /// `shutdown` cannot narrow to one server: `Io.Group` has no per-registrant view.
+    max_connections: ?usize = null,
     child: ChildConfig = .{},
     listen: Io.net.IpAddress.ListenOptions = .{ .reuse_address = true },
     /// Concurrent acceptor tasks. More than one helps only when accept itself
@@ -105,6 +126,9 @@ pub const Server = struct {
     child: ChildConfig,
     acceptors: Io.Group,
     acceptor_count: usize,
+    /// The ceiling from `ServerOptions.max_connections`, kept because `admit` runs on an
+    /// acceptor task long after `listen` returned.
+    max_connections: ?usize,
     state: std.atomic.Value(State),
     stats: Stats,
 
@@ -112,7 +136,14 @@ pub const Server = struct {
 
     pub const Stats = struct {
         accepted: std.atomic.Value(u64) = .init(0),
+        /// Connections dropped because something failed: no memory for a channel, or no
+        /// loop able to start its tasks.
         rejected: std.atomic.Value(u64) = .init(0),
+        /// Connections closed immediately because `max_connections` was reached. Separate
+        /// from `rejected` on purpose: one is the server failing, the other is the server
+        /// doing exactly what it was configured to do, and an operator reading a dashboard
+        /// needs to tell those apart.
+        refused_at_capacity: std.atomic.Value(u64) = .init(0),
         accept_failures: std.atomic.Value(u64) = .init(0),
     };
 
@@ -147,6 +178,7 @@ pub const Server = struct {
             .child = options.child,
             .acceptors = .init,
             .acceptor_count = options.acceptor_count,
+            .max_connections = options.max_connections,
             .state = .init(.idle),
             .stats = .{},
         };
@@ -171,6 +203,13 @@ pub const Server = struct {
         const gpa = server.gpa;
         server.* = undefined;
         gpa.destroy(server);
+    }
+
+    /// Connections currently being served, which is what `max_connections` is compared
+    /// against. Exposed because a ceiling nobody can see the distance to is a ceiling that
+    /// gets discovered by hitting it.
+    pub fn liveCount(server: *const Server) usize {
+        return server.workers.activeCount();
     }
 
     /// The address actually bound, including the port the kernel chose when 0
@@ -322,6 +361,16 @@ pub const Server = struct {
 
     /// Turns an accepted stream into a running channel, or closes it.
     fn admit(server: *Server, stream: Io.net.Stream) void {
+        // Checked before a channel exists: refusing after allocating one would spend the
+        // memory of a connection that is not going to be served.
+        if (server.max_connections) |limit| {
+            if (server.liveCount() >= limit) {
+                stream.close(server.io);
+                _ = server.stats.refused_at_capacity.fetchAdd(1, .monotonic);
+                return;
+            }
+        }
+
         const channel = Channel.create(.{
             .gpa = server.gpa,
             .io = server.io,
@@ -1076,4 +1125,114 @@ test "Server: shutting down one server does not cut another's connections" {
     try orphan_writer.interface.writeAll("orphan");
     try orphan_writer.interface.flush();
     try testing.expectEqualStrings("ORPHAN", try orphan_reader.interface.take(6));
+}
+
+test "Server: a connection ceiling refuses rather than accepting without limit" {
+    // The bound that every other resource in this framework had and this one did not. Without
+    // it a server accepts until `Io.concurrent` refuses to start a task, which means the
+    // capacity decision is made by the runtime, under pressure, at the worst possible moment
+    // — and the operator has no way to state a policy or to see how close to it they are.
+    //
+    // Refusal is a *close*, immediately, before a channel is allocated: spending memory on a
+    // connection that will not be served is the opposite of what a ceiling is for. And it is
+    // counted separately from `rejected`, because "the server is at the capacity you gave it"
+    // and "the server failed to serve a connection" are different facts about a deployment.
+    const gpa = testing.allocator;
+    var threaded = try backend.Runtime.init(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try Server.listen(.{
+        .gpa = gpa,
+        .io = io,
+        .address = .{ .ip4 = .loopback(0) },
+        .worker_count = 1,
+        .max_connections = 2,
+        .child = .{ .initializer = .initFunction(buildShoutPipeline) },
+    });
+    defer server.deinit();
+    try server.serve();
+
+    var address = server.boundAddress();
+
+    // Two connections, both served.
+    var first = try address.connect(io, .{ .mode = .stream });
+    // Closed explicitly further down, to free a slot; the flag is what keeps that from being
+    // a second close of the same descriptor.
+    var first_closed = false;
+    defer if (!first_closed) first.close(io);
+    var second = try address.connect(io, .{ .mode = .stream });
+    defer second.close(io);
+
+    var first_write: [64]u8 = undefined;
+    var first_writer = first.writer(io, &first_write);
+    var first_read: [64]u8 = undefined;
+    var first_reader = first.reader(io, &first_read);
+    try first_writer.interface.writeAll("one");
+    try first_writer.interface.flush();
+    try testing.expectEqualStrings("ONE", try first_reader.interface.take(3));
+
+    var second_write: [64]u8 = undefined;
+    var second_writer = second.writer(io, &second_write);
+    var second_read: [64]u8 = undefined;
+    var second_reader = second.reader(io, &second_read);
+    try second_writer.interface.writeAll("two");
+    try second_writer.interface.flush();
+    try testing.expectEqualStrings("TWO", try second_reader.interface.take(3));
+
+    try testing.expectEqual(@as(usize, 2), server.liveCount());
+
+    // The third is refused. TCP completes — the kernel's backlog does that without asking the
+    // application — so what the client observes is a connection that closes without answering,
+    // which is exactly what a server at capacity should look like.
+    {
+        var third = try address.connect(io, .{ .mode = .stream });
+        defer third.close(io);
+
+        // The counter first, with a bound, and only then the read. Asserting through the read
+        // alone would mean that a server *without* a ceiling — which serves this connection
+        // and waits for it to say something — leaves the test blocked forever instead of
+        // failing it. A test that wedges when the behaviour regresses is worse than no test:
+        // it teaches people to kill the suite rather than read it.
+        const refused_by = Io.Timestamp.now(io, .awake).addDuration(.fromSeconds(5));
+        while (server.stats.refused_at_capacity.load(.acquire) == 0) {
+            if (Io.Timestamp.now(io, .awake).nanoseconds >= refused_by.nanoseconds) break;
+            try io.sleep(.fromMilliseconds(2), .awake);
+        }
+        try testing.expectEqual(@as(u64, 1), server.stats.refused_at_capacity.load(.acquire));
+
+        // Nothing is written on it, so the refusal is observed as end of stream: a plain FIN.
+        // Writing first would make the server's close produce a reset instead, and then this
+        // would be an assertion about which error name the platform picks.
+        var third_read: [64]u8 = undefined;
+        var third_reader = third.reader(io, &third_read);
+        try testing.expectError(error.EndOfStream, third_reader.interface.take(1));
+    }
+
+    try testing.expectEqual(@as(u64, 1), server.stats.refused_at_capacity.load(.acquire));
+    // Refused at capacity is not a failure, and the two counters do not bleed into each other.
+    try testing.expectEqual(@as(u64, 0), server.stats.rejected.load(.acquire));
+    try testing.expectEqual(@as(u64, 2), server.stats.accepted.load(.acquire));
+
+    // And the ceiling is a ceiling on *live* connections, not a lifetime quota: when one ends,
+    // the next one in is served.
+    first.close(io);
+    first_closed = true;
+    const deadline = Io.Timestamp.now(io, .awake).addDuration(.fromSeconds(5));
+    while (server.liveCount() > 1) {
+        if (Io.Timestamp.now(io, .awake).nanoseconds >= deadline.nanoseconds) break;
+        try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    try testing.expectEqual(@as(usize, 1), server.liveCount());
+
+    var fourth = try address.connect(io, .{ .mode = .stream });
+    defer fourth.close(io);
+    var fourth_write: [64]u8 = undefined;
+    var fourth_writer = fourth.writer(io, &fourth_write);
+    var fourth_read: [64]u8 = undefined;
+    var fourth_reader = fourth.reader(io, &fourth_read);
+    try fourth_writer.interface.writeAll("four");
+    try fourth_writer.interface.flush();
+    try testing.expectEqualStrings("FOUR", try fourth_reader.interface.take(4));
+    try testing.expectEqual(@as(u64, 1), server.stats.refused_at_capacity.load(.acquire));
 }
