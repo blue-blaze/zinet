@@ -158,6 +158,58 @@ pub const Headers = struct {
     }
 };
 
+/// How a header block's `Transfer-Encoding` reads, once every field line and every
+/// element has been taken into account (RFC 9112 §6.1 with §5.2's rule that repeated
+/// field lines are one comma-separated list).
+///
+/// Asking "does the token `chunked` appear anywhere" is not enough, and the difference is
+/// a framing disagreement rather than a nicety: `chunked, gzip` has a body this decoder
+/// would read as plain chunked, `gzip, chunked` has one it cannot undo, and `chunked,
+/// chunked` is forbidden outright. A hop that guesses differently from the next hop is
+/// where request smuggling lives, so anything other than exactly one `chunked` in final
+/// position is refused rather than interpreted.
+pub const TransferCoding = enum {
+    /// No `Transfer-Encoding` field at all.
+    absent,
+    /// Exactly one coding, `chunked`.
+    chunked,
+    /// Anything else: another coding, `chunked` not last, or `chunked` more than once.
+    unsupported,
+
+    pub fn of(headers: *const Headers) TransferCoding {
+        var seen_any = false;
+        var codings: usize = 0;
+        var chunked_count: usize = 0;
+
+        for (headers.items()) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.name, "transfer-encoding")) continue;
+            seen_any = true;
+            var elements = std.mem.splitScalar(u8, entry.value, ',');
+            while (elements.next()) |raw| {
+                const coding = std.mem.trim(u8, raw, " \t");
+                // An empty element is what `Transfer-Encoding: chunked,` produces. §5.6.1
+                // lets a recipient ignore empty list elements, and ignoring one cannot
+                // change which coding is last.
+                if (coding.len == 0) continue;
+                if (std.ascii.eqlIgnoreCase(coding, "chunked")) chunked_count += 1;
+                codings += 1;
+            }
+        }
+
+        if (!seen_any) return .absent;
+        // Two conditions, because this decoder undoes exactly one coding. That collapses
+        // the whole of §6.1 — chunked last, chunked at most once, no coding we cannot
+        // reverse — into "the list is one element and that element is chunked": `gzip,
+        // chunked`, `chunked, gzip` and `chunked, chunked` all have two elements, and a
+        // present-but-empty field has none. Separate checks for ordering and multiplicity
+        // were written first and no input could tell them from these two, which is the
+        // signal that they were the same rule spelled three times.
+        if (codings != 1) return .unsupported;
+        if (chunked_count != 1) return .unsupported;
+        return .chunked;
+    }
+};
+
 /// A decoded request. Owns the arena its strings live in.
 pub const Request = struct {
     arena: std.heap.ArenaAllocator,
@@ -639,17 +691,17 @@ pub const RequestDecoder = struct {
         }
 
         const has_length = headers.has("content-length");
-        const chunked = headers.hasToken("transfer-encoding", "chunked");
+        const coding: TransferCoding = .of(headers);
 
         // Both framings at once is the canonical request smuggling setup.
-        if (has_length and headers.has("transfer-encoding")) {
+        if (has_length and coding != .absent) {
             return error.ConflictingFraming;
         }
-        if (headers.has("transfer-encoding") and !chunked) {
+        if (coding == .unsupported) {
             return error.UnsupportedTransferEncoding;
         }
 
-        if (chunked) {
+        if (coding == .chunked) {
             self.body = .empty;
             self.state = .chunk_size;
             return null;
@@ -1674,17 +1726,17 @@ pub const ResponseDecoder = struct {
         }
 
         const has_length = headers.has("content-length");
-        const chunked = headers.hasToken("transfer-encoding", "chunked");
+        const coding: TransferCoding = .of(headers);
 
-        if (has_length and headers.has("transfer-encoding")) {
+        if (has_length and coding != .absent) {
             return error.ConflictingFraming;
         }
-        if (headers.has("transfer-encoding") and !chunked) {
+        if (coding == .unsupported) {
             return error.UnsupportedTransferEncoding;
         }
 
         // 2. Chunked.
-        if (chunked) {
+        if (coding == .chunked) {
             self.body = .empty;
             self.state = .chunk_size;
             return null;
@@ -2163,6 +2215,32 @@ test "RequestDecoder: request smuggling vectors are rejected" {
         // A Transfer-Encoding this decoder will not interpret.
         .{
             .wire = "POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
+            .want = error.UnsupportedTransferEncoding,
+        },
+        // RFC 9112 §6.1: chunked must be the *final* coding. Asking whether `chunked`
+        // appears anywhere accepts this and then decodes it as though gzip were absent,
+        // which is a body boundary this decoder and the next hop can disagree about.
+        .{
+            .wire = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n",
+            .want = error.UnsupportedTransferEncoding,
+        },
+        // The same list the other way round: chunked is final, but gzip is a coding this
+        // decoder cannot undo, so the body it would deliver is not the body that was sent.
+        .{
+            .wire = "POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+            .want = error.UnsupportedTransferEncoding,
+        },
+        // §6.1: "A sender MUST NOT apply the chunked transfer coding more than once."
+        .{
+            .wire = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked, chunked\r\n\r\n0\r\n\r\n",
+            .want = error.UnsupportedTransferEncoding,
+        },
+        // Spread across two field lines, which §5.2 says is the same list — and is the
+        // spelling an attacker reaches for when one hop joins field lines and another
+        // reads only the first.
+        .{
+            .wire = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n" ++
+                "Transfer-Encoding: gzip\r\n\r\n0\r\n\r\n",
             .want = error.UnsupportedTransferEncoding,
         },
         // Obsolete line folding.
@@ -2985,4 +3063,41 @@ test "MethodTracker: refuses to pipeline deeper than its bound" {
     try testing.expectEqual(Method.get, tracker.pop().?);
     try testing.expectEqual(Method.head, tracker.pop().?);
     try testing.expect(tracker.pop() == null);
+}
+
+test "TransferCoding: the list is read whole, not searched for a token" {
+    const gpa = testing.allocator;
+    const Case = struct { field: ?[]const []const u8, want: TransferCoding };
+    const cases = [_]Case{
+        .{ .field = null, .want = .absent },
+        .{ .field = &.{"chunked"}, .want = .chunked },
+        // Case and surrounding whitespace are not part of the token (§5.6.2, §5.1).
+        .{ .field = &.{"  ChUnKeD "}, .want = .chunked },
+        // §5.6.1: an empty list element may be ignored, and ignoring one cannot change
+        // which coding is last.
+        .{ .field = &.{"chunked,"}, .want = .chunked },
+        .{ .field = &.{",chunked"}, .want = .chunked },
+        // Present but empty is not a coding list.
+        .{ .field = &.{""}, .want = .unsupported },
+        // §6.1: chunked must be last, must appear once, and anything this decoder cannot
+        // undo makes the delivered body a different body.
+        .{ .field = &.{"chunked, gzip"}, .want = .unsupported },
+        .{ .field = &.{"gzip, chunked"}, .want = .unsupported },
+        .{ .field = &.{"chunked, chunked"}, .want = .unsupported },
+        .{ .field = &.{"gzip"}, .want = .unsupported },
+        // §5.2: repeated field lines are one list, so these two are `chunked, gzip`.
+        .{ .field = &.{ "chunked", "gzip" }, .want = .unsupported },
+        .{ .field = &.{ "gzip", "chunked" }, .want = .unsupported },
+        // And two `chunked` field lines are two applications of it.
+        .{ .field = &.{ "chunked", "chunked" }, .want = .unsupported },
+    };
+
+    for (cases) |case| {
+        var headers: Headers = .{};
+        defer headers.entries.deinit(gpa);
+        if (case.field) |lines| {
+            for (lines) |value| try headers.append(gpa, "Transfer-Encoding", value);
+        }
+        try testing.expectEqual(case.want, TransferCoding.of(&headers));
+    }
 }
