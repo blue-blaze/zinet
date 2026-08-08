@@ -14,6 +14,20 @@
 //! when the queue is full, producers block instead of growing memory without
 //! bound.
 //!
+//! Whether that second task is worth its cost has been measured rather than argued. A
+//! variant that removed it — writing straight to the socket from whichever task called
+//! `write`, with no queue and no writer task — was built, benchmarked and thrown away:
+//!
+//! * one connection, 64-byte echo: 17.9 k round trips/s and 56 µs against 16.8 k and 60 µs,
+//!   so about 6 % and 4 µs;
+//! * thirty-two connections: 44.5 k round trips/s against 45.4 k — no gain, marginally worse.
+//!
+//! The queue hop is not what limits this path; the syscalls are. And the price of keeping the
+//! variant would have been two implementations of "how a write reaches the socket", which is
+//! the shape this codebase has found drifting apart more often than any other, plus the
+//! ordering guarantee that `close` travels the same queue as writes — the reason there is no
+//! `ChannelPromise` here at all. Six percent at a concurrency of one does not buy that.
+//!
 //! ```
 //!  reader task                        writer task
 //!  -----------                        -----------

@@ -105,3 +105,19 @@ Reading these numbers honestly:
   why this table can exist at all.
 * These are loopback numbers with both processes competing for the same cores, so they
   understate throughput and overstate latency relative to a real deployment.
+
+## Questions this harness has settled
+
+Isolation made two long-standing design arguments answerable, and both answers were the
+opposite of the assumption:
+
+* **Is the concurrency budget the binding constraint on threads?** No, not at these sizes:
+  2048 connections is 4096 tasks and all of them were served. See `max_connections` in
+  `ServerOptions`, which exists as a *policy* rather than as a guard against a cliff.
+* **Would eliding the per-connection writer task pay for itself?** No. A variant with no
+  writer task and no outbound queue — writing straight to the socket from whichever task
+  called `write` — was built and measured: 6 % better at one connection, nothing at
+  thirty-two. The queue hop is not the limit, and a second write path would cost two
+  implementations of one rule plus the close-ordering guarantee that removes the need for
+  futures. The spike was reverted; the numbers are in `src/channel.zig`'s module comment so
+  the next person to have the idea finds the measurement before writing the code.
