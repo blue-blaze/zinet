@@ -1157,12 +1157,23 @@ test "http3 server: a client that moves to a new socket keeps its connection" {
     try testing.expectEqual(@as(usize, 0), server.addressMoves());
 
     const before = client.localAddress();
-    try client.migrate(false);
-    const after = client.localAddress();
-    // A genuinely different local address, or the test would prove nothing: the
-    // kernel assigns the port, and asserting they differ is what makes this a
-    // migration rather than a reopened socket.
-    try testing.expect(!std.meta.eql(before, after));
+    // A genuinely different local address, or the test would prove nothing: the kernel assigns
+    // the port, and a move to the same address is not a new path, so the server would rightly
+    // never report one.
+    //
+    // Retried because the kernel may hand back the port the previous socket just freed, which
+    // makes a run inconclusive rather than wrong. That is not hypothetical — it happened once
+    // under the load of a full `zig build check`, and a test that fails for a legal kernel
+    // choice is a test that gets ignored. The bound is small on purpose: §9.5 needs a spare
+    // connection ID per move, and `active_connection_id_limit` is 4, so an unbounded retry
+    // would trade one flake for another.
+    var attempts: usize = 0;
+    var after = before;
+    while (std.meta.eql(before, after) and attempts < 3) : (attempts += 1) {
+        try client.migrate(false);
+        after = client.localAddress();
+    }
+    if (std.meta.eql(before, after)) return error.KernelReusedTheEphemeralPort;
 
     // §9.1: the packet the move produces carries RETIRE_CONNECTION_ID for the ID it
     // left behind (§5.1.2), and that is *not* a probing frame — which is what makes

@@ -1041,3 +1041,55 @@ Worth separating the two, because they are different kinds of finding. The first
 lying about the code. The second was the code being wrong in a way only the harness could show:
 every test in this repository sends a handful of requests, and this needed a hundred in flight
 before the rule that governs them misfired.
+
+## What comparing against another framework found
+
+[velo](https://github.com/blue-blaze/velo) is a pure-Zig web framework on `std.Io` with the same
+influences and no third-party dependencies — near enough a peer that its numbers are worth being
+measured against, and it ships a load generator with a pipelining depth flag. Running that
+generator against both servers, one at a time on the same machine, found something this
+repository's own benchmarks could not have.
+
+**At pipeline depth 64 the two served within 5 % of the same requests per second, and this server
+spent 9.0 µs of CPU per request against velo's 1.6 µs.** The throughput column hid it because the
+generator was near saturation; the CPU column is the one that survives a saturated client, which
+is exactly why velo's own README leads with it.
+
+The cause was one `sendmsg` per response. `ctx.writeAndFlush` queues bytes and then a flush, and
+the writer task honoured every flush — so 64 pipelined responses cost 64 syscalls where one would
+do. The writer now takes everything already queued in one pass and flushes once: 294 k req/s
+became 440 k, CPU per request 9.0 µs became 1.51 µs, and the p99 halved. That also puts this server
+ahead of velo at 8 connections and level with it at 64.
+
+Both wrong turns on the way are worth keeping, because each is a general shape.
+
+**A counter that is not updated atomically with the thing it counts cannot answer "is the queue
+empty".** The first attempt read the channel's `pending` counter to decide whether more work was
+queued. `pending` is incremented *after* `putOne`, so the writer can take an item and decrement
+before the producer has counted it; the counter momentarily reads non-zero on an empty queue, and
+a writer that trusts it skips the flush and then blocks holding the only copy of the response.
+Every request timed out. The queue's own `get` answers the question atomically because it is the
+only thing that can.
+
+**A batching rule must not look past the end of the connection.** The second attempt deferred
+every flush to the end of the batch. When a batch was `[flush, close]` the deferred flush ran in
+the close prong — by which time the socket was no longer writable — and a closing handshake's
+farewell went missing. Two existing tests caught it, which is the system working: the rule is now
+narrow (defer only while more *data* follows in the same batch) and it is in the mutation
+catalogue, so the next person to widen it has to argue with a failing test rather than with a
+comment.
+
+One unrelated flake surfaced while verifying all this, and it is recorded because its diagnosis is
+the interesting half. The HTTP/3 migration test asserts that the client's local address *changed*
+after `migrate`, which is what makes the run a migration rather than a reopened socket. Under the
+load of a full `zig build check` it failed once: the kernel handed back the ephemeral port the
+previous socket had just freed. That is a legal choice, and a move to the same address is not a new
+path — so the run was inconclusive rather than wrong, and the test now retries a bounded three
+times and names the cause if it never gets a different port. The bound is small deliberately: §9.5
+spends a spare connection ID per move and `active_connection_id_limit` is 4, so an unbounded retry
+would trade one flake for another.
+
+The general lesson is about the *choice of metric* rather than about writes. Every benchmark in
+this repository reports throughput and latency, and both were within noise of a competitor while a
+5.5x difference in cost per request sat underneath them. A saturated client makes throughput a
+measurement of the client; CPU per request is what stays a measurement of the server.

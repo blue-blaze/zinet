@@ -183,6 +183,76 @@ Six things follow.
   in this repository's code and 0.6 % in the allocator. There is no remaining hot spot to
   optimise here; the lever is fewer and larger syscalls, which is what multiplexing already is.
 
+### Against velo, through velo's own load generator
+
+[velo](https://github.com/blue-blaze/velo) is the closest thing to a peer this repository has: a
+pure-Zig web framework on `std.Io`, HTTP/1.1 through HTTP/3, the same style guides, no third-party
+dependencies in its default build. Comparing against it is more useful than comparing against
+`nginx`, and it is also harder to do honestly, so the method comes first.
+
+**The method.** velo ships a Go load generator with a `-depth` flag for HTTP/1.1 pipelining, and
+that generator was used for both servers — one at a time, on the same port, on this machine, with
+a discarded warm-up run before each measured one. Both servers are ReleaseFast. velo is built with
+Zig 0.16.0 because it pins that release; Zinet needs 0.17.0-dev, so **the two are not compiled by
+the same compiler**, which is a real caveat and not one either project can remove. CPU per request
+is a `cputime` delta taken around the measured window only.
+
+**Why the depth axis decides everything.** At one request per connection a client's `write` and
+`read` cost more than "hello world" costs either server, so the number measures the generator and
+both land in the same place. velo's own README says this about its own table, and it is worth
+repeating rather than discovering. Pipelining moves the bottleneck to the server, which is the
+only condition under which a throughput column means anything.
+
+| 8 connections | Zinet | velo |
+|---|---|---|
+| depth 1 | 40.7 k req/s, p99 503 µs, 40.3 µs CPU/req | 46.1 k req/s, p99 294 µs, 33.7 µs CPU/req |
+| depth 64 | **440.4 k req/s**, p99 **87 µs**, **1.51 µs** CPU/req | 310.3 k req/s, p99 174 µs, 1.65 µs CPU/req |
+
+| 64 connections | Zinet | velo |
+|---|---|---|
+| depth 1 | 44.2 k req/s, 43.7 µs CPU/req | 46.4 k req/s, 33.7 µs CPU/req |
+| depth 64 | 467.4 k req/s, **1.48 µs** CPU/req | **480.3 k req/s**, 1.61 µs CPU/req |
+
+Resident memory and threads, at 64 connections: Zinet 38 MB and 130 threads, velo 7 MB and 67.
+Both differences are design rather than waste. The threads are two tasks per connection — a reader
+and a writer — against velo's one, which is the cost of `Channel.write` being callable from any
+task; the memory is the `BufferPool`, which is preallocated and bounded on purpose. Neither is
+free and both are stated in the architecture rather than being surprises.
+
+**What the comparison found.** The depth-64 row started out very differently: Zinet served 294 k
+req/s to velo's 310 k, and spent **9.0 µs of CPU per request against velo's 1.6 µs**. Throughput
+hid it, because the generator was near saturation; CPU per request did not, which is why it is the
+column to read when the client is the limit.
+
+The cause was one syscall per response. `ctx.writeAndFlush` queues bytes and then a flush, and the
+writer task flushed on every one — so a batch of 64 pipelined responses cost 64 `sendmsg` calls
+where one would do. The writer now takes everything queued in one pass and flushes once, which is
+the change velo's README names as its own biggest single win. 294 k became 440 k, CPU per request
+9.0 µs became 1.51 µs, and the p99 halved.
+
+Two things about that change are worth keeping, both of them corrections to how it was first
+written:
+
+* **A flush may not be deferred past a close.** The first version deferred every flush to the end
+  of the batch, which lost a closing handshake's farewell: the flush that would have carried it
+  ran in the close prong, by which time the socket was no longer writable. Two tests caught it.
+  The rule is now narrow — defer only while more *data* follows in the same batch — and it is in
+  the mutation catalogue, because a batching rule that looks past the end of a connection is not a
+  batching rule.
+* **The queue's own count is the only trustworthy one.** The first attempt used the channel's
+  `pending` counter to decide whether more work was queued. It deadlocked: `pending` is
+  incremented *after* the item is put, so the writer can take and decrement before the producer
+  counts, and the counter momentarily reads non-zero on an empty queue. A writer that trusts it
+  skips the flush and blocks holding the only copy of the response.
+
+**What this comparison does not say.** Nothing about HTTP/2 or HTTP/3 — velo's HTTP/3 runs over
+OpenSSL's QUIC by default where this one is self-written, and its HTTP/2 client is deliberately
+non-multiplexing, so the interesting axes are not the same. Nothing about features: velo is a web
+framework with routing, extractors, middleware and sessions, and Zinet is a Netty-shaped network
+framework with codecs; the HTTP/1.1 hot path is the one place they answer the same question.
+Nothing about a real network, since both sides shared one machine over loopback. And nothing about
+compilers, for the reason given above.
+
 **Echo, both sides threaded**, 32 connections and a 1 KiB payload: 45.4 k round trips/s,
 44.3 MiB/s each way, 704 µs mean, 4.6 ms worst, pool hit rate 100 %.
 
@@ -224,6 +294,12 @@ opposite of the assumption:
 * **Is the concurrency budget the binding constraint on threads?** No, not at these sizes:
   2048 connections is 4096 tasks and all of them were served. See `max_connections` in
   `ServerOptions`, which exists as a *policy* rather than as a guard against a cliff.
+* **Is one syscall per response worth avoiding?** Yes, and by more than the throughput column
+  showed. A pipelined batch of 64 responses used to cost 64 `sendmsg` calls; batching them into
+  one took CPU per request from 9.0 µs to 1.51 µs and the p99 at depth 64 from 174 µs to 87 µs.
+  It was found by comparing against velo through velo's load generator — the throughput was
+  within 5 %, so nothing but the CPU column would have shown it. See the section above for the
+  two ways the first version of the change was wrong.
 * **Why were HTTP/2 and HTTP/3 slower than HTTP/1.1?** They were not; the harness was. Every
   benchmark used `DebugAllocator`, which returns pages to the kernel as it frees, and HTTP/2 and
   HTTP/3 allocate a stream channel, a pipeline and a handler per request where an HTTP/1.1

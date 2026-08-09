@@ -899,6 +899,11 @@ pub const Channel = struct {
     }
 
     /// Body of the writer task: drains the outbound queue into the socket.
+    /// How many queued items one pass of the writer may take. An explicit bound like every
+    /// other queue here, and the reason it is more than one is measured rather than assumed:
+    /// see `writeLoop`.
+    const write_batch_max = 32;
+
     fn writeLoop(channel: *Channel) void {
         const io = channel.io;
         // Declared first so it runs last: by then the queue is closed, so the
@@ -907,30 +912,99 @@ pub const Channel = struct {
         defer channel.outbound.close(io);
 
         var writer = channel.stream.writer(io, channel.write_buffer);
-        while (true) {
-            var item = channel.outbound.getOne(io) catch break;
-            _ = channel.pending.fetchSub(1, .monotonic);
-            switch (item) {
-                .data => |*msg| {
-                    defer msg.deinit(channel.gpa);
-                    const bytes = msg.bytes() orelse continue;
-                    writer.interface.writeAll(bytes) catch break;
-                    channel.stats.bytes_written += bytes.len;
-                    channel.stats.writes += 1;
-                },
-                .flush => {
-                    writer.interface.flush() catch break;
-                    channel.stats.flushes += 1;
-                },
-                .close => {
-                    writer.interface.flush() catch {};
-                    // Shutting down both directions also unblocks the reader.
-                    channel.stream.shutdown(io, .both) catch {};
-                    break;
-                },
+        var batch: [write_batch_max]Outbound = undefined;
+        outer: while (true) {
+            // Everything already queued, in one pass, so that a batch of responses becomes one
+            // `sendmsg` rather than one per response. `min` is 1, so this blocks until there is
+            // work and then takes whatever else is there.
+            //
+            // Deferring the flush to the end of the batch cannot delay anything the application
+            // is waiting on: the only items whose flush is skipped are those with more work
+            // *already queued behind them*, which means the producer did not wait for that
+            // flush before making the rest.
+            //
+            // Measured against velo through the same load generator: at pipeline depth 64 both
+            // servers served about the same requests per second, because the generator is the
+            // limit there — while this one spent 9.0 µs of CPU per request against velo's
+            // 1.6 µs. Throughput hides a syscall; CPU per request does not.
+            //
+            // An earlier attempt used the `pending` counter to decide whether more work was
+            // queued. It deadlocked, and the reason is worth keeping: `pending` is incremented
+            // *after* `putOne`, so the writer can take an item and decrement before the producer
+            // has counted it. The counter momentarily reads non-zero when the queue is empty —
+            // or wraps below zero — and a writer that trusts it skips the flush and then blocks
+            // holding the only copy of the response. The queue's own `get` is the answer,
+            // because "how many are there" is a question only the queue can answer atomically.
+            const taken = channel.outbound.get(io, &batch, 1) catch break;
+            var flush_wanted = false;
+            var index: usize = 0;
+            while (index < taken) : (index += 1) {
+                _ = channel.pending.fetchSub(1, .monotonic);
+                switch (batch[index]) {
+                    .data => |*msg| {
+                        defer msg.deinit(channel.gpa);
+                        const bytes = msg.bytes() orelse continue;
+                        writer.interface.writeAll(bytes) catch {
+                            channel.freeBatch(batch[index + 1 .. taken]);
+                            break :outer;
+                        };
+                        channel.stats.bytes_written += bytes.len;
+                        channel.stats.writes += 1;
+                    },
+                    // Deferred only when more *data* follows it in this same batch, in which
+                    // case a later flush in the batch covers these bytes too. Never deferred
+                    // across a `.close`: the close prong flushes, and if that flush is the one
+                    // carrying the bytes it can fail, because closing is exactly when the
+                    // socket stops being writable. That cost two tests — a closing handshake's
+                    // farewell went missing — and the shape of the bug is worth keeping in
+                    // view: a batching rule that looks past the end of the connection is not a
+                    // batching rule.
+                    .flush => if (moreDataFollows(batch[index + 1 .. taken])) {
+                        flush_wanted = true;
+                    } else {
+                        writer.interface.flush() catch break :outer;
+                        channel.stats.flushes += 1;
+                        flush_wanted = false;
+                    },
+                    .close => {
+                        writer.interface.flush() catch {};
+                        // Shutting down both directions also unblocks the reader.
+                        channel.stream.shutdown(io, .both) catch {};
+                        channel.freeBatch(batch[index + 1 .. taken]);
+                        break :outer;
+                    },
+                }
+            }
+            if (flush_wanted) {
+                writer.interface.flush() catch break;
+                channel.stats.flushes += 1;
             }
         }
         writer.interface.flush() catch {};
+    }
+
+    /// Whether the rest of this batch has data whose flush will cover the bytes already
+    /// buffered. A `.close` ends the search: nothing after it will be written.
+    fn moreDataFollows(rest: []const Outbound) bool {
+        for (rest) |item| switch (item) {
+            .data => return true,
+            .flush => {},
+            .close => return false,
+        };
+        return false;
+    }
+
+    /// Releases items taken from the queue but not written, which a batch leaves possible: a
+    /// close or a write failure ends the pass with items already copied out of the queue, where
+    /// `drainOutbound` can no longer see them.
+    fn freeBatch(channel: *Channel, items: []Outbound) void {
+        for (items) |*item| {
+            _ = channel.pending.fetchSub(1, .monotonic);
+            switch (item.*) {
+                .data => |*msg| msg.deinit(channel.gpa),
+                .flush, .close => {},
+            }
+        }
     }
 
     /// Frees whatever is left in the outbound queue. Must only run once the

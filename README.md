@@ -706,6 +706,16 @@ against HTTP/1.1's 45 k ceiling, because a connection here is one reader task an
 what stops the syscall being a per-request cost. Under load the server is syscall-bound: 81 % of
 its profile is `readv` and `__sendmsg`, 9 % this code.
 
+Measured against [velo](https://github.com/blue-blaze/velo) — a pure-Zig framework on `std.Io`,
+close enough to a peer to be worth the comparison — through **velo's own load generator**, one
+server at a time on the same machine: at pipeline depth 64 and 8 connections this serves 440 k
+req/s to velo's 310 k with a p99 of 87 µs against 174 µs, and at 64 connections 467 k to velo's
+480 k. At depth 1 both are generator-bound and velo is ~12 % ahead. That comparison is also what
+found the last real inefficiency in the write path: throughput was within 5 % while this server
+spent **9.0 µs of CPU per request against velo's 1.6 µs**, because a batch of pipelined responses
+cost one `sendmsg` each. Batching them is 1.51 µs. See [bench/README.md](bench/README.md) for the
+method and its caveats — the two projects cannot even be built by the same compiler.
+
 Those numbers are two to three times what the first version of these benchmarks reported, and the
 correction is the more useful half. The benchmarks measured through the leak-checking allocator,
 which unmaps pages as it frees — so the two protocols that allocate per request paid for the

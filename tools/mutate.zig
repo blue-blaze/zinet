@@ -142,6 +142,13 @@ const catalogue = [_]Mutation{
         .because = "\"the application will keep up\" is not a bound",
     },
     .{
+        .name = "channel/flush-not-past-close",
+        .path = "src/channel.zig",
+        .find = "fn moreDataFollows(rest: []const Outbound) bool {",
+        .replace = "fn moreDataFollows(rest: []const Outbound) bool { if (rest.len >= 0) return true;",
+        .because = "batching a flush past a close loses the bytes a closing handshake exists to send",
+    },
+    .{
         .name = "http3/short-write-residue",
         .path = "src/codec/http3/connection.zig",
         .find = "if (offset == bytes.len) return;",
