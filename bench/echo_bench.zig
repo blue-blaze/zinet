@@ -20,6 +20,7 @@
 const std = @import("std");
 const backend = @import("backend");
 const zinet = @import("zinet");
+const bench_allocator = @import("allocator.zig");
 
 const HandlerContext = zinet.HandlerContext;
 const Message = zinet.Message;
@@ -138,12 +139,12 @@ fn loadConnection(
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer if (debug_allocator.deinit() == .leak) {
-        log.err("benchmark leaked memory", .{});
-        std.process.exit(1);
-    };
-    const gpa = debug_allocator.allocator();
+    // `smp_allocator` by default, `DebugAllocator` when asked: see bench/allocator.zig. The
+    // leak-checking one unmaps pages as it frees, which on a per-request allocation costs more
+    // than the network does, so measuring through it measures the harness.
+    var allocators: bench_allocator.Choice = .init(init.args);
+    defer allocators.deinit();
+    const gpa = allocators.allocator();
 
     const config = try parseConfig(gpa, init.args);
     defer gpa.free(config.exe);

@@ -38,7 +38,7 @@ handshake written here, because Netty binds Quiche and the standard library has 
 TLS server; see [HTTP3.md](HTTP3.md) and [TLS.md](TLS.md) — Redis RESP2/RESP3,
 datagram (UDP) endpoints, a DNS resolver, TLS 1.3 on both sides of a connection, a
 bounded client connection pool, and `EmbeddedChannel` for testing pipelines without
-sockets. 823 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
+sockets. 825 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
 all under a leak-checking allocator, plus twenty-two fuzz targets. The same suite
 also runs **on fibers** rather than threads — see [Choosing an `Io`](#choosing-an-io).
 
@@ -698,14 +698,25 @@ zig build bench
 ```
 
 All three HTTP versions are measured on the same axis, which makes the point of each protocol's
-machinery visible rather than assumed: one request at a time costs 77 µs on HTTP/1.1, 89 µs on
-HTTP/2 and 133 µs on HTTP/3, while 32 requests multiplexed onto a single HTTP/2 connection serve
-105 k req/s against HTTP/1.1's 42 k ceiling — because a connection here is one reader task, and
-multiplexing is what stops the syscall being a per-request cost. Writing those benchmarks found
-three HTTP/3 defects that no test, fuzz target or aioquic run had reached, each needing volume
-rather than a rule to appear: a connection that stopped serving after exactly 100 requests, an
-application that could never learn it had stream credit again, and `openStream` closing the
-connection when the *application* asked for one stream too many. See [REVIEW.md](REVIEW.md).
+machinery visible rather than assumed: one request at a time costs 59 µs on HTTP/1.1 and **the
+same 59 µs on HTTP/2** — the framing, HPACK and per-stream pipeline together are under a
+microsecond — while 73 µs on HTTP/3 is the transport's packet protection rather than the HTTP
+mapping. Multiplexed, one HTTP/2 connection serves 131 k req/s and one HTTP/3 connection 129 k
+against HTTP/1.1's 45 k ceiling, because a connection here is one reader task and multiplexing is
+what stops the syscall being a per-request cost. Under load the server is syscall-bound: 81 % of
+its profile is `readv` and `__sendmsg`, 9 % this code.
+
+Those numbers are two to three times what the first version of these benchmarks reported, and the
+correction is the more useful half. The benchmarks measured through the leak-checking allocator,
+which unmaps pages as it frees — so the two protocols that allocate per request paid for the
+harness's choice while HTTP/1.1 did not, and HTTP/2 looked slower than HTTP/1.1 when it is
+identical. The other half was ours: **an HTTP/3 connection's stream credit, not its CPU, was the
+binding constraint**, because credit was announced only when a large increment could be granted and
+a busy connection can never grant one. Writing these benchmarks also found three HTTP/3 defects
+that no test, fuzz target or aioquic run had reached, each needing volume rather than a rule to
+appear: a connection that stopped serving after exactly 100 requests, an application that could
+never learn it had stream credit again, and `openStream` closing the connection when the
+*application* asked for one stream too many. See [REVIEW.md](REVIEW.md).
 
 ## Development
 

@@ -298,22 +298,29 @@ a clock that goes backwards cannot open the gate.
 ## What it costs
 
 `zig build bench-http2_bench` measures the two axes HTTP/2 has: connections, and requests in
-flight on each. The load generator speaks HTTP/2 over a raw socket — a pre-encoded HPACK block
-and frame headers only, no decoder — so the numbers are the server's cost rather than a round
-trip through this implementation twice.
+flight on each. The load generator speaks HTTP/2 over a raw socket — a pre-encoded HPACK block and
+frame headers only, no decoder — so the numbers are the server's cost rather than a round trip
+through this implementation twice.
 
-The result is a clean statement of what multiplexing is for here. Sixty-four connections with
-one stream each serve 41.5 k req/s, which is indistinguishable from HTTP/1.1 at the same
-concurrency: with one request in flight per connection, this framing costs nothing measurable
-and buys nothing either. Thirty-two streams on **one** connection serve 105 k, and 128 streams
-on one connection 115–137 k. The mechanism is not clever scheduling — it is that one read
-gathers many requests and one write scatters many responses, so the syscall stops being a
-per-request cost.
+The result is a clean statement of what multiplexing is for here. Sixty-four connections with one
+stream each serve 44.1 k req/s, indistinguishable from HTTP/1.1's 44.9 k at the same concurrency:
+with one request in flight per connection, this framing costs nothing measurable and buys nothing
+either. Thirty-two streams on **one** connection serve 118 k, and 64 on one connection 131 k. The
+mechanism is not clever scheduling — one read gathers many requests and one write scatters many
+responses, so the syscall stops being a per-request cost. Eight connections of 128 streams reach
+396 k, which is the machine rather than a connection.
 
-Which also means the ceiling is one core: a connection here has exactly one reader task, so
-1 × 64 (125.7 k) beats 8 × 8 (88.3 k), and eight connections of 128 streams reach 142.8 k rather
-than eight times a single connection's figure. The tables are in
+At concurrency 1, where nothing batches, HTTP/2 costs **59 µs against HTTP/1.1's 59 µs** — the
+framing, HPACK and the per-stream pipeline together are under a microsecond. That equality is
+recent, and not because anything here changed: the benchmarks used to run on the leak-checking
+allocator, which unmaps pages as it frees, and a protocol that allocates per request paid for
+that while HTTP/1.1 did not. It read as 89 µs against 77 µs. The write-up is in
 [bench/README.md](bench/README.md).
+
+Under load the server is syscall-bound and nothing else: at 118 k req/s, 54 % of the working
+profile is `readv`, 27 % `__sendmsg`, 9 % this repository's code and 0.6 % the allocator. There is
+no hot spot left to remove — the only lever is fewer and larger syscalls, which is what
+multiplexing already is.
 
 ## What found the defects
 

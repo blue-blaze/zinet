@@ -180,7 +180,18 @@ pub const Parameters = struct {
         .initial_max_stream_data_bidi_local = 256 * 1024,
         .initial_max_stream_data_bidi_remote = 256 * 1024,
         .initial_max_stream_data_uni = 256 * 1024,
-        .initial_max_streams_bidi = 100,
+        // Chosen against `streams.max_concurrent`, which is the hard cap on how many streams
+        // one connection will hold state for: announcing more than that would be promising
+        // something this implementation refuses, and refusing it means closing the connection
+        // of a peer that did exactly what it was told it could do. 400 plus the 16 below leaves
+        // room under the cap for the streams this endpoint opens itself.
+        //
+        // It was 100, which made the stream allowance the binding constraint on an HTTP/3
+        // server well before its CPU was: a client keeping 32 requests in flight spent its time
+        // waiting for credit and served 77 k requests a second where 120 k was available. The
+        // number of concurrent streams costs a small struct each; what bounds the *memory* a
+        // peer can occupy is `initial_max_data` above, which is unchanged.
+        .initial_max_streams_bidi = 400,
         .initial_max_streams_uni = 16,
         .max_idle_timeout_ms = 30_000,
         .active_connection_id_limit = 4,

@@ -1006,3 +1006,38 @@ suite is built from small, precise exchanges — which is the right shape for ch
 rule and the wrong shape for checking that a connection still works on its ten-thousandth
 request. A benchmark is a load test that happens to report numbers; that it reports numbers is
 why it gets run, and finding these was worth more than the numbers were.
+
+## The benchmark that measured itself, twice
+
+Two of the three HTTP protocols looked slower than HTTP/1.1. Neither was.
+
+**Every benchmark ran on `DebugAllocator`**, because a leak failing the run is worth having. It
+also returns pages to the kernel as it frees them — and HTTP/2 and HTTP/3 allocate a stream
+channel, a pipeline and a handler per request, where an HTTP/1.1 connection allocates a request
+arena and nothing else. A profile of the HTTP/2 server settled the size of it: **51 % of the
+samples in which the server was doing anything were in the allocator**, `__munmap` alone 7 % of the
+whole profile, against 26 % in `readv` and `__sendmsg` and 11 % in the protocol. Switching to
+`smp_allocator` took HTTP/2's single-request cost from 98 µs to 59 µs — exactly HTTP/1.1's — and
+eight connections of 128 streams from 142.8 k to 396.5 k req/s. HTTP/1.1 gained almost nothing,
+which is the asymmetry in one sentence.
+
+This is the second time this repository has published numbers dominated by the harness's own
+choice: the first was measuring a TLS handshake against a Debug build. The pattern is the same and
+so is the correction — make the honest configuration the default and put the other behind a flag,
+rather than relying on remembering. `bench/allocator.zig` is the default; `leakcheck` is the flag.
+
+**The other half was real, and it was a policy inverted.** With the allocator out of the way,
+HTTP/3 was still bounded well below its CPU, and the benchmark's refusal counter said by what:
+stream credit. `maxStreamsUpdate` announced a raised limit only when it could grant at least half
+the allowance more, and the most it can *ever* grant is `initial - live`. A stream stays live until
+its FIN is acknowledged, so on a busy connection most of the allowance is live and the limit
+stopped moving at all — one connection with 128 requests in flight served 45 k req/s and spent the
+rest of its time being told no. The trigger is now the credit the *peer* has left, with a small
+floor on the increment so a frame is not spent per stream close, and the default allowance is
+chosen against `streams.max_concurrent` — the hard cap on stream state — instead of being a round
+number. 45 k became 129 k, and the refusals went to zero.
+
+Worth separating the two, because they are different kinds of finding. The first was the harness
+lying about the code. The second was the code being wrong in a way only the harness could show:
+every test in this repository sends a handful of requests, and this needed a hundred in flight
+before the rule that governs them misfired.

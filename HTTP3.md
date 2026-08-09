@@ -290,29 +290,43 @@ exercise it is worse than one that is honestly absent.
 ## What it costs, and what measuring it found
 
 `zig build bench-http3_bench` puts HTTP/3 on the same axis as the other two protocols: same
-machine, same response body, same process shape. One connection with 32 requests in flight
-serves about 42 k req/s; a single request at a time costs 133 µs against HTTP/1.1's 77 µs and
-HTTP/2's 89 µs, which is the price of packet protection and acknowledgement bookkeeping. Adding
-connections does not add throughput here, because both endpoints are on the one machine and each
-datagram is protected twice. The tables are in [bench/README.md](bench/README.md).
+machine, same response body, same process shape. One connection with 32 requests in flight serves
+about 126 k req/s and with 128 in flight 129 k, which is where HTTP/2 lands on one connection too;
+eight connections reach 155 k. At eight requests in flight HTTP/3 is *faster* than HTTP/2 — 59.6 k
+against 52.5 k — because eight small responses coalesce into fewer datagrams than TCP writes. A
+single request at a time costs 73 µs against HTTP/1.1's and HTTP/2's 59 µs, and that 14 µs is
+packet protection and acknowledgement bookkeeping: the transport's price, not the HTTP mapping's.
+The tables are in [bench/README.md](bench/README.md).
 
-**The per-connection boundary is stream credit rather than CPU**, and the benchmark reports the
-refusals that show it: at 32 in flight a client is told "not yet" some 24 000 times in three
-seconds and still serves 42 k; at 128 in flight the refusals quadruple and throughput falls,
-because the connection spends its time asking. `initial_max_streams_bidi` is the knob.
+**Those figures are three times what they were this morning, and both causes are worth naming**
+because neither was the protocol.
 
-None of that was measurable until the benchmark found three defects, each of which needed
-volume — a hundred requests on one connection, or thirty-two at once — that no test, fuzz target
-or aioquic run had ever produced. A connection stopped serving after exactly 100 requests
-because finished streams were never reaped, so the credit that reaping enables was never granted;
-an application refused for want of credit had no event that could tell it to try again; and
-asking for one stream too many *closed the connection*, blaming the peer for a rule it had not
-broken. The write-up is in [REVIEW.md](REVIEW.md).
+The first was the benchmark's own allocator. `DebugAllocator` unmaps pages as it frees, and an
+HTTP/3 request allocates a stream channel, a pipeline and a handler; half the server's working
+profile was the allocator. That is a harness artifact and it is fixed in the harness.
+
+The second was ours. **`initial_max_streams_bidi` was the binding constraint on a connection long
+before its CPU was**, and the credit policy behind it had a bug of the kind that only volume
+finds: `maxStreamsUpdate` announced more streams only when it could grant at least half the
+allowance more, while the most it can *ever* grant is `initial - live`. A stream stays live until
+its FIN is acknowledged, so a busy connection had most of its allowance live and the limit stopped
+moving at all — one connection with 128 requests in flight served 45 k req/s and spent the rest of
+its time being refused. The trigger is now how much credit the *peer* has left, and the default
+allowance is chosen against `streams.max_concurrent` — the hard cap on stream state — rather than
+being a round number. Refusals went to zero and throughput from 45 k to 129 k.
+
+None of this was measurable until the benchmark found three further defects, each needing volume —
+a hundred requests on one connection, or thirty-two at once — that no test, fuzz target or aioquic
+run had produced. A connection stopped serving after exactly 100 requests because finished streams
+were never reaped, so the credit reaping enables was never granted; an application refused for want
+of credit had no event that could tell it to try again; and asking for one stream too many *closed
+the connection*, blaming the peer for a rule it had not broken. The write-up is in
+[REVIEW.md](REVIEW.md).
 
 ## Numbers
 
 The QUIC and HTTP/3 stack is roughly 28,000 lines across the two directories,
-carrying 310 of the repository's 823 tests plus seven of its 22 fuzz targets. All of
+carrying 312 of the repository's 825 tests plus seven of its 22 fuzz targets. All of
 it runs under the leak-checking allocator, on threads and on fibers, on Linux and
 macOS, in Debug, ReleaseSafe and ReleaseFast — and against aioquic in CI on every
 push, in both directions.

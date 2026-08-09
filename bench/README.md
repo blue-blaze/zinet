@@ -19,7 +19,7 @@ so a green run is also a memory-safety result.
 ## Running
 
 ```
-zig build bench                                   # build both
+zig build bench                                   # build them all
 zig build bench -Dio=zio                          # ... against the fiber backend
 
 ./zig-out/bin/echo_bench  [connections] [payload] [seconds] [loops]
@@ -28,6 +28,11 @@ zig build bench -Dio=zio                          # ... against the fiber backen
 ./zig-out/bin/http3_bench [connections] [in flight] [seconds]
 ./zig-out/bin/tls_bench   [handshakes]
 ```
+
+Append `leakcheck` to any of them to swap the fast allocator for the leak-checking one. The
+default measures speed; that one checks correctness, and the two answer different questions —
+`bench/allocator.zig` says why running the leak-checking allocator by default made HTTP/2 and
+HTTP/3 look two to three times slower than they are.
 
 Defaults are 32 connections, a 1 KiB payload, 3 seconds and 4 worker loops. In that form the
 benchmark spawns the server from its own executable and loads it; the roles can also be run
@@ -107,80 +112,76 @@ loops, three-second runs, server and generator in separate processes on the same
 
 ### The three HTTP versions side by side
 
-Same machine, same 17-byte response body, same four worker loops, three-second runs, server in
-its own process. HTTP/1.1 and HTTP/2 are loaded over raw sockets; HTTP/3 is loaded by this
-stack, so its column measures the protocol rather than the server alone.
+Same machine, same 17-byte response body, four worker loops, three-second runs, server in its own
+process, **`smp_allocator`** on both sides. That last one is not a detail: measuring these through
+the leak-checking allocator gave answers that were wrong by two to three times, and wrong in a
+direction that flattered HTTP/1.1. The story is under "Questions this harness has settled" below.
 
 **HTTP/1.1 — one request in flight per connection, so the axis is connections:**
 
 | Connections | Throughput | Mean | Worst |
 |---|---|---|---|
-| 1 | 13.0 k req/s | 77 µs | 549 µs |
-| 8 | 37.9 k req/s | 211 µs | 2.0 ms |
-| 64 | 39–41 k req/s | 1.5 ms | 8.7 ms |
-| 256 | 40.3 k req/s | 6.3 ms | 18.6 ms |
+| 1 | 16.9 k req/s | 59 µs | 314 µs |
+| 8 | 44.9 k req/s | 178 µs | 1.3 ms |
+| 64 | 41.8 k req/s | 1.5 ms | 125 ms |
+| 256 | 42.7 k req/s | 5.9 ms | 17.2 ms |
 
 **HTTP/2 — one connection, streams in flight on it:**
 
 | Streams | Throughput | Mean |
 |---|---|---|
-| 1 | 11.2 k req/s | 89 µs |
-| 8 | 38.2 k req/s | 209 µs |
-| 32 | 105 k req/s (104.9, 105.2, 105.4 over three runs) | 308 µs |
-| 128 | 115–137 k req/s | 0.9–1.7 ms |
+| 1 | 16.8 k req/s | 59 µs |
+| 8 | 52.5 k req/s | 152 µs |
+| 32 | 118.3 k req/s | 270 µs |
+| 128 | 128.9 k req/s | 993 µs |
 
 **HTTP/2 — the same total concurrency of 64, split three ways:**
 
 | Split | Throughput | Mean | Worst |
 |---|---|---|---|
-| 1 connection × 64 streams | 125.7 k req/s | 509 µs | 1.7 ms |
-| 8 × 8 | 88.3 k req/s | 724 µs | 6.2 ms |
-| 64 × 1 | 41.5 k req/s | 1.5 ms | 28.5 ms |
+| 1 connection × 64 streams | 130.7 k req/s | 490 µs | 1.5 ms |
+| 8 × 8 | 126.0 k req/s | 507 µs | 2.2 ms |
+| 64 × 1 | 44.1 k req/s | 1.4 ms | 20.6 ms |
+
+**HTTP/2 — eight connections × 128 streams: 396.5 k req/s**, which is the machine rather than a
+connection.
 
 **HTTP/3 — one connection, requests in flight on it:**
 
 | In flight | Throughput | Mean | Credit refusals |
 |---|---|---|---|
-| 1 | 7.3 k req/s | 133 µs | 0 |
-| 8 | 31.2 k req/s | 254 µs | 0 |
-| 32 | 41–42 k req/s | 0.7 ms | 24 460 |
-| 128 | 31.1 k req/s | 1.2 ms | 95 754 |
+| 1 | 13.5 k req/s | 73 µs | 0 |
+| 8 | 59.6 k req/s | 133 µs | 0 |
+| 32 | 125.8 k req/s | 252 µs | 0 |
+| 128 | 128.8 k req/s | 990 µs | 0 |
 
-**HTTP/3 — 32 in flight, adding connections:** 1 → 42.3 k, 2 → 41.0 k, 4 → 38.1 k, 8 → 35.0 k.
+**HTTP/3 — eight connections × 32 in flight: 155.1 k req/s**, still with no refusals.
 
-Six things follow, and the last two are the boundaries this exercise was looking for.
+Six things follow.
 
-* **The unit of cost is the syscall, not the request.** HTTP/2 with 64 connections and one
-  stream each is 41.5 k — indistinguishable from HTTP/1.1's 42 k at the same concurrency. With
-  one request in flight per connection, HTTP/2's framing costs nothing measurable and buys
-  nothing either. Put 32 requests on *one* connection and it is 105 k, because one read gathers
-  many requests and one write scatters many responses.
-* **One connection is one core**, which is why 1 × 64 (125.7 k) beats 8 × 8 (88.3 k). Fewer
-  connections carrying more streams is *less* work, not more, and it is the same fact that makes
-  HTTP/1.1 need 64 connections to reach 42 k while HTTP/2 reaches 105 k on a single one.
-* **The cost of each protocol's machinery is visible at concurrency 1**, where nothing batches:
-  77 µs for HTTP/1.1, 89 µs for HTTP/2, 133 µs for HTTP/3. Framing adds about 12 µs; QUIC's
-  packet protection and its acknowledgement bookkeeping add another 44 µs on top.
-* **HTTP/1.1 saturates at about 42 k and reaches it at 64 connections.** Past that only latency
-  grows: 256 connections serve the same throughput with four times the delay. That is a
-  saturated service that is not losing work, and it is the same flatness the older table shows
-  out to 2048 connections.
-* **HTTP/2's per-connection ceiling is the reader task's core, at roughly 105–135 k req/s.**
-  Adding connections past that helps only up to the number of cores: 8 connections × 128 streams
-  reached 142.8 k, not eight times 135 k.
-* **HTTP/3's per-connection boundary is stream credit, not CPU** — which is what the refusal
-  counter is in the report for. At 32 in flight the client is told "not yet" 24 460 times in
-  three seconds and still serves 42 k; at 128 in flight the refusals quadruple and throughput
-  *falls* to 31 k, because the connection spends its time asking rather than requesting. The
-  server grants 100 streams to start and renews in blocks of fifty as they close, so
-  `initial_max_streams_bidi` is the knob for a client that wants deeper concurrency. And adding
-  HTTP/3 connections does not help at all (42 k down to 35 k from one connection to eight),
-  because both endpoints are on this box: every datagram is protected twice, once per side.
-
-Those last two only became measurable after the benchmark found three defects, which is most of
-what it was worth. They are written up in [REVIEW.md](../REVIEW.md); the shortest version is that
-an HTTP/3 connection used to stop serving after exactly 100 requests, and an application that
-asked for one stream too many used to destroy its own connection.
+* **The unit of cost is the syscall, not the request.** HTTP/2 with 64 connections and one stream
+  each is 44.1 k — indistinguishable from HTTP/1.1's 44.9 k at the same concurrency. With one
+  request in flight per connection, HTTP/2's framing costs nothing measurable and buys nothing
+  either. Put 32 requests on *one* connection and it is 118 k, because one read gathers many
+  requests and one write scatters many responses.
+* **The machinery is nearly free until QUIC.** At concurrency 1, where nothing batches, HTTP/1.1
+  and HTTP/2 are both 59 µs — the framing, HPACK and the per-stream pipeline together cost less
+  than a microsecond. HTTP/3 is 73 µs, and that 14 µs is packet protection and acknowledgement
+  bookkeeping, which is the price of the transport rather than of the HTTP mapping.
+* **HTTP/1.1 saturates at about 45 k**, reached at 8 connections. Past that only latency grows:
+  256 connections serve the same throughput with thirty times the delay of one. That is a
+  saturated service that is not losing work.
+* **A single connection is a single core**, and both multiplexed protocols reach about the same
+  place on it: 130.7 k for HTTP/2, 128.8 k for HTTP/3. Eight connections reach 396.5 k on HTTP/2
+  and 155.1 k on HTTP/3 — the gap there is not the protocol design but that both HTTP/3 endpoints
+  are on this box, each protecting every datagram.
+* **HTTP/3 beats HTTP/2 at moderate concurrency** — 59.6 k against 52.5 k at eight in flight —
+  which is worth stating because the reverse is the expectation. Eight small responses coalesce
+  into fewer datagrams than they do TCP writes.
+* **Under load the server is syscall-bound and nothing else.** A profile of the HTTP/2 server at
+  118 k req/s spends 54 % of its working samples in `readv` and 27 % in `__sendmsg`, against 9 %
+  in this repository's code and 0.6 % in the allocator. There is no remaining hot spot to
+  optimise here; the lever is fewer and larger syscalls, which is what multiplexing already is.
 
 **Echo, both sides threaded**, 32 connections and a 1 KiB payload: 45.4 k round trips/s,
 44.3 MiB/s each way, 704 µs mean, 4.6 ms worst, pool hit rate 100 %.
@@ -223,6 +224,24 @@ opposite of the assumption:
 * **Is the concurrency budget the binding constraint on threads?** No, not at these sizes:
   2048 connections is 4096 tasks and all of them were served. See `max_connections` in
   `ServerOptions`, which exists as a *policy* rather than as a guard against a cliff.
+* **Why were HTTP/2 and HTTP/3 slower than HTTP/1.1?** They were not; the harness was. Every
+  benchmark used `DebugAllocator`, which returns pages to the kernel as it frees, and HTTP/2 and
+  HTTP/3 allocate a stream channel, a pipeline and a handler per request where an HTTP/1.1
+  connection allocates a request arena and nothing else. A profile settled it: **51 % of the
+  server's working samples were in the allocator** — `__munmap` alone 7 % of the whole profile —
+  against 26 % in `readv` and `__sendmsg`. Switching to `smp_allocator` took HTTP/2's
+  single-request cost from 98 µs to 59 µs, exactly HTTP/1.1's, and HTTP/2 at eight connections of
+  128 streams from 142.8 k to 396.5 k req/s. HTTP/1.1 barely moved, because it barely allocates.
+  The default is now the fast allocator and the leak check is an argument; see
+  `bench/allocator.zig` for why both are kept.
+* **What bounds an HTTP/3 connection — CPU or credit?** It was credit, by a factor of three, and
+  the reason was a policy bug rather than a tuning choice. `maxStreamsUpdate` announced more
+  streams only when it could grant at least half the allowance more, and the most it can ever
+  grant is `initial - live`; a stream stays live until its FIN is acknowledged, so a busy
+  connection had most of its allowance live and the limit stopped moving altogether. One
+  connection with 128 requests in flight served 45 k req/s and spent the rest of its time asking.
+  Triggering on the credit the *peer* has left, plus a default allowance chosen against the hard
+  cap on stream state rather than a round number, gives 128.8 k with no refusals at all.
 * **How much of a TLS handshake is this code's own work?** About a fifth. Optimized, a full
   handshake takes 0.83 ms as a client sees it, of which the server's engine is about 175 µs and
   the CertificateVerify signature is some 128 µs of that. `openssl s_server` costs 0.91 ms on the same

@@ -29,6 +29,7 @@
 const std = @import("std");
 const backend = @import("backend");
 const zinet = @import("zinet");
+const bench_allocator = @import("allocator.zig");
 
 const http = zinet.http;
 const HandlerContext = zinet.HandlerContext;
@@ -194,19 +195,19 @@ fn parseContentLength(head: []const u8) ?usize {
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer if (debug_allocator.deinit() == .leak) {
-        log.err("benchmark leaked memory", .{});
-        std.process.exit(1);
-    };
-    const gpa = debug_allocator.allocator();
+    // `smp_allocator` by default, `DebugAllocator` when asked: see bench/allocator.zig. The
+    // leak-checking one unmaps pages as it frees, which on a per-request allocation costs more
+    // than the network does, so measuring through it measures the harness.
+    var allocators: bench_allocator.Choice = .init(init.args);
+    defer allocators.deinit();
+    const gpa = allocators.allocator();
 
     const config = try parseConfig(gpa, init.args);
     defer gpa.free(config.exe);
     switch (config.role) {
         .server => return runServer(gpa, config),
         .client => return runClient(gpa, config, null),
-        .both => return runBoth(gpa, config),
+        .both => return runBoth(gpa, config, allocators.leak_check),
     }
 }
 
@@ -227,7 +228,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 /// demonstrably written and logged. Rather than guess at why, the coordination was removed:
 /// an unexplained dependency is a worse thing to have in a measurement harness than a spare
 /// bind call.
-fn runBoth(gpa: std.mem.Allocator, config: Config) !void {
+fn runBoth(gpa: std.mem.Allocator, config: Config, leak_check: bool) !void {
     var harness: std.Io.Threaded = .init(gpa, .{});
     defer harness.deinit();
     const harness_io = harness.io();
@@ -244,7 +245,10 @@ fn runBoth(gpa: std.mem.Allocator, config: Config) !void {
     defer gpa.free(workers_text);
 
     var child = try std.process.spawn(harness_io, .{
-        .argv = &.{ config.exe, "server", port_text, seconds_text, workers_text },
+        .argv = if (leak_check)
+            &.{ config.exe, "server", port_text, seconds_text, workers_text, bench_allocator.leak_check_flag }
+        else
+            &.{ config.exe, "server", port_text, seconds_text, workers_text },
     });
     var reaped = false;
     defer if (!reaped) child.kill(harness_io);
