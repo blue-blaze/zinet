@@ -707,14 +707,23 @@ what stops the syscall being a per-request cost. Under load the server is syscal
 its profile is `readv` and `__sendmsg`, 9 % this code.
 
 Measured against [velo](https://github.com/blue-blaze/velo) — a pure-Zig framework on `std.Io`,
-close enough to a peer to be worth the comparison — through **velo's own load generator**, one
-server at a time on the same machine: at pipeline depth 64 and 8 connections this serves 440 k
-req/s to velo's 310 k with a p99 of 87 µs against 174 µs, and at 64 connections 467 k to velo's
-480 k. At depth 1 both are generator-bound and velo is ~12 % ahead. That comparison is also what
-found the last real inefficiency in the write path: throughput was within 5 % while this server
-spent **9.0 µs of CPU per request against velo's 1.6 µs**, because a batch of pipelined responses
-cost one `sendmsg` each. Batching them is 1.51 µs. See [bench/README.md](bench/README.md) for the
-method and its caveats — the two projects cannot even be built by the same compiler.
+close enough to a peer to be worth the comparison — **on all three HTTP versions**, each server
+measured start to finish on its own rather than alternating, since a laptop's clock drift would
+otherwise look like a difference between the projects. HTTP/1.1 uses velo's own load generator;
+HTTP/2 and HTTP/3 use generators written on Go's `x/net/http2` and `quic-go`, which share code with
+neither framework. Medians of five 10-second windows: pipelined HTTP/1.1 is 442 k req/s to velo's
+380 k for 1.44 µs of CPU per request against 1.72 µs, h2c is 1.4–3× ahead at a third of the CPU per
+request, and HTTP/3 through quic-go is 8 % ahead at one request in flight and 86 % ahead at
+thirty-two, example against example. At HTTP/1.1 depth 1 both are generator-bound and velo is
+~20 % cheaper per request — the honest place to read the cost of a queue hop per response.
+
+That comparison is also what found the last real inefficiency in the write path: throughput was
+within 5 % of velo's while this server spent **9.0 µs of CPU per request against 1.6 µs**, because
+a batch of pipelined responses cost one `sendmsg` each. Batching them is 1.44 µs. And it corrected
+a claim this file used to make: the resident-memory gap was attributed to `BufferPool`
+preallocation and is in fact the allocator — the same load is 87 MB under `smp_allocator` and 2 MB
+under a leak-checking one, with nothing retained either way. See [bench/README.md](bench/README.md)
+for the method and its caveats — the two projects cannot even be built by the same compiler.
 
 Those numbers are two to three times what the first version of these benchmarks reported, and the
 correction is the more useful half. The benchmarks measured through the leak-checking allocator,

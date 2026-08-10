@@ -183,108 +183,97 @@ Six things follow.
   in this repository's code and 0.6 % in the allocator. There is no remaining hot spot to
   optimise here; the lever is fewer and larger syscalls, which is what multiplexing already is.
 
-### Against velo, through velo's own load generator
+### Against velo, on all three HTTP versions
 
 [velo](https://github.com/blue-blaze/velo) is the closest thing to a peer this repository has: a
-pure-Zig web framework on `std.Io`, HTTP/1.1 through HTTP/3, the same style guides, no third-party
-dependencies in its default build. Comparing against it is more useful than comparing against
-`nginx`, and it is also harder to do honestly, so the method comes first.
+pure-Zig web framework on `std.Io`, HTTP/1.1 through HTTP/3, no third-party dependencies in its
+default build. The comparison is worth making and easy to get wrong, so the method comes first.
 
-**The method.** velo ships a Go load generator with a `-depth` flag for HTTP/1.1 pipelining, and
-that generator was used for both servers — one at a time, on the same port, on this machine, with
-a discarded warm-up run before each measured one. Both servers are ReleaseFast. velo is built with
-Zig 0.16.0 because it pins that release; Zinet needs 0.17.0-dev, so **the two are not compiled by
-the same compiler**, which is a real caveat and not one either project can remove. CPU per request
-is a `cputime` delta taken around the measured window only.
+**Each server was measured on its own, start to finish, before the other was started.** Not
+alternating between them, because a laptop's clock speed drifts with temperature and alternating
+turns that drift into an apparent difference between the two projects. Every number below is the
+median of five 10-second windows against one server process, after a discarded warm-up.
 
-**Why the depth axis decides everything.** At one request per connection a client's `write` and
-`read` cost more than "hello world" costs either server, so the number measures the generator and
-both land in the same place. velo's own README says this about its own table, and it is worth
-repeating rather than discovering. Pipelining moves the bottleneck to the server, which is the
-only condition under which a throughput column means anything.
+**Three generators, none of which is ours where it mattered.** HTTP/1.1 uses velo's own Go load
+generator, which has the pipelining depth flag that decides everything. HTTP/2 and HTTP/3 have no
+generator shipped by either project, and this machine has no `h2load` and a `curl` without HTTP/3,
+so two were written on Go libraries that share code with neither framework: **`x/net/http2`** for
+h2c and **`quic-go`** for HTTP/3. Where our own generator was also used, both numbers are shown.
 
-| 8 connections | Zinet | velo |
+velo is built with Zig 0.16.0 because it pins that release; Zinet needs 0.17.0-dev. **The two
+cannot be built by the same compiler**, and neither project can fix that.
+
+#### HTTP/1.1 — velo's generator
+
+| | Zinet | velo |
 |---|---|---|
-| depth 1 | 40.7 k req/s, p99 503 µs, 40.3 µs CPU/req | 46.1 k req/s, p99 294 µs, 33.7 µs CPU/req |
-| depth 64 | **440.4 k req/s**, p99 **87 µs**, **1.51 µs** CPU/req | 310.3 k req/s, p99 174 µs, 1.65 µs CPU/req |
+| 8 conns, depth 1 | 42 977 req/s, p99 383 µs, 38.5 µs CPU/req | 41 953 req/s, p99 502 µs, 32.3 µs CPU/req |
+| 8 conns, depth 64 | **442 432**, p99 85 µs, **1.44 µs** | 380 486, p99 114 µs, 1.72 µs |
+| 64 conns, depth 1 | 45 657, p99 1.85 ms, 40.3 µs | 46 256, p99 3.01 ms, 32.7 µs |
+| 64 conns, depth 64 | **484 570**, p99 1.07 ms, **1.43 µs** | 390 701, p99 1.28 ms, 1.64 µs |
 
-| 64 connections | Zinet | velo |
+At depth 1 the generator is the limit and the two are within 2 % of each other, with velo ~20 %
+cheaper per request. Pipelining moves the limit to the server, and there this serves 16–24 % more
+for 13–16 % less CPU. Depth 1 is the honest place to read velo's advantage: a request that arrives
+alone pays for this design's extra queue hop, and that hop is what makes `Channel.write` callable
+from any task.
+
+#### HTTP/2 (h2c) — two generators
+
+| | Zinet | velo |
 |---|---|---|
-| depth 1 | 44.2 k req/s, 43.7 µs CPU/req | 46.4 k req/s, 33.7 µs CPU/req |
-| depth 64 | 467.4 k req/s, **1.48 µs** CPU/req | **480.3 k req/s**, 1.61 µs CPU/req |
+| Go `x/net/http2`, 1 conn × 1 stream | 13 642 req/s, 26 µs CPU/req | 9 043, 82 µs |
+| Go `x/net/http2`, 1 conn × 32 streams | 37 706, 22.8 µs | 26 723, 91 µs |
+| Go `x/net/http2`, 8 conns × 32 streams | **69 265**, **17.7 µs** | 22 643, 81 µs |
+| our generator, 8 conns × 32 streams | **320 610**, **4.38 µs** | 42 972, 65.1 µs |
+| our generator, 8 conns × 128 streams | 374 553, 5.98 µs | 42 880, 68.4 µs |
 
-Resident memory and threads, at 64 connections: Zinet 38 MB and 130 threads, velo 7 MB and 67.
-Both differences are design rather than waste. The threads are two tasks per connection — a reader
-and a writer — against velo's one, which is the cost of `Channel.write` being callable from any
-task; the memory is the `BufferPool`, which is preallocated and bounded on purpose. Neither is
-free and both are stated in the architecture rather than being surprises.
+The Go generator is itself the limit — it holds this server to 69 k where our own generator reaches
+320 k — but it limits both servers equally, so the ratio survives even though the absolute numbers
+do not. Both generators agree on the shape: velo's HTTP/2 saturates around 22–43 k req/s no matter
+how much concurrency it is offered, and spends 3–4.6× the CPU per request. Its thread count climbs
+with load — 8 connections became 107 threads — which suggests a task per stream where this runs
+every stream of a connection on that connection's one reader task.
 
-**What the comparison found.** The depth-64 row started out very differently: Zinet served 294 k
-req/s to velo's 310 k, and spent **9.0 µs of CPU per request against velo's 1.6 µs**. Throughput
-hid it, because the generator was near saturation; CPU per request did not, which is why it is the
-column to read when the client is the limit.
+#### HTTP/3 — quic-go, a client sharing code with neither
 
-The cause was one syscall per response. `ctx.writeAndFlush` queues bytes and then a flush, and the
-writer task flushed on every one — so a batch of 64 pipelined responses cost 64 `sendmsg` calls
-where one would do. The writer now takes everything queued in one pass and flushes once, which is
-the change velo's README names as its own biggest single win. 294 k became 440 k, CPU per request
-9.0 µs became 1.51 µs, and the p99 halved.
+| single connection | Zinet (bench server) | Zinet (example server) | velo (example server) |
+|---|---|---|---|
+| 1 in flight | **10 958** req/s, mean 90 µs | 7 575 | 7 027, mean 141 µs |
+| 4 in flight | **21 094**, mean 189 µs | — | 7 535 |
+| 32 in flight | **39 125**, mean 812 µs | 15 450 | 8 301 |
 
-Two things about that change are worth keeping, both of them corrections to how it was first
-written:
+Two Zinet columns because the comparison is only fair against the one that matches how velo's
+example is built: velo's HTTP/3 example uses `page_allocator`, ours uses `DebugAllocator` so a
+clean exit proves no leaks. Like for like — example against example — this is 8 % ahead at one
+request in flight and 86 % ahead at thirty-two. The bench server, which uses the allocator a
+deployment would, is 1.6× to 4.7× ahead. What the shape says is more interesting than the ratio:
+velo's HTTP/3 gains 18 % from 1 to 32 requests in flight where this gains 3.6×, which is what
+multiplexing is supposed to buy.
 
-* **A flush may not be deferred past a close.** The first version deferred every flush to the end
-  of the batch, which lost a closing handshake's farewell: the flush that would have carried it
-  ran in the close prong, by which time the socket was no longer writable. Two tests caught it.
-  The rule is now narrow — defer only while more *data* follows in the same batch — and it is in
-  the mutation catalogue, because a batching rule that looks past the end of a connection is not a
-  batching rule.
-* **The queue's own count is the only trustworthy one.** The first attempt used the channel's
-  `pending` counter to decide whether more work was queued. It deadlocked: `pending` is
-  incremented *after* the item is put, so the writer can take and decrement before the producer
-  counts, and the counter momentarily reads non-zero on an empty queue. A writer that trusts it
-  skips the flush and blocks holding the only copy of the response.
+**One interoperability gap this found, in our own client.** Our HTTP/3 *client* cannot get a
+response out of velo's HTTP/3 server — with either of velo's QUIC backends. The QUIC handshake and
+TLS 1.3 complete, the connection reports established, and then zero requests finish, with no
+reset, no stream-credit refusal, and no error. quic-go talks to velo's server without trouble, and
+to ours, so both servers work and the defect is on our client's side. It is recorded here rather
+than left for someone else to find; it is not diagnosed yet.
 
-**What this comparison does not say.** Nothing about HTTP/2 or HTTP/3 — velo's HTTP/3 runs over
-OpenSSL's QUIC by default where this one is self-written, and its HTTP/2 client is deliberately
-non-multiplexing, so the interesting axes are not the same. Nothing about features: velo is a web
-framework with routing, extractors, middleware and sessions, and Zinet is a Netty-shaped network
-framework with codecs; the HTTP/1.1 hot path is the one place they answer the same question.
-Nothing about a real network, since both sides shared one machine over loopback. And nothing about
-compilers, for the reason given above.
+#### What the memory column actually measured
 
-**Echo, both sides threaded**, 32 connections and a 1 KiB payload: 45.4 k round trips/s,
-44.3 MiB/s each way, 704 µs mean, 4.6 ms worst, pool hit rate 100 %.
+The previous version of this section reported that Zinet's resident memory was 38 MB against velo's
+7 MB and attributed it to the `BufferPool` being preallocated. **That was wrong, and the correction
+is worth more than the number.** Under load the RSS of this server climbs about 2 MB per round of
+eight fresh connections and does not come back down — 24 MB to 87 MB over thirty rounds, 240
+connections. Nothing is retained: run the identical load with `leakcheck`, which switches to
+`DebugAllocator`, and RSS sits at **2 MB for all thirty rounds**, with no leak reported at exit.
 
-A ten second soak at 32 HTTP connections served 421 424 requests with zero failures and no
-leaked bytes at exit.
-
-Reading these numbers honestly:
-
-* **Throughput is flat in the number of connections** — about 39–41 k req/s from 8 to 512 on
-  threads — so the limit is per-operation cost, syscalls and scheduling, not bandwidth and not
-  concurrency. Latency rises while throughput holds, which is what a saturated service looks
-  like when it is not losing work.
-* **The threaded backend does not fall over where the design says it should.** Two tasks per
-  connection means 2048 connections is 4096 tasks, and that ran with **zero refusals** and a
-  graceful throughput decline. The framework's own documentation has argued that the
-  concurrency budget is its scarcest resource; on this platform, at these sizes, it was not
-  the binding constraint. That does not make a bound unnecessary — a server that accepts 2048
-  connections because nobody told it not to is still missing a limit — but it does mean the
-  cost of threads here is throughput, not refusal.
-* **The fiber backend is currently slower, and its tail is much worse.** Pairing a fiber
-  server with a threaded generator — which the split roles exist to make possible — puts the
-  cost on the server side: ~20 % less throughput and a **reproducible multi-second worst
-  case** (2.74 s, 2.72 s, 2.78 s across three runs) where the threaded server stays under
-  50 ms. A fiber generator against a threaded server shows a milder version of the same tail
-  (284 ms), so the scheduler, not this framework's structure, is what is being observed.
-* **This is a statement about one third-party fiber runtime on one operating system**, not
-  about fibers. zio's `zig-0.17` branch on macOS is what was measured; Linux with io_uring is
-  the comparison that has not been made, and the one that would matter most. Nothing in
-  `src/` changes between the two backends, which is the point of injecting `Io` — and is also
-  why this table can exist at all.
-* These are loopback numbers with both processes competing for the same cores, so they
-  understate throughput and overstate latency relative to a real deployment.
+So the memory column was measuring the allocator, not the framework. `std.heap.smp_allocator` is a
+per-thread pool that never returns pages to the kernel — the right trade for a benchmark, and the
+reason RSS grows without anything being lost. velo's 1–7 MB comes from `std.heap.page_allocator`,
+which unmaps on free; it pays a syscall per allocation for it. The extreme case is HTTP/3, where
+this server reached **491 MB** under `smp_allocator` and **2 MB** under `DebugAllocator` serving the
+same requests, at 30 % less throughput. Any RSS comparison between two servers is a comparison of
+their allocators unless both are stated.
 
 ## Questions this harness has settled
 
@@ -294,6 +283,10 @@ opposite of the assumption:
 * **Is the concurrency budget the binding constraint on threads?** No, not at these sizes:
   2048 connections is 4096 tasks and all of them were served. See `max_connections` in
   `ServerOptions`, which exists as a *policy* rather than as a guard against a cliff.
+* **Does the resident-memory column say anything about the framework?** No. It says which
+  allocator the harness picked. The same load leaves this server at 87 MB under `smp_allocator` and
+  2 MB under `DebugAllocator`, and the HTTP/3 case is 491 MB against 2 MB. An earlier version of
+  this file attributed the difference to `BufferPool` preallocation, which was wrong.
 * **Is one syscall per response worth avoiding?** Yes, and by more than the throughput column
   showed. A pipelined batch of 64 responses used to cost 64 `sendmsg` calls; batching them into
   one took CPU per request from 9.0 µs to 1.51 µs and the p99 at depth 64 from 174 µs to 87 µs.

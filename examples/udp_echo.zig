@@ -99,7 +99,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Announced because a benchmark run against a Debug build of this example once produced a
     // handshake cost four times the real one, and nothing in its output said which build it was.
-    std.debug.print("build: {t}\n", .{@import("builtin").mode});
+    // Debug builds say so loudly: the mode was logged quietly once already and a
+    // measurement was still taken against one and briefly believed.
+    switch (@import("builtin").mode) {
+        .Debug => std.debug.print("build: debug — unoptimized, not a performance measurement\n", .{}),
+        else => std.debug.print("build: {t}\n", .{@import("builtin").mode}),
+    }
     std.debug.print("listening on {d}\n", .{endpoint.port()});
 
     while (!shutdown_requested.load(.acquire)) {

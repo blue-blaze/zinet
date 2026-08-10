@@ -1079,6 +1079,39 @@ narrow (defer only while more *data* follows in the same batch) and it is in the
 catalogue, so the next person to widen it has to argue with a failing test rather than with a
 comment.
 
+Measuring all three HTTP versions against velo, rather than only HTTP/1.1, then found three things
+about *this repository's own measurements* — none of them a defect in the library, all of them
+defects in what was believed about it.
+
+**The resident-memory column was measuring the allocator.** This file and `bench/README.md` both
+said Zinet's 38 MB against velo's 7 MB came from `BufferPool` preallocation. It does not. Under
+load RSS climbs about 2 MB per round of eight fresh connections and never falls — 24 MB to 87 MB
+across thirty rounds — and the obvious conclusion, that connections are being retained, is also
+wrong: the identical load under `DebugAllocator` sits at **2 MB for all thirty rounds** and reports
+no leak at exit. `smp_allocator` is a per-thread pool that never returns pages to the kernel, which
+is the right trade for a benchmark and a complete explanation of the number. velo's low figure is
+`page_allocator`, which unmaps on free and pays a syscall for it. HTTP/3 is the extreme: 491 MB
+against 2 MB for the same requests. Two servers' RSS cannot be compared unless both allocators are
+named — and this project had drawn a conclusion about its own design from that column.
+
+**The Debug-build trap caught this repository a second time.** An earlier commit had already found
+a TLS measurement that was really measuring a Debug build, and the fix was to log the build mode at
+every server example's startup. That log was written and then not read: an HTTP/3 example was
+measured at 460 req/s against velo's 7 027, and the number was briefly believed. The same example
+in ReleaseFast serves 7 575 — sixteen times more. The log said `build: debug` the whole time. A
+guard that has to be noticed is not a guard, which is the same conclusion the mutation catalogue
+was built on. So the level now does the noticing: every server example logs a Debug build at
+`warn` with the words "not a performance measurement", and only an optimized build gets the quiet
+`info` line.
+
+**Our HTTP/3 client cannot get a response out of velo's HTTP/3 server.** With either of velo's QUIC
+backends: the handshake and TLS 1.3 complete, the connection reports established, and then no
+request ever finishes — no reset, no stream-credit refusal, no error anywhere. quic-go talks to
+velo's server and to ours, so both servers work and the gap is on our client's side. It is written
+down undiagnosed rather than left for someone else to find, and it is the sharpest available
+argument for cross-implementation testing: the client is exercised constantly against our own
+server, against aioquic in CI, and it still had a way to fail that neither reached.
+
 One unrelated flake surfaced while verifying all this, and it is recorded because its diagnosis is
 the interesting half. The HTTP/3 migration test asserts that the client's local address *changed*
 after `migrate`, which is what makes the run a migration rather than a reopened socket. Under the
