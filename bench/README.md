@@ -251,12 +251,17 @@ deployment would, is 1.6× to 4.7× ahead. What the shape says is more interesti
 velo's HTTP/3 gains 18 % from 1 to 32 requests in flight where this gains 3.6×, which is what
 multiplexing is supposed to buy.
 
-**One interoperability gap this found, in our own client.** Our HTTP/3 *client* cannot get a
-response out of velo's HTTP/3 server — with either of velo's QUIC backends. The QUIC handshake and
-TLS 1.3 complete, the connection reports established, and then zero requests finish, with no
-reset, no stream-credit refusal, and no error. quic-go talks to velo's server without trouble, and
-to ours, so both servers work and the defect is on our client's side. It is recorded here rather
-than left for someone else to find; it is not diagnosed yet.
+**One defect in our own client this found, since a benchmark that only ever talks to itself cannot.**
+Our HTTP/3 *client* could not get a single response out of velo's server: handshake and TLS 1.3
+complete, connection established, then zero requests, no reset, no error. The cause was one line
+treating *any* post-handshake TLS message as a protocol violation — and OpenSSL sends a
+NewSessionTicket by default, so this client died against every OpenSSL-based QUIC server it would
+ever meet. Zero became 55 067 requests in five seconds. See [REVIEW.md](../REVIEW.md); the same
+rule was already implemented correctly on the TCP path, which is the more useful half of the story.
+
+velo has the mirror-image defect: its `-Dquic=zig` backend stops granting bidirectional stream
+credit after about sixteen requests, which both our client and quic-go run into. That is why the
+HTTP/3 numbers above use velo's OpenSSL backend.
 
 #### What the memory column actually measured
 

@@ -142,6 +142,13 @@ const catalogue = [_]Mutation{
         .because = "\"the application will keep up\" is not a bound",
     },
     .{
+        .name = "quic/post-handshake-ticket",
+        .path = "src/codec/quic/client.zig",
+        .find = "                .new_session_ticket => {},",
+        .replace = "                .new_session_ticket => return error.UnexpectedMessage,",
+        .because = "a legal NewSessionTicket killed every connection to an OpenSSL-based server",
+    },
+    .{
         .name = "channel/flush-not-past-close",
         .path = "src/channel.zig",
         .find = "fn moreDataFollows(rest: []const Outbound) bool {",

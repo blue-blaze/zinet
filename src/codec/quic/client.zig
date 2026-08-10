@@ -332,7 +332,25 @@ pub const Client = struct {
                 if (message.type != .finished) return error.UnexpectedMessage;
                 try self.handleFinished(gpa, message);
             },
-            .idle, .complete, .failed => return error.UnexpectedMessage,
+            // §4.6: post-handshake messages are legal at any time after the
+            // handshake, and treating them as violations killed every connection
+            // to a server built on OpenSSL — which sends a NewSessionTicket by
+            // default. The handshake completed, the connection reported itself
+            // established, and then the first 1-RTT packet carrying the ticket
+            // failed the whole connection with no error reaching the application.
+            // Ignoring the ticket is right, because resumption is not implemented
+            // (see the row in HTTP3.md); *failing* on it was not.
+            //
+            // KeyUpdate stays fatal, and that is not an oversight: §6 of RFC 9001
+            // gives QUIC its own key update and says an endpoint MUST treat a TLS
+            // KeyUpdate as a connection error. So the two directions of this rule
+            // differ on purpose from `tls13.session`, which rotates keys on one
+            // because over TCP that is exactly what it means.
+            .complete => switch (message.type) {
+                .new_session_ticket => {},
+                else => return error.UnexpectedMessage,
+            },
+            .idle, .failed => return error.UnexpectedMessage,
         }
     }
 
@@ -603,6 +621,78 @@ test "client: a full handshake against a server built from the same schedule" {
     );
     const opened_len = try peer_keys.open(&opened, 0, "header", sealed[0..len]);
     try testing.expectEqualStrings("payload", opened[0..opened_len]);
+}
+
+test "client: a NewSessionTicket after the handshake is ignored rather than fatal" {
+    // The defect this covers was found by pointing this client at a server built
+    // on OpenSSL QUIC, which sends a ticket by default: the handshake completed,
+    // the connection reported itself established, and the first 1-RTT packet
+    // carrying the ticket failed the connection — with no error reaching the
+    // application, because the HTTP/3 client marks itself finished and drops
+    // every datagram after that. Zero requests, no reset, no error.
+    const gpa = testing.allocator;
+    var client = try Client.init(.{
+        .host = "example.com",
+        .alpn = &.{"h3"},
+        .transport_parameters = &.{ 0xaa, 0xbb },
+        .verification = null,
+    }, @splat(0x11));
+    defer client.deinit(gpa);
+
+    try client.start(gpa);
+    var server = TestServer.init(0x22);
+    try client.provide(gpa, .initial, server.writeServerHello(client.output(.initial)));
+    var flight_buf: [512]u8 = undefined;
+    try client.provide(gpa, .handshake, server.writeFlight(&flight_buf, "h3", &.{ 0xcc, 0xdd }));
+    try testing.expect(client.isComplete());
+
+    // §4.6.1: ticket_lifetime, ticket_age_add, an empty nonce, a one-byte ticket
+    // and no extensions. The body is not read — resumption is not implemented —
+    // but a well-formed one is what a server actually sends.
+    const ticket = [_]u8{
+        @backingInt(tls.MessageType.new_session_ticket), 0, 0, 14,
+        0, 0, 0x1c, 0x20, // ticket_lifetime: 7200
+        0x11, 0x22, 0x33, 0x44, // ticket_age_add
+        0, // nonce: empty
+        0, 1, 0xab, // ticket: one byte
+        0, 0, // extensions: none
+    };
+    try client.provide(gpa, .one_rtt, &ticket);
+    try testing.expect(client.isComplete());
+    try testing.expectEqual(State.complete, client.state);
+
+    // A second one, because OpenSSL sends two by default and a rule that only
+    // survives the first would fail in exactly the same place.
+    try client.provide(gpa, .one_rtt, &ticket);
+    try testing.expect(client.isComplete());
+}
+
+test "client: a TLS KeyUpdate is fatal, because QUIC has its own key update" {
+    // The other half of the rule above, and the reason this file cannot simply
+    // copy `tls13.session`, which rotates keys on a KeyUpdate because over TCP
+    // that is what it means. §6 of RFC 9001 gives QUIC its own key update and
+    // requires an endpoint to treat a TLS KeyUpdate as a connection error.
+    const gpa = testing.allocator;
+    var client = try Client.init(.{
+        .host = "example.com",
+        .alpn = &.{"h3"},
+        .transport_parameters = &.{ 0xaa, 0xbb },
+        .verification = null,
+    }, @splat(0x11));
+    defer client.deinit(gpa);
+
+    try client.start(gpa);
+    var server = TestServer.init(0x22);
+    try client.provide(gpa, .initial, server.writeServerHello(client.output(.initial)));
+    var flight_buf: [512]u8 = undefined;
+    try client.provide(gpa, .handshake, server.writeFlight(&flight_buf, "h3", &.{ 0xcc, 0xdd }));
+    try testing.expect(client.isComplete());
+
+    const key_update = [_]u8{ @backingInt(tls.MessageType.key_update), 0, 0, 1, 0 };
+    try testing.expectError(
+        error.UnexpectedMessage,
+        client.provide(gpa, .one_rtt, &key_update),
+    );
 }
 
 test "client: an ALPN the client never offered fails the handshake" {

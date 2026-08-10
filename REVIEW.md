@@ -1104,13 +1104,40 @@ was built on. So the level now does the noticing: every server example logs a De
 `warn` with the words "not a performance measurement", and only an optimized build gets the quiet
 `info` line.
 
-**Our HTTP/3 client cannot get a response out of velo's HTTP/3 server.** With either of velo's QUIC
-backends: the handshake and TLS 1.3 complete, the connection reports established, and then no
-request ever finishes — no reset, no stream-credit refusal, no error anywhere. quic-go talks to
-velo's server and to ours, so both servers work and the gap is on our client's side. It is written
-down undiagnosed rather than left for someone else to find, and it is the sharpest available
-argument for cross-implementation testing: the client is exercised constantly against our own
-server, against aioquic in CI, and it still had a way to fail that neither reached.
+**Our HTTP/3 client killed the connection over a perfectly legal TLS message.** Pointed at velo's
+HTTP/3 server, the handshake and TLS 1.3 completed, the connection reported itself established, and
+then no request ever finished — no reset, no stream-credit refusal, no error anywhere. quic-go
+talked to velo's server and to ours, so both servers worked.
+
+The cause was one line. `quic.client` handled post-handshake messages as
+`.idle, .complete, .failed => return error.UnexpectedMessage` — that is, once the handshake was
+done, *any* handshake message was a protocol violation. RFC 8446 §4.6 messages are legal at any time
+after the handshake, and **OpenSSL sends a NewSessionTicket by default**, so every connection to
+every server built on OpenSSL QUIC died on its first 1-RTT packet. Ignoring the ticket is right
+here — resumption is not implemented, and that is stated in HTTP3.md — but failing on it was not.
+The fix ignores `new_session_ticket` and keeps everything else fatal, because §6 of RFC 9001 gives
+QUIC its own key update and *requires* an endpoint to treat a TLS KeyUpdate as a connection error:
+the two halves of the rule differ from `tls13.session`, which rotates keys on one, on purpose.
+Zero requests became 55 067 in a five-second window against the same server.
+
+Two things about how it hid are worth more than the fix. **The same rule was already implemented
+correctly forty files away**: `tls13.session.handlePostHandshake` ignores tickets and rotates keys
+on a KeyUpdate, because that is what those messages mean over TCP. One rule, two implementations,
+one of them wrong — which is the failure mode this repository's own constraint about single
+implementations exists to prevent, and it survived a full test suite because nothing crosses the
+two paths.
+
+**And the failure was silent by construction.** `http3.client`'s reader marked the connection
+finished and dropped every datagram afterwards, so a failed connection was indistinguishable from a
+peer that had gone quiet. The comment there claimed it also told the application; it did not. It now
+logs, and the honest note is in the code: `Event` has `peer_closed` and `idle_timeout` but nothing
+for "we failed the connection ourselves", and that gap is an API change rather than a line.
+
+**One defect found on velo's side, for symmetry.** Its `-Dquic=zig` backend stops granting
+bidirectional stream credit after about sixteen requests: our client completes 13 and records one
+credit refusal, then waits for the MAX_STREAMS that never comes — and quic-go completes 17 against
+the same server and then times out. Two independent clients agreeing is what makes that velo's bug
+rather than ours, and it is why the HTTP/3 comparison in bench/README.md uses the OpenSSL backend.
 
 One unrelated flake surfaced while verifying all this, and it is recorded because its diagnosis is
 the interesting half. The HTTP/3 migration test asserts that the client's local address *changed*

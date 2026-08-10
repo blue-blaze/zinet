@@ -36,6 +36,8 @@ const pipeline_mod = @import("../../pipeline.zig");
 const Message = @import("../../message.zig").Message;
 
 const quic = @import("../quic.zig");
+
+const log = std.log.scoped(.zinet);
 const connection = @import("connection.zig");
 const qpack = @import("qpack.zig");
 
@@ -137,11 +139,24 @@ pub const Handler = struct {
         if (self.finished) return;
 
         self.conn.setTime(self.now());
-        self.conn.receive(ctx.gpa(), incoming.bytes()) catch {
+        self.conn.receive(ctx.gpa(), incoming.bytes()) catch |err| {
             // The connection has already recorded the failure and queued the
-            // CONNECTION_CLOSE if one is owed; what remains is to send it and
-            // tell the application. Nothing here is recoverable — QUIC's
-            // answer to a protocol violation is to stop being a connection.
+            // CONNECTION_CLOSE if one is owed; what remains is to send it.
+            // Nothing here is recoverable — QUIC's answer to a protocol
+            // violation is to stop being a connection.
+            //
+            // Logged because this comment used to claim it also told the
+            // application, and it did not: every datagram after this point is
+            // dropped at the top of this function, so a connection that failed
+            // here looked exactly like a peer that had gone quiet. That cost a
+            // long diagnosis — a server sending a perfectly legal
+            // NewSessionTicket killed the connection and the benchmark reported
+            // "connections up: 1, requests: 0" with no error anywhere. The
+            // application still has no *event* for this, which is a real gap
+            // rather than a decision: `Event` has `peer_closed` and
+            // `idle_timeout` but nothing for "we failed the connection
+            // ourselves", and adding one is an API change rather than a line.
+            log.warn("connection failed while receiving: {t}", .{err});
             self.finished = true;
         };
         try self.deliver();
