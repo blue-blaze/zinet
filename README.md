@@ -36,7 +36,8 @@ both directions with `permessage-deflate`, **HTTP/2** over cleartext *and over T
 **HTTP/3 over QUIC** in both directions — with the QUIC transport and the TLS 1.3
 handshake written here, because Netty binds Quiche and the standard library has no
 TLS server; see [HTTP3.md](HTTP3.md) and [TLS.md](TLS.md) — Redis RESP2/RESP3,
-datagram (UDP) endpoints, a DNS resolver, TLS 1.3 on both sides of a connection, a
+**Protocol Buffers** — the wire format, a `comptime` mapping onto Zig structs and
+varint-length framing, with no code generation step — datagram (UDP) endpoints, a DNS resolver, TLS 1.3 on both sides of a connection, a
 bounded client connection pool, and `EmbeddedChannel` for testing pipelines without
 sockets. 825 tests pass on Linux and macOS in Debug, ReleaseSafe and ReleaseFast,
 all under a leak-checking allocator, plus twenty-two fuzz targets. The same suite
@@ -45,7 +46,8 @@ also runs **on fibers** rather than threads — see [Choosing an `Io`](#choosing
 Every protocol is checked against other people's code, not only its own
 counterpart: the HTTP server against `curl`, the HTTP client against Python's
 `http.server`, the WebSocket client *and* server against the third-party
-`websockets` library, the RESP server against `redis-py`, the UDP endpoint against
+`websockets` library, the RESP server against `redis-py`, the protobuf codec against Google's own Python
+`protobuf` — fixed vectors in the unit tests and a live round trip through a pipe in CI — the UDP endpoint against
 Python's `socket` and `nc -u`, the DNS resolver against `dig` — address for
 address — the TLS client against OpenSSL's `s_server` and the TLS *server* against
 `openssl s_client`, `curl`, and — in the ordinary test suite, with no external process —
@@ -314,6 +316,9 @@ graph TB
 | — | `tls13.client.Client` | The self-written engine on the client side, which is what can send ALPN |
 | — | `tls13.identity.Identity` | A server's certificate chain and signing key, from PEM |
 | `RedisDecoder` / `RedisEncoder` | `redis.Decoder` / `redis.Encoder` | RESP2 and RESP3, both directions |
+| `ProtobufDecoder` / `ProtobufEncoder` | `protobuf.Decoder(T)` / `protobuf.Encoder(T)` | The schema is a Zig struct with declared field numbers, mapped at `comptime`. Netty needs `protobuf-java`'s generated classes; this needs no generator and no build step |
+| `ProtobufVarint32FrameDecoder` | `protobuf.Varint32FrameDecoder` | And `Varint32Prepender` outbound. A protobuf message is not self-delimiting |
+| — | `protobuf.Reader` | The wire format as pure functions: varints, tags, zigzag, a field iterator. No schema, so it is also how a message of unknown shape is walked |
 | `RedisArrayAggregator` | — | `redis.Decoder` delivers whole nested values, so there is nothing left to aggregate |
 | `DatagramChannel` | `datagram.DatagramChannel` | One socket, one pipeline, every message addressed |
 | `DatagramPacket` | `datagram.Datagram` | Owns its payload, because it crosses a queue rather than being serialized in place |
@@ -663,6 +668,7 @@ zig build run-ws-echo      -- 8090     # websocat ws://localhost:8090/
 zig build run-http-client  -- localhost 8080 /echo
 zig build run-ws-client    -- 127.0.0.1 8090 /
 zig build run-redis-server -- 6380      # redis-cli -p 6380 set k v
+zig build run-protobuf_relay           # python3 scripts/protobuf-interop.py
 zig build run-udp-echo     -- 9000      # echo hi | nc -u localhost 9000
 zig build run-https-client -- 127.0.0.1 8443 localhost / insecure
 zig build run-http3-client -- 127.0.0.1 4433 localhost /   # against e.g. aioquic

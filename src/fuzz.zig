@@ -40,6 +40,7 @@ const json = @import("codec/json.zig");
 const pipeline_mod = @import("pipeline.zig");
 const pool_mod = @import("pool.zig");
 const permessage_deflate = @import("codec/permessage_deflate.zig");
+const protobuf = @import("codec/protobuf.zig");
 const redis = @import("codec/redis.zig");
 const websocket = @import("codec/websocket.zig");
 const quic = @import("codec/quic.zig");
@@ -646,6 +647,126 @@ const framing_corpus = [_][]const u8{
     // Exact multiples and a remainder, for the fixed-length decoder.
     "abcdefghij",
     "abcdefghijk",
+};
+
+// -- protobuf ---------------------------------------------------------------
+
+fn installProtobufFrameDecoder(pipeline: *Pipeline) anyerror!void {
+    _ = try protobuf.Varint32FrameDecoder.addTo(pipeline, .{ .max_frame_length = 64 });
+}
+
+fn fuzzProtobuf(harness: *Harness, smith: *Smith) anyerror!void {
+    return withLeakCheck(harness, smith, fuzzProtobufBody);
+}
+
+fn fuzzProtobufBody(harness: *Harness, smith: *Smith, gpa: Allocator) anyerror!void {
+    var scratch: [max_input]u8 = undefined;
+    const len = smith.slice(&scratch);
+    const payload = scratch[0..len];
+
+    // The length prefix is itself a varint, so the boundary that matters is one
+    // *inside* the prefix — a decoder that assumed it arrived whole would pass
+    // every hand-written test and fail against a peer that flushed mid-prefix.
+    try expectChunkIndependent(gpa, harness.io(), smith, payload, installProtobufFrameDecoder);
+
+    // The wire reader must terminate and never read outside its input, whatever
+    // the bytes are. Walking to the end or to an error is the whole property:
+    // a `Reader` that returned a field pointing past the buffer would be a
+    // use-after-free in the schema layer above it.
+    var reader: protobuf.Reader = .init(payload, .{ .max_message_len = max_input });
+    while (reader.next() catch null) |field| {
+        switch (field.value) {
+            .len => |bytes| {
+                const start = @intFromPtr(payload.ptr);
+                const end = start + payload.len;
+                const field_start = @intFromPtr(bytes.ptr);
+                std.debug.assert(field_start >= start);
+                std.debug.assert(field_start + bytes.len <= end);
+            },
+            else => {},
+        }
+    }
+
+    // Decoding arbitrary bytes as a real schema must fail or succeed, never leak
+    // and never trap. `withLeakCheck` is what turns the "never leak" half into an
+    // assertion rather than a hope.
+    if (protobuf.decode(FuzzMessage, gpa, payload, .{
+        .max_message_len = max_input,
+        .max_elements = 64,
+        .max_nesting_depth = 8,
+    })) |decoded| {
+        var owned = decoded;
+        defer owned.deinit(gpa);
+
+        // Whatever came out must go back in: re-encoding a decoded message and
+        // decoding that again has to reach the same value, which is the property
+        // that catches a field the encoder drops or widens.
+        const size = protobuf.encodedLen(FuzzMessage, &owned.value);
+        const buf = try gpa.alloc(u8, size);
+        defer gpa.free(buf);
+        const written = protobuf.encode(FuzzMessage, buf, &owned.value);
+        var again = try protobuf.decode(FuzzMessage, gpa, buf[0..written], .{
+            .max_message_len = max_input,
+            .max_elements = 64,
+            .max_nesting_depth = 8,
+        });
+        defer again.deinit(gpa);
+        std.debug.assert(again.value.number == owned.value.number);
+        std.debug.assert(again.value.repeated.len == owned.value.repeated.len);
+        std.debug.assert(std.mem.eql(u8, again.value.text, owned.value.text));
+    } else |_| {}
+}
+
+/// One field of each shape a peer can get wrong: a varint, a length-delimited
+/// string, a zigzag, a packed run, and a nested message.
+const FuzzMessage = struct {
+    number: i64 = 0,
+    text: []const u8 = "",
+    zigzagged: i32 = 0,
+    repeated: []const u32 = &.{},
+    nested: ?*const FuzzNested = null,
+
+    pub const proto = .{
+        .number = 1,
+        .text = 2,
+        .zigzagged = .{ .number = 3, .kind = .sint },
+        .repeated = 4,
+        .nested = 5,
+    };
+};
+
+const FuzzNested = struct {
+    flag: bool = false,
+    fixed: u64 = 0,
+    pub const proto = .{ .flag = 1, .fixed = .{ .number = 2, .kind = .fixed } };
+};
+
+test "fuzz: protobuf" {
+    var harness: Harness = try .init(std.testing.allocator);
+    defer harness.deinit();
+    try std.testing.fuzz(&harness, fuzzProtobuf, .{ .corpus = &protobuf_corpus });
+}
+
+const protobuf_corpus = [_][]const u8{
+    // A framed message: length 5, then field 1 varint 150 and field 2 empty.
+    "\x05\x08\x96\x01\x12\x00",
+    // A prefix announcing more than follows, which must ask for more rather than
+    // inventing a message.
+    "\x40\x08\x01",
+    // A prefix that needs two varint bytes.
+    "\x80\x01",
+    // Every wire type in one message.
+    "\x08\x96\x01\x12\x02hi\x1d\x04\x03\x02\x01!\x08\x07\x06\x05\x04\x03\x02\x01",
+    // A ten-byte varint at the maximum, and one over it.
+    "\x08\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01",
+    "\x08\xff\xff\xff\xff\xff\xff\xff\xff\xff\x02",
+    // Groups, which are refused rather than skipped.
+    "\x0b\x08\x01\x0c",
+    // Nesting: field 5 holding field 5 holding a leaf.
+    "*\x04*\x02\x08\x01",
+    // A packed run and the same field unpacked.
+    "\x22\x03\x01\x02\x03",
+    "\x20\x01\x20\x02",
 };
 
 // -- JSON ------------------------------------------------------------------

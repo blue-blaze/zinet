@@ -165,6 +165,17 @@ jobs:
           wait "$server_pid" 2>/dev/null || true
           echo "client reached a third-party server"
 
+      # protobuf against Google's own implementation. `FileDescriptorProto` is
+      # used because Python's protobuf ships it pre-generated, so this needs no
+      # protoc and no .proto file. The relay decodes and re-encodes from the
+      # decoded value, so a dropped or mis-tagged field fails on the Python side.
+      - name: protobuf round trips through Python's protobuf
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check protobuf
+          python3 scripts/protobuf-interop.py ./zig-out/bin/protobuf_relay
+
       # RESP over a raw socket, so no client library is needed. A clean exit is
       # also proof of no leaks, since the example uses DebugAllocator.
       - name: RESP server answers and exits cleanly

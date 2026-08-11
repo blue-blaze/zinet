@@ -142,6 +142,20 @@ const catalogue = [_]Mutation{
         .because = "\"the application will keep up\" is not a bound",
     },
     .{
+        .name = "protobuf/negative-int-width",
+        .path = "src/codec/protobuf.zig",
+        .find = "    const wide: i64 = value;\n    return @bitCast(wide);",
+        .replace = "    const wide: i64 = value;\n    return @bitCast(wide & 0xffffffff);",
+        .because = "a negative int32 is a 64-bit two's complement varint, which is ten bytes",
+    },
+    .{
+        .name = "protobuf/nesting-bound",
+        .path = "src/codec/protobuf.zig",
+        .find = "    if (depth >= limits.max_nesting_depth) return error.NestingTooDeep;",
+        .replace = "    if (depth >= 1_000_000) return error.NestingTooDeep;",
+        .because = "a peer can announce any nesting depth in a handful of bytes",
+    },
+    .{
         .name = "quic/post-handshake-ticket",
         .path = "src/codec/quic/client.zig",
         .find = "                .new_session_ticket => {},",

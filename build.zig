@@ -10,6 +10,7 @@ const examples: []const []const u8 = &.{
     "ws_echo",
     "ws_client",
     "redis_server",
+    "protobuf_relay",
     "udp_echo",
     "https_client",
     "tls13_client",
