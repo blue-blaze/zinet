@@ -20,6 +20,19 @@
         "src",
         "examples",
         "bench",
+        // `build.zig` names `tools/mutate.zig` unconditionally, so a package
+        // missing it cannot be configured by a consumer at all.
+        "tools",
+        "scripts",
+        "docs",
+        "LICENSE",
         "README.md",
+        // The implementation records the README points at. They are the argument
+        // this repository makes, so shipping the code without them ships the
+        // conclusions without the reasoning.
+        "HTTP2.md",
+        "HTTP3.md",
+        "TLS.md",
+        "REVIEW.md",
     },
 }
