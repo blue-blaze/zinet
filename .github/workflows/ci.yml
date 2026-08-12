@@ -323,7 +323,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet --disable-pip-version-check websockets
+          # A virtual environment, because a Homebrew-managed Python refuses a
+          # system-wide install under PEP 668 — this step passed on Linux and
+          # failed on macOS for that reason alone, and had done since long before
+          # anyone could see it.
+          if [ ! -d /tmp/wsvenv ]; then
+            python3 -m venv /tmp/wsvenv
+            /tmp/wsvenv/bin/pip install --quiet --disable-pip-version-check websockets
+          fi
+          ws_python=/tmp/wsvenv/bin/python
 
           # Under `set -e` a failed check skips the kills below, which would leave
           # a listener holding the port. Harmless on a fresh runner, confusing
@@ -345,7 +353,7 @@ jobs:
             sleep 0.2
           done
 
-          python3 - 19101 <<'PYEOF'
+          "$ws_python" - 19101 <<'PYEOF'
           import asyncio, sys
           import websockets
           from websockets.extensions import permessage_deflate
@@ -378,7 +386,7 @@ jobs:
           echo "zinet server survived a third-party client"
 
           # Third-party server, Zinet client.
-          python3 - 19102 <<'PYEOF' > /tmp/wss.log 2>&1 &
+          "$ws_python" - 19102 <<'PYEOF' > /tmp/wss.log 2>&1 &
           import asyncio, sys
           import websockets
           from websockets.extensions import permessage_deflate
