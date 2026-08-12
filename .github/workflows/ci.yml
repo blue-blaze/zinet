@@ -194,8 +194,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet --disable-pip-version-check protobuf
-          python3 scripts/protobuf-interop.py ./zig-out/bin/protobuf_relay
+          # A virtual environment because a Homebrew-managed Python refuses a
+          # system-wide install (PEP 668), which is how this failed on macOS
+          # while passing on Linux. The aioquic steps below already do this.
+          if [ ! -d /tmp/pbvenv ]; then
+            python3 -m venv /tmp/pbvenv
+            /tmp/pbvenv/bin/pip install --quiet --disable-pip-version-check protobuf
+          fi
+          /tmp/pbvenv/bin/python scripts/protobuf-interop.py ./zig-out/bin/protobuf_relay
 
       # RESP over a raw socket, so no client library is needed. A clean exit is
       # also proof of no leaks, since the example uses DebugAllocator.
@@ -599,7 +605,12 @@ jobs:
           # perl's alarm rather than `timeout`: the macOS runner has no GNU
           # coreutils `timeout`, and a cross-implementation check that can hang
           # is a check that gets disabled the first time it does.
-          output=$(perl -e 'alarm 30; exec @ARGV' ./zig-out/bin/http3_client 127.0.0.1 18445 localhost /ci-interop)
+          # `2>&1` because the example prints through `std.debug.print`, which is
+          # stderr — without it `$output` is empty and both greps below fail while
+          # the reply they are looking for sits in the log, visibly correct. The
+          # https_client step above already redirects; this one did not, and CI has
+          # not been able to install Zig for long enough that nobody found out.
+          output=$(perl -e 'alarm 30; exec @ARGV' ./zig-out/bin/http3_client 127.0.0.1 18445 localhost /ci-interop 2>&1)
           echo "$output"
           echo "$output" | grep -q "status: 200"
           echo "$output" | grep -q "hello from aioquic: /ci-interop"

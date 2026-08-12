@@ -1021,6 +1021,11 @@ const TruncatingServer = struct {
 };
 
 test "resolver: a truncated datagram answer is asked again over TCP" {
+    // The TCP path reads with a deadline, which is `net_receive` on a stream
+    // socket — the one operation zio panics on. Same guard as the eight other
+    // tests that reach it; these three were written after the guard existed and
+    // the fiber build was not re-run, which is the third time that has happened.
+    try @import("../../channel.zig").skipIfReadDeadlinesAreBroken();
     // §4.2.1 caps a datagram reply and sets TC when the answer did not fit; §4.2.2 is the
     // transport where it does. Before this the resolver returned `error.Truncated` and
     // stopped, which fails exactly the names that have enough records to need the retry — and
@@ -1061,6 +1066,11 @@ test "resolver: a truncated datagram answer is asked again over TCP" {
 }
 
 test "resolver: the TCP retry can be declined, and then truncation is the answer" {
+    // The TCP path reads with a deadline, which is `net_receive` on a stream
+    // socket — the one operation zio panics on. Same guard as the eight other
+    // tests that reach it; these three were written after the guard existed and
+    // the fiber build was not re-run, which is the third time that has happened.
+    try @import("../../channel.zig").skipIfReadDeadlinesAreBroken();
     // The retry is an option because a deployment may not want its resolver opening streams —
     // a firewall that permits port 53 over UDP and not over TCP is common enough that the
     // failure is worth being able to choose. Declining it restores the old behaviour, which
@@ -1106,6 +1116,11 @@ const Probe = struct {
 };
 
 test "resolver: a stream reply is bounded by what it claims, and checked like any other" {
+    // The TCP path reads with a deadline, which is `net_receive` on a stream
+    // socket — the one operation zio panics on. Same guard as the eight other
+    // tests that reach it; these three were written after the guard existed and
+    // the fiber build was not re-run, which is the third time that has happened.
+    try @import("../../channel.zig").skipIfReadDeadlinesAreBroken();
     // Two conditions on the TCP path that the successful case cannot exercise. Both are about
     // trusting the peer exactly as far as a datagram peer is trusted: §4.2.2's length prefix
     // is sixteen bits of *the server's claim*, and a stream reply is no more inherently ours

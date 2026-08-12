@@ -202,10 +202,28 @@ pub const Handler = struct {
 
     pub fn deinit(self: *Handler, gpa: Allocator) void {
         assert(gpa.ptr == self.gpa.ptr);
-        var it = self.entries();
-        while (it.next()) |entry| {
-            entry.deinit(gpa);
-            gpa.destroy(entry);
+        // Freed through `removeEntry`, and one at a time with the walk restarted,
+        // because `EntryIterator` decides whether it has already seen a connection
+        // by *reading that connection*: a spare connection ID puts the same entry
+        // in the table under several keys, and only the key equal to `cid_keys[0]`
+        // yields it. Freeing during the walk therefore leaves the remaining keys
+        // pointing at freed memory, which the iterator then reads.
+        //
+        // This function used to free `entry` directly, which was the same rule
+        // implemented a second time and the copy that was wrong — `removeEntry`
+        // takes every key out of the table first, and that is exactly the step the
+        // duplicate omitted. `sweep`, the other caller, collects into an array and
+        // frees after the walk, so it was never affected.
+        //
+        // What the consequence was depended on the allocator: nothing visible on
+        // macOS, a segmentation fault on Linux. The suite had been green on one
+        // platform for weeks and the first CI run on the other found it, which is
+        // the argument for the matrix rather than for more tests — no assertion
+        // available here can observe a read of freed memory.
+        while (true) {
+            var it = self.entries();
+            const entry = it.next() orelse break;
+            self.removeEntry(entry);
         }
         self.connections.deinit(gpa);
     }
