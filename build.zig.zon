@@ -20,8 +20,16 @@
         "src",
         "examples",
         "bench",
-        // `build.zig` names `tools/mutate.zig` unconditionally, so a package
-        // missing it cannot be configured by a consumer at all.
+        // `tools` and `scripts` are here so a consumer can run the checks this
+        // repository holds itself to — `zig build mutate` and the protobuf interop
+        // script — rather than only the library.
+        //
+        // The commit that added them gave a different reason and it was wrong: it
+        // claimed `build.zig` naming `tools/mutate.zig` unconditionally meant a
+        // package without it could not be configured. `b.path` does not read the
+        // file, and a consumer that never runs the `mutate` step never needs it —
+        // checked by deleting `tools` from an extracted package, whose build then
+        // succeeded. The paths stay, for the honest reason.
         "tools",
         "scripts",
         "docs",
