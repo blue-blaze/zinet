@@ -27,7 +27,14 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: master
+          # The version this repository is written against, and the one
+          # `build.zig.zon` names as its minimum. Tracking `master` here was a
+          # mistake with a visible cost: CI went red because upstream moved,
+          # 208 compile errors from an array-to-pointer change and a
+          # `net.Socket` that stopped being an `i32`, with no commit here
+          # responsible. Following master is `zig-master-probe.yml`'s job, and
+          # that file says so — "this tracks upstream, not us".
+          version: 0.17.0-dev.1476+91a29d707
 
       - name: Check formatting
         if: matrix.optimize == 'Debug'
@@ -65,7 +72,14 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: master
+          # The version this repository is written against, and the one
+          # `build.zig.zon` names as its minimum. Tracking `master` here was a
+          # mistake with a visible cost: CI went red because upstream moved,
+          # 208 compile errors from an array-to-pointer change and a
+          # `net.Socket` that stopped being an `i32`, with no commit here
+          # responsible. Following master is `zig-master-probe.yml`'s job, and
+          # that file says so — "this tracks upstream, not us".
+          version: 0.17.0-dev.1476+91a29d707
 
       # `-Dio=zio` swaps the `std.Io` implementation for a fiber runtime, so every
       # task becomes a fiber rather than an OS thread. This is the configuration
@@ -116,7 +130,14 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: master
+          # The version this repository is written against, and the one
+          # `build.zig.zon` names as its minimum. Tracking `master` here was a
+          # mistake with a visible cost: CI went red because upstream moved,
+          # 208 compile errors from an array-to-pointer change and a
+          # `net.Socket` that stopped being an `i32`, with no commit here
+          # responsible. Following master is `zig-master-probe.yml`'s job, and
+          # that file says so — "this tracks upstream, not us".
+          version: 0.17.0-dev.1476+91a29d707
 
       - name: Build
         run: zig build examples -Doptimize=ReleaseSafe
